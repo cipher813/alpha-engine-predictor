@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Data — parquet cache and normalization stats (large, machine-generated)
+data/cache/
+data/norm_stats.json
+data/constituents_cache.csv
+
+# Model checkpoints and training artifacts
+checkpoints/
+tune.db
+
+# Evaluation and prediction outputs
+eval_report.json
+
+# Secrets and environment
+.env
+.env.*
+*.pem
+*.key
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log
+logs/
+
+# pytest
+.pytest_cache/
+.coverage
+htmlcov/

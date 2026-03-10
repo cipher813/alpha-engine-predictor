@@ -29,6 +29,9 @@ set -euo pipefail
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 LOCAL_MODE=false
+SKIP_TUNE=false
+TUNE_TRIALS="${TUNE_TRIALS:-50}"
+TUNE_EPOCHS="${TUNE_EPOCHS:-30}"
 S3_BUCKET="${S3_BUCKET:-alpha-engine-research}"
 SAGEMAKER_ROLE_ARN="${SAGEMAKER_ROLE_ARN:-}"
 ECR_REPO="alpha-engine-predictor"
@@ -38,6 +41,11 @@ JOB_NAME="alpha-engine-predictor-retrain-$(date +%Y%m%d-%H%M%S)"
 for arg in "$@"; do
   case "$arg" in
     --local) LOCAL_MODE=true ;;
+    --skip-tune) SKIP_TUNE=true ;;
+    --tune-trials)
+      shift
+      TUNE_TRIALS="$1"
+      ;;
     --sagemaker-role)
       shift
       SAGEMAKER_ROLE_ARN="$1"
@@ -72,7 +80,30 @@ if [ "$LOCAL_MODE" = true ]; then
   echo "  Found $N_FILES parquet files in data/cache/"
   echo ""
 
-  echo "==> Starting training..."
+  # ── Hyperparameter tuning (optional, runs before full training) ──────────
+  if [ "$SKIP_TUNE" = false ]; then
+    echo "==> Running hyperparameter search (${TUNE_TRIALS} trials, ${TUNE_EPOCHS} epochs each)..."
+    echo "    To skip tuning: ./infrastructure/retrain.sh --local --skip-tune"
+    echo ""
+    python tune.py \
+      --data-dir data/cache \
+      --trials "${TUNE_TRIALS}" \
+      --epochs "${TUNE_EPOCHS}" \
+      --device cpu \
+      --output checkpoints/
+    echo ""
+    echo "==> Tuning complete. Best params saved to checkpoints/best_params.json"
+  else
+    echo "==> Skipping hyperparameter search (--skip-tune)"
+    if [ -f "checkpoints/best_params.json" ]; then
+      echo "    Using existing best_params.json from previous run"
+    else
+      echo "    No best_params.json found — train.py will use config.py defaults"
+    fi
+  fi
+
+  echo ""
+  echo "==> Starting training with best params..."
   python train.py \
     --data-dir data/cache \
     --device cpu \
@@ -122,8 +153,10 @@ JOB_CONFIG=$(cat <<EOF
   "AlgorithmSpecification": {
     "TrainingImage": "${TRAINING_IMAGE}",
     "TrainingInputMode": "File",
-    "ContainerEntrypoint": ["python", "train.py"],
-    "ContainerArguments": ["--data-dir", "/opt/ml/input/data/training", "--output", "/opt/ml/model"]
+    "ContainerEntrypoint": ["bash", "-c"],
+    "ContainerArguments": [
+      "python tune.py --data-dir /opt/ml/input/data/training --trials ${TUNE_TRIALS} --epochs ${TUNE_EPOCHS} --output /opt/ml/model && python train.py --data-dir /opt/ml/input/data/training --output /opt/ml/model"
+    ]
   },
   "RoleArn": "${SAGEMAKER_ROLE_ARN}",
   "InputDataConfig": [
@@ -150,7 +183,9 @@ JOB_CONFIG=$(cat <<EOF
     "MaxRuntimeInSeconds": 3600
   },
   "Environment": {
-    "S3_BUCKET": "${S3_BUCKET}"
+    "S3_BUCKET": "${S3_BUCKET}",
+    "TUNE_TRIALS": "${TUNE_TRIALS}",
+    "TUNE_EPOCHS": "${TUNE_EPOCHS}"
   }
 }
 EOF

@@ -200,6 +200,97 @@ The model must pass all four gates before being enabled in `config/universe.yaml
 
 ---
 
+## Hyperparameter tuning
+
+`tune.py` runs an Optuna search before full training. It samples hyperparameter
+combinations, trains each for a reduced number of epochs, and saves the best
+configuration to `checkpoints/best_params.json`. `train.py` loads this file
+automatically on the next run.
+
+### Running the tuner
+
+```bash
+# Default: 50 trials, 30 epochs each (~15 min on CPU with 900 tickers)
+python tune.py --data-dir data/cache
+
+# Faster search for iteration:
+python tune.py --data-dir data/cache --trials 20 --epochs 15
+
+# Resume a previous study (requires --storage):
+python tune.py --data-dir data/cache --storage sqlite:///tune.db
+
+# Then train with the best params:
+python train.py --data-dir data/cache
+```
+
+The retrain shell script runs tuning automatically before `train.py`:
+```bash
+./infrastructure/retrain.sh --local               # tune (50 trials) then train
+./infrastructure/retrain.sh --local --skip-tune   # skip tune, use existing best_params.json
+TUNE_TRIALS=20 ./infrastructure/retrain.sh --local  # faster search
+```
+
+### Search space
+
+| Parameter | Type | Range | Notes |
+|-----------|------|-------|-------|
+| `HIDDEN_1` | categorical | 32, 64, 128, 256 | First hidden layer width |
+| `HIDDEN_2` | categorical | 16, 32, 64, 128 | Must be ≤ HIDDEN_1 in practice |
+| `DROPOUT_1` | float | 0.1 – 0.5 | Step 0.1 |
+| `DROPOUT_2` | float | 0.0 – 0.4 | Step 0.1; typically < DROPOUT_1 |
+| `LEARNING_RATE` | log-float | 1e-4 – 5e-3 | Log scale; TPE explores this well |
+| `WEIGHT_DECAY` | log-float | 1e-5 – 1e-3 | L2 regularization |
+| `UP_THRESHOLD` | categorical | 0.5%, 1%, 1.5%, 2% | Controls class balance; DOWN = symmetric |
+
+**Why `UP_THRESHOLD` is the most impactful knob:** it determines the FLAT class
+width. A ±1% threshold on a 5-day return produces roughly 30/40/30 DOWN/FLAT/UP
+class balance at historical equity volatility. Widening to ±2% shifts more samples
+into FLAT (~55%), making UP/DOWN harder to learn but cleaner signal when predicted.
+Narrowing to ±0.5% increases class frequency but adds label noise.
+
+### Sampler and pruner
+
+- **TPE sampler** (default): Tree-structured Parzen Estimator. Builds a probabilistic
+  model of the objective function and samples from the more promising regions.
+  Significantly more efficient than random search after ~10 trials.
+- **MedianPruner**: kills trials whose intermediate val_loss is worse than the median
+  of completed trials at the same epoch. Skips `n_startup_trials=10` to let the
+  sampler warm up first.
+- Both are seeded at 42 for reproducibility.
+
+### Per-trial early stopping
+
+Each trial uses a patience of 5 (shorter than the full training patience of 10) to
+keep per-trial wall time under ~30 seconds on CPU. The objective value is the best
+validation loss achieved across all epochs in the trial.
+
+### best_params.json schema
+
+```json
+{
+  "best_params": {
+    "HIDDEN_1": 128,
+    "HIDDEN_2": 64,
+    "DROPOUT_1": 0.2,
+    "DROPOUT_2": 0.1,
+    "LEARNING_RATE": 0.0008,
+    "WEIGHT_DECAY": 0.00005,
+    "UP_THRESHOLD": 0.01,
+    "DOWN_THRESHOLD": -0.01
+  },
+  "best_val_loss": 1.0842,
+  "best_trial_number": 31,
+  "n_trials": 50,
+  "n_pruned": 18
+}
+```
+
+`train.py` reads `best_params` and applies each key as an override to the `config`
+module before building datasets and instantiating the model. All other config values
+(S3 paths, feature list, production gates) are unchanged.
+
+---
+
 ## Retraining schedule
 
 **Frequency**: Monthly, first Sunday of each month.

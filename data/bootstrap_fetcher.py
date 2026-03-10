@@ -12,7 +12,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import concurrent.futures
 import logging
 import sys
 import time
@@ -31,9 +30,9 @@ log = logging.getLogger(__name__)
 
 # Download constants
 _BATCH_SIZE = 50          # tickers per yfinance batch call
-_DOWNLOAD_WORKERS = 4     # parallel batch workers
 _PRICE_PERIOD = "5y"      # 5-year history for training
-_RETRY_DELAY = 2.0        # seconds between retries
+_INTER_BATCH_SLEEP = 1.0  # seconds between batches (rate-limit headroom)
+_RETRY_DELAY = 5.0        # seconds before retrying a failed batch
 
 
 # ── Ticker universe ───────────────────────────────────────────────────────────
@@ -199,37 +198,38 @@ def run_bootstrap(
         _BATCH_SIZE,
     )
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=_DOWNLOAD_WORKERS) as executor:
-        future_to_batch = {
-            executor.submit(_download_batch, batch, period): batch for batch in batches
-        }
-        failed_batches: list[list[str]] = []
+    failed_batches: list[list[str]] = []
 
-        for future in concurrent.futures.as_completed(future_to_batch):
-            batch = future_to_batch[future]
-            try:
-                batch_results = future.result()
-            except Exception as exc:
-                log.warning("Batch failed (%s), will retry: %s", batch[:3], exc)
-                failed_batches.append(batch)
-                continue
+    for batch_idx, batch in enumerate(batches):
+        if batch_idx > 0:
+            time.sleep(_INTER_BATCH_SLEEP)
 
-            for ticker, df in batch_results.items():
-                if df.empty:
-                    log.warning("No data for %s — skipping", ticker)
-                    failed.append(ticker)
-                else:
-                    local_path = _save_parquet(ticker, df, output_dir)
-                    if upload:
-                        _upload_to_s3(ticker, local_path, s3_bucket, s3_key_template)
-                    completed += 1
+        try:
+            batch_results = _download_batch(batch, period)
+        except Exception as exc:
+            log.warning("Batch %d failed (%s), will retry: %s", batch_idx, batch[:3], exc)
+            failed_batches.append(batch)
+            continue
 
-            pct = 100 * completed / total
-            log.info("Progress: %d / %d (%.1f%%)  failed so far: %d", completed, total, pct, len(failed))
+        for ticker, df in batch_results.items():
+            if df.empty:
+                log.warning("No data for %s — skipping", ticker)
+                failed.append(ticker)
+            else:
+                local_path = _save_parquet(ticker, df, output_dir)
+                if upload:
+                    _upload_to_s3(ticker, local_path, s3_bucket, s3_key_template)
+                completed += 1
 
-    # ── Retry failed batches sequentially ────────────────────────────────────
+        pct = 100 * completed / total
+        log.info(
+            "Batch %d/%d done — Progress: %d / %d (%.1f%%)  failed so far: %d",
+            batch_idx + 1, len(batches), completed, total, pct, len(failed),
+        )
+
+    # ── Retry failed batches ──────────────────────────────────────────────────
     if failed_batches:
-        log.info("Retrying %d failed batches sequentially...", len(failed_batches))
+        log.info("Retrying %d failed batches...", len(failed_batches))
         for batch in failed_batches:
             time.sleep(_RETRY_DELAY)
             try:

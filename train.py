@@ -61,6 +61,27 @@ def main() -> None:
     from model.trainer import train
     from model.evaluator import evaluate
 
+    # ── Load tuned hyperparameters if available ───────────────────────────────
+    # tune.py writes checkpoints/best_params.json after a search run.
+    # If present, those values override the defaults in config.py for this run.
+    best_params_path = Path(args.output) / "best_params.json"
+    if best_params_path.exists():
+        try:
+            with open(best_params_path) as f:
+                tuned = json.load(f).get("best_params", {})
+            for key, val in tuned.items():
+                if hasattr(cfg, key):
+                    setattr(cfg, key, val)
+            log.info(
+                "Loaded tuned hyperparameters from %s: %s",
+                best_params_path,
+                {k: v for k, v in tuned.items()},
+            )
+        except Exception as exc:
+            log.warning("Could not load best_params.json (%s) — using config.py defaults", exc)
+    else:
+        log.info("No best_params.json found — using config.py defaults")
+
     # ── Validate device ───────────────────────────────────────────────────────
     import torch
     if args.device == "cuda" and not torch.cuda.is_available():
