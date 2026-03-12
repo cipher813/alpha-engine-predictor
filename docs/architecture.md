@@ -1,5 +1,118 @@
 # Architecture — alpha-engine-predictor
 
+## Model versions
+
+| Version | Name | Status | IC (test) | Lambda `model_type` |
+|---------|------|--------|-----------|---------------------|
+| v1 | MLP — Direction Predictor | Available, not in production | ~0.033 | `mlp` |
+| v1.5 | GBM — LightGBM alpha scorer | **Production** (2026-03-12) | ~0.046 | `gbm` |
+| v2 | TFT — Temporal Fusion Transformer | Planned | — | — |
+
+The Lambda handler (`inference/handler.py`) currently runs `model_type="gbm"`.
+
+---
+
+## GBM v1.5 — LightGBM Alpha Scorer (Production)
+
+### Overview
+
+A LightGBM gradient-boosted tree model that takes a 21-feature snapshot per
+ticker and outputs a continuous predicted alpha (5-day return minus sector ETF
+return). The continuous score is thresholded at inference time to produce a
+3-class direction prediction identical in schema to the MLP output.
+
+### Why GBM over MLP for tabular financial data
+
+| Property | MLP | GBM |
+|---|---|---|
+| Feature normalization required | Yes (z-score) | No |
+| Handles non-linear thresholds | Moderate | Excellent (e.g. RSI > 70 AND dist_52w_high < −0.1) |
+| Feature importance (interpretable) | SHAP-only | Gain-based + SHAP |
+| Cold-start Lambda | Slow (PyTorch load) | Fast (~100ms) |
+| Lambda deployment | Container image (PyTorch 350MB) | Zip (lightgbm 11MB) |
+| Test IC | ~0.033 | ~0.046 |
+
+### Training objective
+
+```
+Objective  : regression (MSE) on sector-neutral 5-day return
+             y = (close[T+5]/close[T] - 1) - (sector_etf[T+5]/sector_etf[T] - 1)
+Eval metric: Pearson IC (cross-sectional, same as MLP)
+Library    : lightgbm >= 4.0.0
+```
+
+Sector-neutral labels (introduced 2026-03-12) replace SPY-relative labels.
+Using the sector ETF as benchmark removes industry momentum that the model
+cannot reliably time, leaving only stock-specific alpha for the GBM to learn.
+
+### Feature set (21 features)
+
+| Feature | Description |
+|---|---|
+| `rsi_14` | 14-day RSI |
+| `macd_cross` | MACD signal-line crossover {−1, 0, +1} |
+| `macd_above_zero` | MACD histogram sign {0, 1} |
+| `macd_line_last` | MACD line value |
+| `price_vs_ma50` | % distance from 50-day MA |
+| `price_vs_ma200` | % distance from 200-day MA |
+| `momentum_20d` | 20-day price return |
+| `avg_volume_20d` | Normalised 20-day avg volume |
+| `dist_52w_high` | % below 52-week high |
+| `dist_52w_low` | % above 52-week low |
+| `atr_14_pct` | ATR(14) as % of price (volatility) |
+| `bb_pct_b` | Bollinger Band %B |
+| `volume_trend` | 5d vs 20d volume ratio |
+| `price_accel` | 5d momentum minus 20d momentum |
+| `rsi_slope` | 5-day RSI slope |
+| `macd_histogram` | MACD histogram value |
+| `ema_cross_8_21` | EMA(8)/EMA(21) − 1 |
+| `sector_vs_spy_5d` | Sector ETF 5d return − SPY 5d return |
+| Macro features | SPY 5d return, VIX level, TNX yield (3 features) |
+
+GBM is scale-invariant; features are passed raw (no z-score normalization).
+`norm_stats.json` is still generated but only used by the MLP path.
+
+### S3 artifacts
+
+```
+s3://alpha-engine-research/
+  predictor/weights/gbm_latest.txt        ← LightGBM booster text file (production)
+  predictor/weights/gbm_YYYYMMDD.txt      ← dated snapshots (on retrain)
+  predictor/predictions/YYYY-MM-DD.json   ← per-ticker predictions
+  predictor/predictions/latest.json       ← always points to today
+  predictor/metrics/latest.json           ← model health (IC, n_predictions, etc.)
+```
+
+### Output schema (per ticker in `predictions/latest.json`)
+
+```json
+{
+  "ticker": "AAPL",
+  "predicted_direction": "UP",
+  "prediction_confidence": 0.72,
+  "predicted_alpha": 0.0083,
+  "p_up": 0.72,
+  "p_flat": 0.0,
+  "p_down": 0.28,
+  "watchlist_source": "tracked"
+}
+```
+
+`predicted_direction` is derived from the continuous `predicted_alpha` score:
+`UP` if alpha > threshold, `DOWN` if alpha < −threshold, `FLAT` otherwise.
+The `prediction_confidence` maps directly to the argmax probability for
+compatibility with the MLP schema consumed by alpha-engine-research.
+
+### Option A — Veto gate (active)
+
+The GBM output feeds an ENTER-veto gate in the research consolidator:
+- `predicted_direction == "DOWN"` **and** `confidence ≥ 0.60` → ENTER signal
+  downgraded to HOLD
+- Surfaced in the research email as `↓✗` in the GBM column of the thesis table
+- Does not affect EXIT, REDUCE, or HOLD signals
+
+---
+
 ## MLP v1 — Direction Predictor
 
 The v1 model is a feedforward Multi-Layer Perceptron (MLP) that takes a single

@@ -1,13 +1,19 @@
 # alpha-engine-predictor
 
-A standalone PyTorch ML module that produces per-ticker 5-day return direction
-predictions from technical indicators. It runs daily as an AWS Lambda function,
-reads price data via yfinance, computes the same 8 features used by the
-alpha-engine-research pipeline, and writes a `predictions.json` to S3. The
-research pipeline optionally loads these predictions and uses them as a
-confidence-gated modifier to per-ticker technical scores. The predictor is
-deliberately separate from the research and executor modules — integration
-happens through S3 artifacts, not shared code.
+A standalone ML module that produces per-ticker 5-day return direction predictions
+from 21 technical and macro features. It runs daily as an AWS Lambda function
+(Python 3.12, zip deployment), reads price data via yfinance, and writes a
+`predictions.json` to S3.
+
+**Current production model**: LightGBM GBM (test IC ≈ 0.046, sector-neutral labels).
+The MLP (PyTorch) is available for reactivation but is not running in the Lambda.
+
+The research pipeline reads these predictions and uses them as:
+1. A confidence-gated score modifier (+/− 10pt on technical score)
+2. An ENTER-veto gate: predicted DOWN with ≥ 60% confidence blocks new position entries
+
+The predictor is deliberately separate from the research and executor modules —
+integration happens through S3 artifacts, not shared code.
 
 ---
 
@@ -15,44 +21,40 @@ happens through S3 artifacts, not shared code.
 
 ```
   ┌────────────────────────────────────────────────────┐
-  │                 Monthly retraining                 │
+  │          Weekly/monthly retraining (GBM)           │
   │  bootstrap_fetcher → feature_engineer → dataset    │
-  │  → train.py → checkpoints/best.pt → S3             │
+  │  → train_gbm.py → checkpoints/gbm_best.txt → S3   │
+  │  s3://alpha-engine-research/predictor/weights/     │
+  │         gbm_latest.txt                             │
   └────────────────────────────────────────────────────┘
                             │
-             s3://alpha-engine-research/predictor/weights/latest.pt
-                            │
   ┌─────────────────────────▼──────────────────────────┐
-  │              Daily inference (Lambda)              │
-  │  EventBridge 6:15am PT                             │
-  │  → load model from S3                              │
-  │  → get universe from signals.json                  │
-  │  → fetch 1y OHLCV (yfinance)                       │
-  │  → compute 8 features (latest row)                 │
-  │  → z-score normalize (checkpoint norm_stats)       │
-  │  → MLP forward pass → softmax                      │
-  │  → write predictions/latest.json to S3             │
+  │      Daily inference — Lambda (6:15am PT)          │
+  │  EventBridge ae-predictor-run (13:15 UTC weekdays) │
+  │  → load GBM booster from S3                        │
+  │  → read watchlist from signals.json (S3)           │
+  │  → fetch 1y OHLCV per ticker (yfinance)            │
+  │  → compute 21 features (latest row)                │
+  │  → GBM predict → direction + confidence            │
+  │  → write predictions/YYYY-MM-DD.json + latest.json │
   └────────────────────────────────────────────────────┘
                             │
              s3://alpha-engine-research/predictor/predictions/latest.json
                             │
   ┌─────────────────────────▼──────────────────────────┐
   │          alpha-engine-research integration         │
-  │  fetch_data() reads latest.json (best-effort)      │
-  │  run_universe_agents() merges predictor values      │
-  │  into indicators dict → compute_technical_score()  │
-  │  applies ±10pt confidence-gated modifier           │
+  │  consolidator reads predictions (best-effort)      │
+  │  Option A veto: DOWN ≥ 60% conf → ENTER → HOLD     │
+  │  ±10pt confidence-gated modifier on tech score     │
   └────────────────────────────────────────────────────┘
 ```
 
-**MLP architecture (regression mode):**
-```
-Input(17) → Linear(64) → BatchNorm → ReLU → Dropout(0.3)
-          → Linear(32) → BatchNorm → ReLU → Dropout(0.2)
-          → Linear(1)  → scalar 5-day relative return prediction
-```
-Hyperparameters (HIDDEN_1, HIDDEN_2, DROPOUT_1, DROPOUT_2) are tuned via
-Optuna before each monthly retrain. See `tune.py` and `docs/training.md`.
+**GBM (production):** LightGBM regression on sector-neutral 5-day alpha.
+21 features, no normalization required, test IC ≈ 0.046.
+
+**MLP (available, not running):** PyTorch feedforward, 8 features, z-score
+normalized. Activate by setting `model_type="mlp"` in `handler.py` and
+deploying as a container image (PyTorch requires Docker build).
 
 ---
 
@@ -112,14 +114,27 @@ results = evaluate(model, test_loader)
 print(f"Test accuracy: {results['accuracy']:.1%}")
 ```
 
+### Train the GBM (production model)
+
+```bash
+python train_gbm.py --data-dir data/cache
+# Output: checkpoints/gbm_best.txt, checkpoints/gbm_eval_report.json
+```
+
 ### Run inference locally (dry run)
 
 ```bash
-python inference/daily_predict.py --local --dry-run
+# GBM (production model) — requires checkpoints/gbm_best.txt
+python inference/daily_predict.py --local --model-type gbm --dry-run
+
+# Watchlist mode (mirrors Lambda behaviour)
+python inference/daily_predict.py --local --model-type gbm --watchlist auto --dry-run
+
+# MLP — requires checkpoints/best.pt
+python inference/daily_predict.py --local --model-type mlp --dry-run
 ```
 
-Prints the predictions JSON to stdout without writing to S3. Requires a
-trained checkpoint at `checkpoints/best.pt`.
+Prints the predictions JSON to stdout without writing to S3.
 
 ### Run tests
 
@@ -159,26 +174,27 @@ predictor:
 
 See [docs/deployment.md](docs/deployment.md) for full walkthrough.
 
-### Build and deploy Lambda (container image)
+### Build and deploy Lambda (zip — no Docker required)
 
 ```bash
-export AWS_ACCOUNT_ID=123456789012
-export AWS_REGION=us-east-1
-./infrastructure/deploy.sh
-
-# Dry run (build only, no AWS push):
-./infrastructure/deploy.sh --dry-run
+# See docs/deployment.md for the full build procedure.
+# Short version:
+pip install --platform manylinux_2_28_x86_64 --target /tmp/lambda-pkg \
+  --implementation cp --python-version 3.12 --only-binary=:all: \
+  -r requirements-lambda.txt
+# (add libgomp.so.1 stub + scipy stub + source files)
+cd /tmp/lambda-pkg && zip -r /tmp/predictor.zip . -q
+aws s3 cp /tmp/predictor.zip s3://alpha-engine-research/lambda/alpha-engine-predictor.zip
+aws lambda update-function-code --function-name alpha-engine-predictor-inference \
+  --s3-bucket alpha-engine-research --s3-key lambda/alpha-engine-predictor.zip
 ```
 
-### Monthly retraining
+### GBM retraining (weights update — no Lambda redeploy)
 
 ```bash
-# Local (development)
-./infrastructure/retrain.sh --local
-
-# SageMaker (production)
-export SAGEMAKER_ROLE_ARN=arn:aws:iam::ACCOUNT_ID:role/SageMakerExecutionRole
-./infrastructure/retrain.sh
+python train_gbm.py --data-dir data/cache
+aws s3 cp checkpoints/gbm_best.txt \
+  s3://alpha-engine-research/predictor/weights/gbm_latest.txt
 ```
 
 ---
@@ -188,33 +204,39 @@ export SAGEMAKER_ROLE_ARN=arn:aws:iam::ACCOUNT_ID:role/SageMakerExecutionRole
 ```
 alpha-engine-predictor/
 ├── data/
-│   ├── bootstrap_fetcher.py   # one-time 5y OHLCV fetch for ~900 tickers
-│   ├── feature_engineer.py    # rolling 8-feature computation (mirrors research)
-│   ├── label_generator.py     # 5-day forward return labels
-│   └── dataset.py             # PyTorch Dataset + DataLoader construction
+│   ├── bootstrap_fetcher.py   # one-time 5y OHLCV fetch + sector_map.json
+│   ├── feature_engineer.py    # rolling 21-feature computation (mirrors research)
+│   ├── label_generator.py     # sector-neutral 5-day forward return labels
+│   ├── dataset.py             # Dataset + DataLoader for MLP and GBM
+│   └── norm_stats.json        # z-score stats (MLP only; bundled in Lambda zip)
 ├── model/
 │   ├── predictor.py           # DirectionPredictor MLP + checkpoint save/load
-│   ├── trainer.py             # training loop, early stopping, LR scheduler
-│   └── evaluator.py           # IC, hit rate, direction Sharpe, confusion matrix
+│   ├── gbm_scorer.py          # GBMScorer (LightGBM) — production model
+│   ├── trainer.py             # MLP training loop (early stopping, LR scheduler)
+│   └── evaluator.py           # IC, hit rate, confusion matrix
 ├── inference/
-│   ├── daily_predict.py       # daily prediction pipeline (CLI + programmatic)
-│   └── handler.py             # AWS Lambda entry point
+│   ├── daily_predict.py       # daily prediction pipeline; --model-type gbm|mlp
+│   └── handler.py             # AWS Lambda entry point (model_type="gbm")
 ├── infrastructure/
-│   ├── deploy.sh              # ECR build + push + Lambda update
-│   └── retrain.sh             # SageMaker Training Job or local retrain
+│   ├── deploy.sh              # container image build + ECR push (MLP path)
+│   └── retrain.sh             # local or SageMaker retrain
 ├── tests/
 │   ├── test_features.py       # feature engineering unit tests
 │   ├── test_model.py          # model forward pass + checkpoint tests
 │   └── test_inference.py      # predict_ticker() unit tests
 ├── docs/
-│   ├── architecture.md        # MLP architecture, TFT upgrade path
+│   ├── architecture.md        # GBM v1.5 + MLP v1 + TFT v2 upgrade path
 │   ├── training.md            # data pipeline, split strategy, hyperparameters
 │   ├── inference.md           # daily workflow, output schema, confidence gate
-│   └── deployment.md          # AWS setup, ECR, EventBridge, SageMaker
+│   └── deployment.md          # AWS resources, scheduling, zip build procedure
 ├── config.py                  # S3 paths, hyperparameters, feature list
-├── train.py                   # root-level training entry point
-├── requirements.txt
-├── Dockerfile
+├── train.py                   # MLP training entry point
+├── train_gbm.py               # GBM training entry point (production)
+├── tune.py                    # Optuna hyperparameter search (MLP)
+├── buildspec.yml              # AWS CodeBuild spec (container image path)
+├── requirements.txt           # full dev dependencies
+├── requirements-lambda.txt    # Lambda-only deps (no torch, no scipy, no pyarrow)
+├── Dockerfile                 # container image (MLP/PyTorch path)
 └── alpha-engine-predictor-design-260310.md
 ```
 
@@ -227,65 +249,72 @@ All constants are in `config.py`. Notable values:
 | Constant | Default | Description |
 |----------|---------|-------------|
 | `S3_BUCKET` | `alpha-engine-research` | S3 bucket for weights and predictions |
-| `FEATURES` | 8 features | Must stay in sync with research pipeline |
+| `GBM_WEIGHTS_KEY` | `predictor/weights/gbm_latest.txt` | S3 key for GBM booster |
+| `FEATURES` | 21 features | Must stay in sync with research pipeline feature list |
 | `FORWARD_DAYS` | 5 | Prediction horizon (trading days) |
-| `UP_THRESHOLD` | 0.01 | > +1% forward return = UP class |
-| `DOWN_THRESHOLD` | -0.01 | < -1% forward return = DOWN class |
-| `MIN_CONFIDENCE` | 0.65 | Below this, modifier not applied in research |
+| `UP_THRESHOLD` | 0.01 | > +1% sector-neutral return = UP class |
+| `DOWN_THRESHOLD` | -0.01 | < -1% sector-neutral return = DOWN class |
+| `MIN_CONFIDENCE` | 0.65 | Below this, ±10pt modifier not applied in research |
+| `GBM_VETO_CONFIDENCE` | 0.60 | DOWN prediction at or above this blocks ENTER signals |
 | `MIN_HIT_RATE` | 0.55 | Required for production deployment |
 | `MIN_IC` | 0.05 | Required for production deployment |
 | `TRAIN_FRAC` | 0.70 | Time-based training split |
-| `HIDDEN_1` | 64 | First hidden layer width |
-| `HIDDEN_2` | 32 | Second hidden layer width |
+| `HIDDEN_1` | 64 | MLP first hidden layer width |
+| `HIDDEN_2` | 32 | MLP second hidden layer width |
+| `GBM_NUM_LEAVES` | 63 | LightGBM num_leaves |
+| `GBM_N_ESTIMATORS` | 500 | LightGBM trees (with early stopping) |
 
 ---
 
 ## How training works
 
+### GBM (production — `train_gbm.py`)
+
 1. **Data**: 5-year OHLCV parquets in `data/cache/` (one per ticker, plus SPY,
-   VIX, and sector ETFs used as market-context inputs).
-2. **Features**: `compute_features()` computes 17 rolling technical indicators
-   per row. Rows lacking sufficient history (252-row warmup for 52-week
-   high/low) are dropped.
-3. **Labels**: `compute_labels()` computes the 5-day forward return relative to
-   SPY: `(close[T+5]/close[T] - 1) - (spy[T+5]/spy[T] - 1)`. This targets
-   alpha generation (outperformance vs market), not absolute direction.
-4. **Samples**: Each `(ticker, date)` pair becomes one sample — a 17-element
-   feature vector (market state at date T) paired with the 5-day forward
-   relative return (what happens after T). The model never sees prices after T.
-5. **Split**: All ~1.1M samples sorted by date, split 70/15/15 at date
-   boundaries. The test set is always the most recent ~15% of calendar time
-   across all tickers — not "the 5 days after training ends."
-6. **Per-day batching**: `DateGroupedSampler` groups all ~850 stocks on the
-   same trading date into one batch. This ensures the IC loss (Pearson
-   correlation between predictions and returns) is computed cross-sectionally
-   — the correct quant objective. See [docs/training.md](docs/training.md)
-   for full theory.
-7. **Loss**: `ICLoss` = negative Pearson IC, directly optimizing cross-sectional
-   ranking ability rather than absolute return magnitude.
-8. **Normalization**: Z-score per feature, fit on training set only. Statistics
-   saved to `data/norm_stats.json` and embedded in every checkpoint.
-9. **Training**: AdamW optimizer, ReduceLROnPlateau scheduler, early stopping
-   with patience=10 epochs, gradient clipping at max_norm=1.0.
-10. **Checkpoint**: Best model by validation loss saved to `checkpoints/best.pt`.
+   VIX, sector ETFs, and `sector_map.json` generated by `bootstrap_fetcher.py`).
+2. **Features**: `compute_features()` produces 21 rolling technical + macro
+   indicators per row. 252-row warmup required for 52-week high/low features.
+3. **Labels (sector-neutral)**: `compute_labels()` computes the 5-day forward
+   return relative to the ticker's **sector ETF** (not SPY):
+   `(close[T+5]/close[T] - 1) - (sector_etf[T+5]/sector_etf[T] - 1)`.
+   Falls back to SPY-relative if sector ETF data is unavailable.
+   Sector-neutral labels remove industry momentum the model cannot time,
+   leaving only stock-specific alpha as the training target.
+4. **Objective**: LightGBM regression (MSE). Evaluated on Pearson IC.
+5. **Split**: 70/15/15 time-based split. Test set = most recent 15% of dates.
+6. **Early stopping**: Validation IC monitored; training stops when IC stops
+   improving. Feature importance logged to `checkpoints/gbm_feature_importance.csv`.
+7. **Checkpoint**: `checkpoints/gbm_best.txt` (LightGBM booster text format).
+8. **Production gate**: Test IC ≥ 0.04 required before uploading to S3.
+
+### MLP (available — `train.py`)
+
+Same data pipeline, but uses PyTorch `DateGroupedSampler` + `ICLoss` (negative
+Pearson IC) with z-score normalization. See [docs/training.md](docs/training.md)
+for full MLP theory and hyperparameter details.
 
 ---
 
 ## How inference works
 
-1. Lambda is triggered by EventBridge at 6:15am PT on trading days.
-2. Model weights loaded from `s3://alpha-engine-research/predictor/weights/latest.pt`.
-3. Today's ticker universe read from `signals/signals_YYYYMMDD.json` (falls back
-   to a hardcoded 15-ticker list if unavailable).
-4. 1-year OHLCV fetched via yfinance for each ticker.
-5. `compute_features()` runs on each ticker's DataFrame; only the **last row**
-   (today's feature vector) is used.
-6. Feature vector z-score normalized using `norm_stats` from the checkpoint.
-7. `model(x) → softmax → [p_down, p_flat, p_up]`; argmax gives predicted direction.
-8. Predictions written to S3 at dated path and `latest.json`.
+1. **EventBridge** `ae-predictor-run` fires at 13:15 UTC (6:15am PDT / 5:15am PST)
+   on weekdays, invoking `alpha-engine-predictor-inference`.
+2. **GBM booster** loaded from
+   `s3://alpha-engine-research/predictor/weights/gbm_latest.txt`.
+3. **Watchlist** (`watchlist_path="auto"`) read from
+   `s3://alpha-engine-research/signals/YYYY-MM-DD/signals.json` — only the
+   research module's tracked tickers + buy candidates (~10–30 names) are
+   predicted. Falls back to a hardcoded 15-ticker list if S3 read fails.
+4. **OHLCV** fetched via yfinance (1-year window per ticker).
+5. `compute_features()` produces 21 features per row; only the **last row**
+   (today's snapshot) is used.
+6. **GBM predict** → continuous alpha score → thresholded to
+   {UP / FLAT / DOWN} + confidence.
+7. **S3 write**: results to `predictor/predictions/YYYY-MM-DD.json` and
+   `predictor/predictions/latest.json`. Metrics to `predictor/metrics/latest.json`.
 
-Tickers with fewer than 205 rows of price history (insufficient for MA200) are
-skipped and logged. Missing/failed tickers do not cause the Lambda to fail.
+Tickers with fewer than 205 rows (insufficient for MA200 feature) are skipped
+and logged. Per-ticker failures do not abort the run.
 
 ---
 
