@@ -1,0 +1,40 @@
+version: 0.2
+
+env:
+  variables:
+    ECR_REPO: alpha-engine-predictor
+    LAMBDA_FUNCTION: alpha-engine-predictor-inference
+    AWS_DEFAULT_REGION: us-east-1
+
+phases:
+  pre_build:
+    commands:
+      - echo Logging in to Amazon ECR...
+      - AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+      - ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
+      - ECR_IMAGE="${ECR_REGISTRY}/${ECR_REPO}:latest"
+      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY
+  build:
+    commands:
+      - echo Building Docker image...
+      - docker build --platform linux/amd64 -t ${ECR_REPO}:latest .
+      - docker tag ${ECR_REPO}:latest $ECR_IMAGE
+  post_build:
+    commands:
+      - echo Pushing image to ECR...
+      - docker push $ECR_IMAGE
+      - echo Updating Lambda function...
+      - |
+        if aws lambda get-function --function-name $LAMBDA_FUNCTION 2>/dev/null; then
+          aws lambda update-function-code \
+            --function-name $LAMBDA_FUNCTION \
+            --image-uri $ECR_IMAGE \
+            --region $AWS_DEFAULT_REGION
+          aws lambda wait function-updated \
+            --function-name $LAMBDA_FUNCTION \
+            --region $AWS_DEFAULT_REGION
+          echo "Lambda updated successfully"
+        else
+          echo "Lambda function $LAMBDA_FUNCTION not found - skipping update"
+        fi
+      - echo Build and deploy complete
