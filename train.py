@@ -6,8 +6,13 @@ evaluates on the held-out test set, and prints final metrics. The best
 checkpoint is saved under the specified output directory.
 
 Usage:
-    # Regression mode (recommended — directly optimizes IC via ICLoss):
+    # Regression mode with ICLoss (scale-invariant, optimizes Pearson IC directly):
     python train.py --mode regression [--data-dir data/cache] [--device cpu]
+
+    # Regression mode with MSE loss (allows macro features to provide cross-date
+    # gradients; better when DateGroupedSampler batches would make macro features
+    # constant-within-batch, producing zero ICLoss gradient):
+    python train.py --mode regression --loss mse [--data-dir data/cache]
 
     # Classification mode (3-class cross-entropy):
     python train.py --mode classification [--data-dir data/cache]
@@ -62,9 +67,21 @@ def main() -> None:
         default="regression",
         choices=["regression", "classification"],
         help=(
-            "Training mode: 'regression' (HuberLoss, directly optimizes IC) or "
+            "Training mode: 'regression' (optimizes return prediction) or "
             "'classification' (CrossEntropyLoss, 3-class UP/FLAT/DOWN). "
             "Default: regression"
+        ),
+    )
+    parser.add_argument(
+        "--loss",
+        default="ic",
+        choices=["ic", "mse"],
+        help=(
+            "Regression loss function: 'ic' (ICLoss — directly optimizes Pearson IC, "
+            "scale-invariant but macro features have zero gradient within date-group "
+            "batches) or 'mse' (MSELoss — allows macro features to drive gradients "
+            "across dates, better when macro regime features dominate). "
+            "Only used in regression mode. Default: ic"
         ),
     )
     args = parser.parse_args()
@@ -102,7 +119,7 @@ def main() -> None:
         log.warning("MPS requested but not available — falling back to CPU")
         args.device = "cpu"
 
-    log.info("Device: %s  Mode: %s", args.device, args.mode)
+    log.info("Device: %s  Mode: %s  Loss: %s", args.device, args.mode, args.loss)
 
     # ── Build datasets ────────────────────────────────────────────────────────
     log.info("Building datasets from %s (mode=%s)...", args.data_dir, args.mode)
@@ -177,6 +194,7 @@ def main() -> None:
         checkpoint_dir=args.output,
         norm_stats=norm_stats,
         class_weights=class_weights,
+        regression_loss=args.loss,
     )
 
     log.info(
@@ -217,7 +235,7 @@ def main() -> None:
         mae = float(np.abs(preds_arr - actuals_arr).mean())
         rmse = float(np.sqrt(((preds_arr - actuals_arr) ** 2).mean()))
 
-        print(f"  Mode             : regression (HuberLoss)")
+        print(f"  Mode             : regression (ICLoss)")
         print(f"  Samples          : {len(preds_arr)}")
         print(f"  MAE              : {mae:.5f}  ({mae*100:.3f}%)")
         print(f"  RMSE             : {rmse:.5f}  ({rmse*100:.3f}%)")

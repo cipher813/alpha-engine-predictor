@@ -35,8 +35,21 @@ _INTER_BATCH_SLEEP = 1.0  # seconds between batches (rate-limit headroom)
 _RETRY_DELAY = 5.0        # seconds before retrying a failed batch
 
 # Market / sector reference tickers always downloaded regardless of --tickers / --limit.
-# VIX is stored as "VIX.parquet" (caret stripped); sector ETFs as-is.
-_ALWAYS_DOWNLOAD = ["SPY", "VIX", "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "XLB", "XLRE", "XLC"]
+# VIX, TNX, IRX require a leading caret in yfinance (^VIX, ^TNX, ^IRX) but are stored
+# without it (VIX.parquet, TNX.parquet, IRX.parquet). See _CARET_SYMBOLS below.
+_ALWAYS_DOWNLOAD = [
+    "SPY",                                                                         # S&P 500 benchmark
+    "VIX",                                                                         # CBOE Volatility Index
+    "TNX",                                                                         # 10-Year Treasury yield
+    "IRX",                                                                         # 3-Month T-bill yield
+    "GLD",                                                                         # Gold ETF
+    "USO",                                                                         # Oil ETF (WTI crude proxy)
+    "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "XLB", "XLRE", "XLC",  # sector ETFs
+]
+
+# yfinance requires a leading caret for index/rate tickers.
+# Stored locally without the caret (TNX.parquet, not ^TNX.parquet).
+_CARET_SYMBOLS = {"VIX", "TNX", "IRX"}
 
 # GICS sector name → sector ETF symbol
 GICS_TO_ETF: dict[str, str] = {
@@ -157,8 +170,8 @@ def _download_batch(tickers: list[str], period: str) -> dict[str, pd.DataFrame]:
     if not tickers:
         return {}
 
-    # Map logical ticker names → yfinance symbols (e.g. VIX → ^VIX)
-    yf_symbol: dict[str, str] = {t: (f"^{t}" if t == "VIX" else t) for t in tickers}
+    # Map logical ticker names → yfinance symbols (e.g. VIX → ^VIX, TNX → ^TNX)
+    yf_symbol: dict[str, str] = {t: (f"^{t}" if t in _CARET_SYMBOLS else t) for t in tickers}
     yf_tickers = list(yf_symbol.values())
 
     # Pass a string (not a list) for single-ticker downloads so yfinance always

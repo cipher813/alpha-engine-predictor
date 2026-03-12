@@ -7,15 +7,16 @@ The best checkpoint (lowest val_loss) is saved to checkpoints/best.pt.
 
 Supports two modes:
   Classification (model.n_classes == 3): CrossEntropyLoss + accuracy tracking.
-  Regression     (model.n_classes == 1): Direct IC loss (negative batch Pearson
-    correlation) + MAE tracking.
+  Regression     (model.n_classes == 1): ICLoss or MSELoss + MAE tracking.
 
-    IC loss = −mean( z_score(pred) * z_score(actual) )
+    ICLoss  = −mean( z_score(pred) * z_score(actual) )
+    MSELoss = mean( (pred − actual)² )
 
-    This directly optimises what we evaluate (Pearson IC), unlike MSE/Huber
-    which optimise absolute prediction magnitude — irrelevant for ranking.
-    A model predicting [1x, 2x, 3x] and [100x, 200x, 300x] have identical IC
-    but very different Huber loss; IC loss treats them identically (correct).
+    ICLoss directly optimises Pearson IC and is scale-invariant, but when
+    DateGroupedSampler is used (one batch = all stocks on one date), macro
+    features that are constant within a batch (VIX, yields, gold, oil) produce
+    zero ICLoss gradient. Use --loss mse to allow those features to contribute
+    gradients across dates.
 
 Usage (from train.py or directly):
     from model.trainer import train
@@ -92,6 +93,7 @@ def train(
     checkpoint_dir: str = "checkpoints",
     norm_stats: dict | None = None,
     class_weights: torch.Tensor | None = None,
+    regression_loss: str = "ic",
 ) -> dict[str, Any]:
     """
     Full training loop with early stopping.
@@ -145,14 +147,25 @@ def train(
         optimizer,
         mode="min",       # minimize val_loss
         factor=0.5,       # halve LR on plateau
-        patience=3,       # 3 epochs without improvement triggers LR reduction
+        patience=8,       # 8 epochs before reducing LR (was 3 — too aggressive for
+                          # noisy financial IC/MSE landscapes; caused premature LR
+                          # decay and early stopping at epoch 9)
         min_lr=1e-6,
     )
 
     if regression_mode:
-        # IC loss: directly optimises Pearson IC (scale-invariant ranking objective)
-        criterion = ICLoss()
-        log.info("Regression mode: ICLoss (direct IC optimisation)")
+        if regression_loss == "mse":
+            criterion = nn.MSELoss()
+            log.info(
+                "Regression mode: MSELoss (macro features contribute cross-date "
+                "gradients; predictions are in return units)"
+            )
+        else:
+            # Default: IC loss — directly optimises Pearson IC (scale-invariant
+            # ranking objective). Best when stock-specific cross-sectional features
+            # dominate and macro features are less important.
+            criterion = ICLoss()
+            log.info("Regression mode: ICLoss (direct IC optimisation)")
     elif class_weights is not None:
         w = class_weights.to(device)
         criterion = nn.CrossEntropyLoss(weight=w)

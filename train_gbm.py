@@ -2,7 +2,7 @@
 train_gbm.py — LightGBM GBMScorer training entry point.
 
 Loads the same regression dataset as train.py (same 70/15/15 time split,
-same 17 features, same alpha-vs-SPY target), trains GBMScorer, evaluates
+same 21 features, same alpha-vs-SPY target), trains GBMScorer, evaluates
 Pearson IC on the test set, and saves the booster to checkpoints/.
 
 Also measures the prediction correlation between GBM and the saved MLP
@@ -14,6 +14,8 @@ Usage:
 
     --tune    Run a quick Optuna search (30 trials) before final training.
               Saves best GBM params to checkpoints/gbm_best_params.json.
+              Without --tune, default GBM parameters are always used
+              (saved gbm_best_params.json is ignored).
 """
 
 from __future__ import annotations
@@ -160,14 +162,7 @@ def main() -> None:
         params_path.write_text(json.dumps({"best_params": gbm_params}, indent=2))
         log.info("GBM tuned params saved to %s", params_path)
     else:
-        # Check for previously saved GBM params
-        params_path = Path(args.output) / "gbm_best_params.json"
-        if params_path.exists():
-            saved = json.loads(params_path.read_text())
-            gbm_params = saved.get("best_params")
-            log.info("Loaded GBM params from %s", params_path)
-        else:
-            log.info("No gbm_best_params.json found — using defaults")
+        log.info("No --tune flag — using default GBM parameters")
 
     # ── Train final GBM ────────────────────────────────────────────────────────
     log.info("Training GBMScorer...")
@@ -233,7 +228,15 @@ def main() -> None:
         pred_corr, _ = pearsonr(test_preds, mlp_preds)
 
         # Ensemble 50/50 blend IC
-        blend_preds = 0.5 * test_preds + 0.5 * mlp_preds
+        # Rank-normalise both models to equal scale before blending.
+        # GBM preds are in return units (~0.01); MLP (ICLoss) preds have
+        # arbitrary magnitude — naive averaging is dominated by the
+        # higher-variance signal. Rank-normalisation is standard practice
+        # for combining alpha signals of different provenance.
+        from scipy.stats import rankdata
+        gbm_ranked = rankdata(test_preds).astype(np.float32)
+        mlp_ranked = rankdata(mlp_preds).astype(np.float32)
+        blend_preds = 0.5 * gbm_ranked + 0.5 * mlp_ranked
         blend_ic, _ = pearsonr(blend_preds, y_test)
 
         print("\n" + "=" * 60)
