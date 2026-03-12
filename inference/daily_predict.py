@@ -56,8 +56,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
 import pandas as pd
-import torch
-import torch.nn.functional as F
 
 import config as cfg
 
@@ -481,7 +479,7 @@ def fetch_macro_series(
 def predict_ticker(
     ticker: str,
     df: pd.DataFrame,
-    model: torch.nn.Module,
+    model,  # torch.nn.Module — imported lazily below (not needed for GBM path)
     norm_stats: dict,
     macro: dict[str, pd.Series] | None = None,
     sector_etf_series: pd.Series | None = None,
@@ -555,7 +553,11 @@ def predict_ticker(
         log.warning("Normalization failed for %s: %s", ticker, exc)
         return None
 
-    # Inference
+    # Inference — lazy-import torch so the module loads without PyTorch when
+    # model_type="gbm" (LightGBM only) is used in the Lambda environment.
+    import torch  # noqa: PLC0415
+    import torch.nn.functional as F  # noqa: PLC0415
+
     x_tensor = torch.FloatTensor(x_norm).unsqueeze(0)  # shape (1, 8)
     model.eval()
     with torch.no_grad():
