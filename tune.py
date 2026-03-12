@@ -9,14 +9,17 @@ The tuner optimizes for validation loss using Optuna's TPE sampler with
 MedianPruner to kill unpromising trials early.
 
 Usage:
-    python tune.py [--data-dir data/cache] [--trials 50] [--epochs 30]
-                   [--device cpu] [--output checkpoints/] [--sampler tpe|random]
+    # Regression mode (default — aligns with train.py --mode regression):
+    python tune.py --mode regression [--data-dir data/cache] [--trials 50]
+
+    # Classification mode:
+    python tune.py --mode classification [--data-dir data/cache] [--trials 50]
 
 The --epochs flag controls the per-trial budget (default 30, vs. 100 for full
 training). Each trial trains a fresh model from scratch.
 
 After tuning, run:
-    python train.py  # automatically loads checkpoints/best_params.json
+    python train.py --mode regression  # automatically loads checkpoints/best_params.json
 """
 
 from __future__ import annotations
@@ -88,10 +91,16 @@ def _params_to_config_overrides(params: dict[str, Any]) -> dict[str, Any]:
 # Per-trial objective
 # ---------------------------------------------------------------------------
 
-def _make_objective(train_loader, val_loader, cfg, device: str, trial_epochs: int):
+def _make_objective(
+    train_loader, val_loader, cfg, device: str, trial_epochs: int,
+    class_weights=None, regression_mode: bool = True,
+):
     """
     Return an Optuna objective function that trains a model with the sampled
     params and returns the best validation loss achieved.
+
+    In regression_mode=True: HuberLoss(delta=0.01), n_classes=1.
+    In regression_mode=False: CrossEntropyLoss (± class_weights), n_classes=3.
     """
     import torch
     import torch.nn as nn
@@ -101,23 +110,12 @@ def _make_objective(train_loader, val_loader, cfg, device: str, trial_epochs: in
         params = _suggest_params(trial)
         overrides = _params_to_config_overrides(params)
 
-        # Apply sampled thresholds: if they changed the label distribution,
-        # the loaders already reflect the fixed base thresholds from build_datasets.
-        # We only re-label here conceptually — loaders use the base config's
-        # thresholds. Threshold tuning therefore acts on a proxy: we vary the
-        # architecture/LR while keeping class balance fixed per loader, but we
-        # log the threshold choice so the best config can be applied on the
-        # final training run with a freshly-built dataset.
-        #
-        # To tune thresholds properly we would need to rebuild loaders each trial,
-        # which is expensive (~30s for 900 tickers). We do this only for the top
-        # threshold value from the best trial after the search completes.
-
+        n_classes = 1 if regression_mode else cfg.N_CLASSES
         model = DirectionPredictor(
             n_features=cfg.N_FEATURES,
             hidden_1=overrides["HIDDEN_1"],
             hidden_2=overrides["HIDDEN_2"],
-            n_classes=cfg.N_CLASSES,
+            n_classes=n_classes,
             dropout_1=overrides["DROPOUT_1"],
             dropout_2=overrides["DROPOUT_2"],
         ).to(device)
@@ -130,19 +128,34 @@ def _make_objective(train_loader, val_loader, cfg, device: str, trial_epochs: in
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode="min", factor=0.5, patience=3, min_lr=1e-6
         )
-        criterion = nn.CrossEntropyLoss()
+
+        if regression_mode:
+            from model.trainer import ICLoss
+            criterion = ICLoss()
+        elif class_weights is not None:
+            criterion = nn.CrossEntropyLoss(weight=class_weights.to(device))
+        else:
+            criterion = nn.CrossEntropyLoss()
 
         best_val_loss = float("inf")
         patience = 5  # shorter patience for trial runs
         patience_counter = 0
 
         for epoch in range(trial_epochs):
+            # Notify date-grouped sampler of new epoch for shuffling
+            if hasattr(train_loader, 'batch_sampler') and hasattr(train_loader.batch_sampler, 'set_epoch'):
+                train_loader.batch_sampler.set_epoch(epoch)
+
             # Training pass
             model.train()
             for X_batch, y_batch in train_loader:
                 X_batch, y_batch = X_batch.to(device), y_batch.to(device)
                 optimizer.zero_grad()
-                loss = criterion(model(X_batch), y_batch)
+                output = model(X_batch)
+                if regression_mode:
+                    loss = criterion(output.squeeze(-1), y_batch)
+                else:
+                    loss = criterion(output, y_batch)
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
@@ -151,12 +164,26 @@ def _make_objective(train_loader, val_loader, cfg, device: str, trial_epochs: in
             model.eval()
             val_loss_sum = 0.0
             n_batches = 0
+            all_val_preds = []
+            all_val_targets = []
             with torch.no_grad():
                 for X_batch, y_batch in val_loader:
                     X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-                    val_loss_sum += criterion(model(X_batch), y_batch).item()
-                    n_batches += 1
-            avg_val_loss = val_loss_sum / max(n_batches, 1)
+                    output = model(X_batch)
+                    if regression_mode:
+                        all_val_preds.append(output.squeeze(-1).cpu())
+                        all_val_targets.append(y_batch.cpu())
+                    else:
+                        val_loss_sum += criterion(output, y_batch).item()
+                        n_batches += 1
+            if regression_mode:
+                # Full-set IC: stable cross-sectional Pearson across all val samples
+                import torch as _torch
+                all_p = _torch.cat(all_val_preds)
+                all_t = _torch.cat(all_val_targets)
+                avg_val_loss = criterion(all_p, all_t).item()
+            else:
+                avg_val_loss = val_loss_sum / max(n_batches, 1)
 
             scheduler.step(avg_val_loss)
 
@@ -193,9 +220,15 @@ def main() -> None:
     parser.add_argument("--output",    default="checkpoints",  help="Directory to save best_params.json")
     parser.add_argument("--sampler",   default="tpe",          choices=["tpe", "random"],
                         help="Optuna sampler: tpe (default) or random")
-    parser.add_argument("--study-name", default="direction_predictor", help="Optuna study name")
+    parser.add_argument("--study-name", default="direction_predictor_reg", help="Optuna study name")
     parser.add_argument("--storage",   default=None,
                         help="Optuna storage URL (e.g. sqlite:///tune.db). Optional — enables resume.")
+    parser.add_argument(
+        "--mode",
+        default="regression",
+        choices=["regression", "classification"],
+        help="Training mode matching train.py (default: regression)",
+    )
     args = parser.parse_args()
 
     try:
@@ -213,22 +246,41 @@ def main() -> None:
         args.device = "cpu"
 
     import config as cfg
-    from data.dataset import build_datasets, load_norm_stats
+
+    regression_mode = args.mode == "regression"
+    log.info("Mode: %s", args.mode)
 
     log.info("Building datasets from %s...", args.data_dir)
     try:
-        train_loader, val_loader, _ = build_datasets(
-            data_dir=args.data_dir,
-            config_module=cfg,
-        )
+        if regression_mode:
+            from data.dataset import build_regression_datasets
+            train_loader, val_loader, *_ = build_regression_datasets(
+                data_dir=args.data_dir,
+                config_module=cfg,
+            )
+        else:
+            from data.dataset import build_datasets
+            train_loader, val_loader, *_ = build_datasets(
+                data_dir=args.data_dir,
+                config_module=cfg,
+            )
     except FileNotFoundError as exc:
         log.error("%s", exc)
         log.error("Run: python data/bootstrap_fetcher.py --output-dir %s", args.data_dir)
         sys.exit(1)
 
+    _class_weights = None
+    if not regression_mode:
+        from model.trainer import compute_class_weights
+        _class_weights = compute_class_weights(train_loader, n_classes=3)
+        log.info(
+            "Class weights: DOWN=%.3f  FLAT=%.3f  UP=%.3f",
+            _class_weights[0].item(), _class_weights[1].item(), _class_weights[2].item(),
+        )
+
     log.info(
-        "Starting Optuna search: trials=%d  epochs_per_trial=%d  sampler=%s  device=%s",
-        args.trials, args.epochs, args.sampler, args.device,
+        "Starting Optuna search: trials=%d  epochs_per_trial=%d  sampler=%s  device=%s  mode=%s",
+        args.trials, args.epochs, args.sampler, args.device, args.mode,
     )
 
     # Build sampler
@@ -257,6 +309,8 @@ def main() -> None:
         cfg=cfg,
         device=args.device,
         trial_epochs=args.epochs,
+        class_weights=_class_weights,
+        regression_mode=regression_mode,
     )
 
     study.optimize(
@@ -332,7 +386,7 @@ def main() -> None:
                 f"{p.get('LEARNING_RATE', 0):>10.2e}  {p.get('UP_THRESHOLD', '-'):>8}"
             )
 
-    print(f"\nNext step: python train.py  (will load {params_path})\n")
+    print(f"\nNext step: python train.py --mode {args.mode}  (will load {params_path})\n")
 
 
 if __name__ == "__main__":

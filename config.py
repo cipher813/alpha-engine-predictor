@@ -19,8 +19,9 @@ METRICS_KEY = "predictor/metrics/latest.json"
 PRICE_CACHE_KEY = "predictor/price_cache/{ticker}.parquet"
 
 # ── Features ──────────────────────────────────────────────────────────────────
-# Must stay in sync with data/feature_engineer.py::compute_features()
-# and mirror compute_technical_indicators() in alpha-engine-research.
+# Must stay in sync with data/feature_engineer.py::compute_features().
+# First 8 mirror compute_technical_indicators() in alpha-engine-research.
+# v1.1 added 4 alpha features; v1.2 adds 5 market-context features.
 FEATURES = [
     "rsi_14",
     "macd_cross",
@@ -30,8 +31,19 @@ FEATURES = [
     "price_vs_ma200",
     "momentum_20d",
     "avg_volume_20d",
+    # v1.1 additions
+    "dist_from_52w_high",   # (close - 252d rolling max) / 252d rolling max
+    "momentum_5d",          # (close / close.shift(5)) - 1
+    "rel_volume_ratio",     # today's volume / 20d rolling mean volume
+    "return_vs_spy_5d",     # 5d momentum of stock minus 5d momentum of SPY
+    # v1.2 additions — market context features
+    "vix_level",            # VIX Close / 20.0 (fear regime indicator)
+    "dist_from_52w_low",    # (close - 252d rolling min) / 252d rolling min
+    "vol_ratio_10_60",      # 10d realized vol / 60d realized vol
+    "bollinger_pct",        # (close - lower_bb20) / (upper_bb20 - lower_bb20)
+    "sector_vs_spy_5d",     # sector ETF 5d return - SPY 5d return
 ]
-N_FEATURES = 8
+N_FEATURES = 17
 N_CLASSES = 3  # UP, FLAT, DOWN
 
 # Class labels — index matches model output neuron order

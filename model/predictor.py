@@ -1,14 +1,21 @@
 """
-model/predictor.py — MLP direction predictor (v1).
+model/predictor.py — MLP predictor (classification or regression).
 
 Architecture:
-    Input(8) → Linear(64) → BatchNorm1d → ReLU → Dropout(0.3)
-             → Linear(32) → BatchNorm1d → ReLU → Dropout(0.2)
-             → Linear(3)
+    Input(N) → Linear(H1) → BatchNorm1d → ReLU → Dropout(d1)
+             → Linear(H2) → BatchNorm1d → ReLU → Dropout(d2)
+             → Linear(n_classes)
 
-Output: raw logits for [DOWN, FLAT, UP].
-No softmax in forward() — use torch.nn.CrossEntropyLoss (includes log-softmax).
-At inference time, apply F.softmax(logits, dim=-1) to get probabilities.
+Classification mode (n_classes=3):
+    Output: raw logits for [DOWN, FLAT, UP].  No softmax in forward() —
+    use torch.nn.CrossEntropyLoss (includes log-softmax).
+    At inference apply F.softmax(logits, dim=-1) to get probabilities.
+
+Regression mode (n_classes=1):
+    Output: single scalar (predicted 5-day return relative to SPY).
+    Training loss: HuberLoss(delta=0.01).  IC = corr(pred, actual_return).
+    At inference the scalar output is directly the return prediction.
+    The signal used downstream is pred.squeeze(-1) directly.
 
 Model version string is embedded in checkpoints so inference can log it.
 """
@@ -23,7 +30,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # Bump this when architecture changes — stored in every checkpoint.
-MODEL_VERSION = "v1.0.0"
+MODEL_VERSION = "v1.2.0"  # v1.2: 17 features; regression mode (n_classes=1) supported
 
 
 class DirectionPredictor(nn.Module):
