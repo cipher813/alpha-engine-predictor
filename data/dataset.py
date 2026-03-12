@@ -228,6 +228,22 @@ def build_datasets(
     else:
         log.warning("VIX.parquet not found — vix_level will be 1.0 (neutral). Run bootstrap to download.")
 
+    # ── Load macro rate / commodity series (v1.3 features) ───────────────────
+    def _load_close_series_cls(filename: str) -> pd.Series | None:
+        p = data_path / filename
+        if not p.exists():
+            log.warning("%s not found — related macro feature will use neutral default.", filename)
+            return None
+        df = _load_ticker_parquet(p)
+        if df.empty or "Close" not in df.columns:
+            return None
+        return df["Close"].astype(float)
+
+    tnx_series = _load_close_series_cls("TNX.parquet")
+    irx_series = _load_close_series_cls("IRX.parquet")
+    gld_series = _load_close_series_cls("GLD.parquet")
+    uso_series = _load_close_series_cls("USO.parquet")
+
     # ── Load sector map and sector ETF close series ───────────────────────────
     # sector_map: ticker → ETF symbol (e.g. "AAPL" → "XLK")
     sector_map: dict[str, str] = {}
@@ -252,6 +268,7 @@ def build_datasets(
     # Reference tickers that should not be treated as universe stocks
     _SKIP_TICKERS = {
         "SPY", "VIX",
+        "TNX", "IRX", "GLD", "USO",
         "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "XLB", "XLRE", "XLC",
     }
 
@@ -261,7 +278,7 @@ def build_datasets(
     all_rows: list[tuple[pd.Timestamp, np.ndarray, int, float]] = []
 
     for i, path in enumerate(parquet_files):
-        # Skip market reference files (SPY, VIX, sector ETFs)
+        # Skip market reference files (SPY, VIX, macro series, sector ETFs)
         ticker_name = path.stem
         if ticker_name in _SKIP_TICKERS:
             continue
@@ -281,13 +298,17 @@ def build_datasets(
                 spy_series=spy_series,
                 vix_series=vix_series,
                 sector_etf_series=sector_etf_series,
+                tnx_series=tnx_series,
+                irx_series=irx_series,
+                gld_series=gld_series,
+                uso_series=uso_series,
             )
             labeled_df = compute_labels(
                 featured_df,
                 forward_days=config_module.FORWARD_DAYS,
                 up_threshold=config_module.UP_THRESHOLD,
                 down_threshold=config_module.DOWN_THRESHOLD,
-                spy_returns=spy_series,
+                benchmark_returns=sector_etf_series if sector_etf_series is not None else spy_series,
             )
         except Exception as exc:
             log.warning("Feature/label computation failed for %s: %s", path.name, exc)
@@ -428,7 +449,7 @@ def build_regression_datasets(
             "Run data/bootstrap_fetcher.py first."
         )
 
-    # ── Load reference series (SPY, VIX, sector ETFs) ─────────────────────────
+    # ── Load reference series (SPY, VIX, macro, sector ETFs) ──────────────────
     spy_series: pd.Series | None = None
     spy_path = data_path / "SPY.parquet"
     if spy_path.exists():
@@ -444,10 +465,28 @@ def build_regression_datasets(
         if not vix_df.empty and "Close" in vix_df.columns:
             vix_series = vix_df["Close"].astype(float)
 
+    def _load_close_series(filename: str) -> pd.Series | None:
+        p = data_path / filename
+        if not p.exists():
+            log.warning("%s not found — related macro feature will use neutral default.", filename)
+            return None
+        df = _load_ticker_parquet(p)
+        if df.empty or "Close" not in df.columns:
+            return None
+        return df["Close"].astype(float)
+
+    tnx_series = _load_close_series("TNX.parquet")
+    irx_series = _load_close_series("IRX.parquet")
+    gld_series = _load_close_series("GLD.parquet")
+    uso_series = _load_close_series("USO.parquet")
+
     sector_map: dict[str, str] = {}
     sector_map_path = data_path / "sector_map.json"
     if sector_map_path.exists():
         sector_map = json.loads(sector_map_path.read_text())
+        log.info("Sector map loaded: %d ticker→ETF mappings", len(sector_map))
+    else:
+        log.warning("sector_map.json not found — labels fall back to SPY-relative.")
 
     sector_etf_cache: dict[str, pd.Series] = {}
     for etf_symbol in set(sector_map.values()):
@@ -456,9 +495,15 @@ def build_regression_datasets(
             etf_df = _load_ticker_parquet(etf_path)
             if not etf_df.empty and "Close" in etf_df.columns:
                 sector_etf_cache[etf_symbol] = etf_df["Close"].astype(float)
+    if sector_etf_cache:
+        log.info(
+            "Loaded %d sector ETF series for sector-neutral labels: %s",
+            len(sector_etf_cache), sorted(sector_etf_cache),
+        )
 
     _SKIP_TICKERS = {
         "SPY", "VIX",
+        "TNX", "IRX", "GLD", "USO",
         "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "XLB", "XLRE", "XLC",
     }
 
@@ -483,13 +528,17 @@ def build_regression_datasets(
                 spy_series=spy_series,
                 vix_series=vix_series,
                 sector_etf_series=sector_etf_series,
+                tnx_series=tnx_series,
+                irx_series=irx_series,
+                gld_series=gld_series,
+                uso_series=uso_series,
             )
             labeled_df = compute_labels(
                 featured_df,
                 forward_days=config_module.FORWARD_DAYS,
                 up_threshold=config_module.UP_THRESHOLD,
                 down_threshold=config_module.DOWN_THRESHOLD,
-                spy_returns=spy_series,
+                benchmark_returns=sector_etf_series if sector_etf_series is not None else spy_series,
             )
         except Exception as exc:
             log.warning("Feature/label computation failed for %s: %s", path.name, exc)
@@ -515,6 +564,25 @@ def build_regression_datasets(
     all_dates = [r[0] for r in all_rows]
     X_all = np.stack([r[1] for r in all_rows], axis=0)
     fwd_all = np.array([r[2] for r in all_rows], dtype=np.float32)
+
+    # ── Label winsorization ───────────────────────────────────────────────────
+    # Clip extreme forward returns to reduce gradient noise from earnings gaps,
+    # M&A events, and biotech FDA moves that can be ±30–50% over 5 days.
+    # These outliers distort ICLoss away from the typical ±2–4% signal range.
+    label_clip = getattr(config_module, "LABEL_CLIP", None)
+    if label_clip is not None:
+        n_clipped = int((np.abs(fwd_all) > label_clip).sum())
+        pct_clipped = 100.0 * n_clipped / max(len(fwd_all), 1)
+        fwd_all = np.clip(fwd_all, -label_clip, label_clip)
+        log.info(
+            "Label winsorization (±%.0f%%): clipped %d / %d samples (%.2f%%)",
+            label_clip * 100, n_clipped, len(fwd_all), pct_clipped,
+        )
+        p01, p05, p95, p99 = np.percentile(fwd_all, [1, 5, 95, 99])
+        log.info(
+            "Label distribution after clip — p1=%.3f  p5=%.3f  p95=%.3f  p99=%.3f",
+            p01, p05, p95, p99,
+        )
 
     # Build integer date-group IDs for DateGroupedSampler
     unique_dates = sorted(set(all_dates))

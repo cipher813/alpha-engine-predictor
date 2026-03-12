@@ -4,7 +4,7 @@ data/feature_engineer.py — Rolling technical feature computation.
 Mirrors compute_technical_indicators() from alpha-engine-research exactly,
 but operates on a full OHLCV DataFrame (rolling window per row) rather than
 returning a single snapshot dict. Every row in the output has a complete
-17-feature vector. Rows lacking sufficient price history for any indicator
+21-feature vector. Rows lacking sufficient price history for any indicator
 are dropped after all features are computed.
 
 Feature list (must stay in sync with config.FEATURES):
@@ -25,14 +25,22 @@ Feature list (must stay in sync with config.FEATURES):
     vol_ratio_10_60     10d realized vol / 60d realized vol                  [v1.2]
     bollinger_pct       (close - lower_bb20) / (upper_bb20 - lower_bb20)    [v1.2]
     sector_vs_spy_5d    sector ETF 5d return - SPY 5d return                [v1.2]
+    yield_10y           10Y Treasury yield / 10.0 (rate level)              [v1.3]
+    yield_curve_slope   (10Y yield - 3M yield) / 10.0 (>0 normal, <0 inv.) [v1.3]
+    gold_mom_5d         5d momentum of GLD (risk-off indicator)             [v1.3]
+    oil_mom_5d          5d momentum of USO (commodity cycle / inflation)    [v1.3]
 
 RSI uses EWM with com=13 (equiv. to Wilder's 14-period smoothing), identical
 to the research pipeline.
 
-Optional series parameters (all default to neutral 0.0 when None):
+Optional series parameters (all default to neutral values when None):
     spy_series        SPY Close prices (DatetimeIndex) — return_vs_spy_5d + sector_vs_spy_5d
     vix_series        VIX Close prices (DatetimeIndex) — vix_level
     sector_etf_series Sector ETF Close prices (DatetimeIndex) — sector_vs_spy_5d
+    tnx_series        10Y Treasury yield (DatetimeIndex, percent) — yield_10y, yield_curve_slope
+    irx_series        3M T-bill yield (DatetimeIndex, percent) — yield_curve_slope
+    gld_series        GLD Close prices (DatetimeIndex) — gold_mom_5d
+    uso_series        USO Close prices (DatetimeIndex) — oil_mom_5d
 """
 
 from __future__ import annotations
@@ -111,9 +119,13 @@ def compute_features(
     spy_series: pd.Series | None = None,
     vix_series: pd.Series | None = None,
     sector_etf_series: pd.Series | None = None,
+    tnx_series: pd.Series | None = None,
+    irx_series: pd.Series | None = None,
+    gld_series: pd.Series | None = None,
+    uso_series: pd.Series | None = None,
 ) -> pd.DataFrame:
     """
-    Compute all 17 technical features for a full OHLCV DataFrame.
+    Compute all 21 technical and macro features for a full OHLCV DataFrame.
 
     Parameters
     ----------
@@ -129,11 +141,24 @@ def compute_features(
     sector_etf_series : pd.Series or None
         Sector ETF Close prices (e.g. XLK for tech stocks) with a
         DatetimeIndex. Used for sector_vs_spy_5d. Defaults to 0.0 when None.
+    tnx_series : pd.Series or None
+        10-Year Treasury yield in percent (e.g. 4.5 for 4.5%) with a
+        DatetimeIndex. Used for yield_10y and yield_curve_slope.
+        Defaults to 0.4 (neutral ~4%) when None.
+    irx_series : pd.Series or None
+        3-Month T-bill yield in percent with a DatetimeIndex. Used as the
+        short leg of yield_curve_slope. Defaults to 0.3 when None.
+    gld_series : pd.Series or None
+        GLD (Gold ETF) Close prices with a DatetimeIndex. Used for
+        gold_mom_5d. Defaults to 0.0 when None.
+    uso_series : pd.Series or None
+        USO (Oil ETF) Close prices with a DatetimeIndex. Used for
+        oil_mom_5d. Defaults to 0.0 when None.
 
     Returns
     -------
     pd.DataFrame
-        Original columns plus the 17 feature columns. Rows without
+        Original columns plus the 21 feature columns. Rows without
         sufficient history for any feature are dropped.
 
     Notes
@@ -142,6 +167,8 @@ def compute_features(
     Tickers with fewer than ~265 rows should be skipped by the caller.
     avg_volume_20d is normalized by the mean volume of the ENTIRE series
     (same scalar applied to all rows) to keep the feature stable.
+    Macro series (tnx, irx, gld, uso) are forward-filled on alignment so
+    that weekends/holidays in the source series do not create NaNs.
     """
     if df.empty:
         return df.copy()
@@ -271,6 +298,51 @@ def compute_features(
     else:
         df["sector_vs_spy_5d"] = 0.0  # no sector info: neutral signal
 
+    # ── v1.3 features — macro regime ──────────────────────────────────────────
+
+    # yield_10y: 10-year Treasury yield normalized to a 0–1 scale.
+    # TNX from yfinance is in percent (e.g. 4.5 for 4.5%); divide by 10
+    # so the typical 0–10% range maps to 0.0–1.0.
+    # Forward-fill so bond market holidays don't create equity-day NaNs.
+    if tnx_series is not None:
+        tnx_aligned = tnx_series.reindex(df.index, method="ffill")
+        df["yield_10y"] = tnx_aligned / 10.0
+    else:
+        df["yield_10y"] = 0.4  # neutral: ~4% 10Y yield
+
+    # yield_curve_slope: spread between 10Y and 3M yields, normalized.
+    # Positive = normal/steep curve; negative = inverted (recession signal).
+    # IRX from yfinance is the 13-week T-bill annualized yield in percent.
+    if tnx_series is not None and irx_series is not None:
+        irx_aligned = irx_series.reindex(df.index, method="ffill")
+        df["yield_curve_slope"] = (tnx_aligned - irx_aligned) / 10.0
+    elif tnx_series is not None:
+        # No short rate — use yield level as a rough slope proxy (vs zero)
+        df["yield_curve_slope"] = tnx_aligned / 10.0
+    else:
+        df["yield_curve_slope"] = 0.0  # neutral: assume normal curve
+
+    # gold_mom_5d: 5-day momentum of GLD. Rising gold = risk-off / inflation
+    # fears; falling = risk-on or deflationary. Market-wide signal applied to
+    # all tickers; z-score normalization lets the model weight it appropriately.
+    if gld_series is not None:
+        gld_aligned = gld_series.reindex(df.index, method="ffill")
+        df["gold_mom_5d"] = (gld_aligned / gld_aligned.shift(5)) - 1.0
+        df["gold_mom_5d"] = df["gold_mom_5d"].fillna(0.0)
+    else:
+        df["gold_mom_5d"] = 0.0
+
+    # oil_mom_5d: 5-day momentum of USO (WTI crude proxy).
+    # Rising oil = inflationary pressure / energy sector tailwind;
+    # falling = deflationary / energy headwind. Particularly signal-rich
+    # for energy, industrials, and consumer discretionary sectors.
+    if uso_series is not None:
+        uso_aligned = uso_series.reindex(df.index, method="ffill")
+        df["oil_mom_5d"] = (uso_aligned / uso_aligned.shift(5)) - 1.0
+        df["oil_mom_5d"] = df["oil_mom_5d"].fillna(0.0)
+    else:
+        df["oil_mom_5d"] = 0.0
+
     # ── Drop rows with any NaN in the feature columns ─────────────────────────
     feature_cols = [
         "rsi_14",
@@ -290,6 +362,10 @@ def compute_features(
         "vol_ratio_10_60",
         "bollinger_pct",
         "sector_vs_spy_5d",
+        "yield_10y",
+        "yield_curve_slope",
+        "gold_mom_5d",
+        "oil_mom_5d",
     ]
     df = df.dropna(subset=feature_cols)
 

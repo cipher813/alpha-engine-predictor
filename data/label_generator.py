@@ -11,12 +11,15 @@ Given a DataFrame of OHLCV + computed features, this module computes the
 The integer mapping (DOWN=0, FLAT=1, UP=2) matches CLASS_LABELS in config.py
 and the model output neuron indices.
 
-When spy_returns (SPY Close series) is provided, the label is based on the
-relative return vs SPY rather than the absolute return:
+When benchmark_returns (a benchmark Close series) is provided, the label is
+based on the relative return vs the benchmark rather than the absolute return:
 
-    relative_return_5d = stock_forward_return_5d - spy_forward_return_5d
+    relative_return_5d = stock_forward_return_5d - benchmark_forward_return_5d
 
-This targets alpha generation rather than market direction prediction.
+Pass SPY Close for market-relative alpha, or a sector ETF Close (e.g. XLK) for
+sector-neutral (idiosyncratic) alpha. Sector-neutral labels remove sector-level
+noise and target the stock-specific signal more directly.
+
 The column is still named forward_return_5d for backward compatibility
 with IC computation downstream, but its value is the relative return.
 
@@ -35,7 +38,7 @@ def compute_labels(
     forward_days: int = 5,
     up_threshold: float = 0.01,
     down_threshold: float = -0.01,
-    spy_returns: pd.Series | None = None,
+    benchmark_returns: pd.Series | None = None,
 ) -> pd.DataFrame:
     """
     Append forward-return labels to a featured DataFrame.
@@ -50,15 +53,20 @@ def compute_labels(
         Default is 5 (one calendar week).
     up_threshold : float
         Minimum return to classify as UP. Default +1% (0.01).
-        Applied to relative return when spy_returns is provided.
+        Applied to relative return when benchmark_returns is provided.
     down_threshold : float
         Maximum return to classify as DOWN. Default -1% (-0.01).
-        Applied to relative return when spy_returns is provided.
-    spy_returns : pd.Series or None
-        SPY Close prices with a DatetimeIndex. When provided, labels are
-        based on stock return minus SPY return (relative alpha), rather than
-        the absolute return. The forward_return_5d column stores the
+        Applied to relative return when benchmark_returns is provided.
+    benchmark_returns : pd.Series or None
+        Benchmark Close prices with a DatetimeIndex. When provided, labels are
+        based on stock return minus benchmark return (relative alpha), rather
+        than the absolute return. The forward_return_5d column stores the
         relative return value for IC computation.
+
+        Pass SPY Close for market-relative alpha (original behaviour).
+        Pass a sector ETF Close (e.g. XLK for Information Technology) for
+        sector-neutral (idiosyncratic) alpha — recommended when sector_map.json
+        is available, as it removes sector-level noise from the training target.
 
     Returns
     -------
@@ -84,13 +92,13 @@ def compute_labels(
     future_close = close.shift(-forward_days)
     stock_fwd_return = (future_close / close) - 1.0
 
-    if spy_returns is not None:
-        # Relative return: stock alpha vs SPY over the same forward window.
-        # spy_returns is the SPY Close series; align to ticker's date index.
-        spy_aligned = spy_returns.reindex(df.index)
-        spy_future = spy_aligned.shift(-forward_days)
-        spy_fwd_return = (spy_future / spy_aligned) - 1.0
-        df["forward_return_5d"] = stock_fwd_return - spy_fwd_return
+    if benchmark_returns is not None:
+        # Relative return: stock alpha vs benchmark over the same forward window.
+        # benchmark_returns is a Close series; align to ticker's date index.
+        benchmark_aligned = benchmark_returns.reindex(df.index)
+        benchmark_future = benchmark_aligned.shift(-forward_days)
+        benchmark_fwd_return = (benchmark_future / benchmark_aligned) - 1.0
+        df["forward_return_5d"] = stock_fwd_return - benchmark_fwd_return
     else:
         df["forward_return_5d"] = stock_fwd_return
 

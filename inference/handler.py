@@ -52,7 +52,13 @@ def handler(event: dict, context) -> dict:
 
     try:
         from inference.daily_predict import main
-        main(date_str=date_str, dry_run=dry_run, local=False)
+        main(
+            date_str=date_str,
+            dry_run=dry_run,
+            local=False,
+            model_type="gbm",
+            watchlist_path="auto",
+        )
 
         log.info("Predictor Lambda completed successfully")
         return {

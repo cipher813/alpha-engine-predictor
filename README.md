@@ -45,12 +45,14 @@ happens through S3 artifacts, not shared code.
   └────────────────────────────────────────────────────┘
 ```
 
-**MLP v1 architecture:**
+**MLP architecture (regression mode):**
 ```
-Input(8) → Linear(64) → BatchNorm → ReLU → Dropout(0.3)
-         → Linear(32) → BatchNorm → ReLU → Dropout(0.2)
-         → Linear(3)  → [P(DOWN), P(FLAT), P(UP)]
+Input(17) → Linear(64) → BatchNorm → ReLU → Dropout(0.3)
+          → Linear(32) → BatchNorm → ReLU → Dropout(0.2)
+          → Linear(1)  → scalar 5-day relative return prediction
 ```
+Hyperparameters (HIDDEN_1, HIDDEN_2, DROPOUT_1, DROPOUT_2) are tuned via
+Optuna before each monthly retrain. See `tune.py` and `docs/training.md`.
 
 ---
 
@@ -240,18 +242,32 @@ All constants are in `config.py`. Notable values:
 
 ## How training works
 
-1. **Data**: 5-year OHLCV parquets in `data/cache/` (one per ticker).
-2. **Features**: `compute_features()` computes 8 rolling technical indicators per
-   row. Rows lacking sufficient history (MA200 requires 200+ rows) are dropped.
-3. **Labels**: `compute_labels()` computes `(close[t+5] / close[t]) - 1` and
-   bins into DOWN / FLAT / UP classes.
-4. **Split**: All samples sorted by date, split 70/15/15 at index boundaries
-   (no shuffling across boundaries — the test set is always the most recent data).
-5. **Normalization**: Z-score per feature, fit on training set only. Statistics
+1. **Data**: 5-year OHLCV parquets in `data/cache/` (one per ticker, plus SPY,
+   VIX, and sector ETFs used as market-context inputs).
+2. **Features**: `compute_features()` computes 17 rolling technical indicators
+   per row. Rows lacking sufficient history (252-row warmup for 52-week
+   high/low) are dropped.
+3. **Labels**: `compute_labels()` computes the 5-day forward return relative to
+   SPY: `(close[T+5]/close[T] - 1) - (spy[T+5]/spy[T] - 1)`. This targets
+   alpha generation (outperformance vs market), not absolute direction.
+4. **Samples**: Each `(ticker, date)` pair becomes one sample — a 17-element
+   feature vector (market state at date T) paired with the 5-day forward
+   relative return (what happens after T). The model never sees prices after T.
+5. **Split**: All ~1.1M samples sorted by date, split 70/15/15 at date
+   boundaries. The test set is always the most recent ~15% of calendar time
+   across all tickers — not "the 5 days after training ends."
+6. **Per-day batching**: `DateGroupedSampler` groups all ~850 stocks on the
+   same trading date into one batch. This ensures the IC loss (Pearson
+   correlation between predictions and returns) is computed cross-sectionally
+   — the correct quant objective. See [docs/training.md](docs/training.md)
+   for full theory.
+7. **Loss**: `ICLoss` = negative Pearson IC, directly optimizing cross-sectional
+   ranking ability rather than absolute return magnitude.
+8. **Normalization**: Z-score per feature, fit on training set only. Statistics
    saved to `data/norm_stats.json` and embedded in every checkpoint.
-6. **Training**: AdamW optimizer, ReduceLROnPlateau scheduler, early stopping
+9. **Training**: AdamW optimizer, ReduceLROnPlateau scheduler, early stopping
    with patience=10 epochs, gradient clipping at max_norm=1.0.
-7. **Checkpoint**: Best model by validation loss saved to `checkpoints/best.pt`.
+10. **Checkpoint**: Best model by validation loss saved to `checkpoints/best.pt`.
 
 ---
 

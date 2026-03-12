@@ -8,18 +8,148 @@ data/bootstrap_fetcher.py
     └── Saves data/cache/{ticker}.parquet
 
 data/feature_engineer.py
-    └── compute_features(df) → rolling 8-feature vectors per row
-    └── Warmup: 200 rows (for MA200)
+    └── compute_features(df) → rolling 17-feature vectors per row
+    └── Warmup: 252 rows (for 52-week high/low)
 
 data/label_generator.py
     └── compute_labels(df) → forward_return_5d, direction, direction_int
+    └── Labels are RELATIVE to SPY when spy_series is provided
     └── Drops last 5 rows (no forward return available)
 
 data/dataset.py
-    └── build_datasets() → train/val/test DataLoaders
-    └── Time-based split: 70/15/15
+    └── build_regression_datasets() → train/val/test DataLoaders
+    └── Time-based split: 70/15/15 with date-boundary alignment
+    └── DateGroupedSampler: each batch = all stocks on one trading date
     └── Z-score normalization (fit on train only)
     └── Saves data/norm_stats.json
+```
+
+---
+
+---
+
+## Dataloader architecture — theory and construction
+
+### What a "sample" is
+
+One sample in the dataset represents **one ticker on one specific trading date**.
+It is a tuple of `(feature_vector, forward_return_5d)`:
+
+- **feature_vector**: a 17-element float32 array of rolling technical indicators
+  computed from all price history available up to and including date T. The model
+  never sees any price data after T when computing features.
+- **forward_return_5d**: the 5-trading-day return starting from date T, computed
+  as `(close[T+5] / close[T]) - 1`, then made relative to SPY when SPY data is
+  available. This is the label — what the model is trained to predict.
+
+Crucially, **the feature date (T) and the label date (T+5) are different**. The
+feature vector is a snapshot of market state at T. The label is what happens
+_after_ T. The model never sees the label during a forward pass — it only sees
+the feature vector.
+
+### The per-day grouping: DateGroupedSampler
+
+After features and labels are computed for all ~900 tickers across 5 years, the
+dataset contains roughly **1.1 million samples** (900 tickers × ~1250 trading
+days × ~70% warmup survival rate).
+
+The `DateGroupedSampler` (in `data/dataset.py`) arranges these samples so that
+**each mini-batch contains all tickers observed on one specific trading date** —
+typically ~800–900 stocks per batch.
+
+```
+Mini-batch 1: AAPL/2021-03-15, MSFT/2021-03-15, NVDA/2021-03-15 ... (~850 stocks)
+Mini-batch 2: AAPL/2021-07-22, MSFT/2021-07-22, NVDA/2021-07-22 ... (~830 stocks)
+Mini-batch 3: AAPL/2022-11-08, MSFT/2022-11-08, NVDA/2022-11-08 ... (~870 stocks)
+```
+
+The order of dates across epochs is shuffled (training) or sequential (val/test).
+Each epoch sees every trading date exactly once.
+
+### Why per-day batching is the correct structure for a quant model
+
+The loss function is `ICLoss` — the negative Pearson correlation between
+predictions and actual 5-day returns within a batch:
+
+```
+IC = Pearson(model_predictions, actual_returns)
+   = corr([pred_AAPL, pred_MSFT, pred_NVDA, ...], [ret_AAPL, ret_MSFT, ret_NVDA, ...])
+```
+
+This directly optimizes for **cross-sectional ranking ability**: the capacity to
+correctly order stocks by expected return on a single trading day.
+
+**Why per-day batching is required for IC loss to be meaningful:**
+
+If stocks from different dates were mixed in a batch, the correlation would
+conflate time-series variation with cross-sectional variation. For example, a
+batch containing AAPL on a 2021 bull-market day and MSFT on a 2023 rate-hike
+day would produce a meaningless IC — the returns differ for macro reasons
+unrelated to the model's cross-sectional ranking signal.
+
+With per-day batches, every gradient step answers the correct question:
+**"On this specific day, did the model rank the cross-section of stocks
+correctly?"** This aligns the training objective with how alpha signals are
+used in production: the model score is rank-transformed within each day's
+universe before portfolio construction.
+
+The IC loss is also scale-invariant by design. A model that outputs
+`[0.01, 0.02, 0.03]` and one that outputs `[1.0, 2.0, 3.0]` have identical
+IC — both rank the three stocks the same way. This is the correct property
+for a ranking-based alpha signal, unlike MSE or Huber loss which penalize
+prediction magnitude.
+
+### How this differs from the train/test split
+
+The per-day grouping is a property of **how samples are batched during
+training**. It is orthogonal to which samples are in train vs val vs test.
+
+The train/test split is purely temporal:
+
+```
+All 1.1M samples sorted by date (T, the feature date):
+
+Oldest ───────────────────────────────────────────── Newest
+│        70% train         │   15% val   │  15% test  │
+│  (e.g. Jan 2019–Oct 2022)│(Oct 22–May 23)│(May 23–Dec 24)│
+└──────────────────────────┴─────────────┴────────────┘
+```
+
+Each of these three sets contains samples from ~900 tickers. The test set is
+the most recent ~9 months of data across all tickers — the closest proxy for
+live performance.
+
+**Does the test set cover the 5 days after the training cutoff?** No — and this
+is a common source of confusion. The split is based on the **feature date T**,
+not the label date T+5. A sample with feature date T=2022-10-28 (last day of
+train) has a label computed from close[2022-11-04]. The first val sample has
+feature date T=2022-10-31. There is a 5-day overlap in the price data used
+to compute labels at the train/val boundary, but the model never sees those
+forward prices as inputs. This minor boundary overlap is unavoidable with any
+forward-return labeling scheme and is standard in quantitative ML.
+
+The test set spans a continuous later period in calendar time. It is not
+"the 5 days immediately after training ends" — it is a full 15% slice of
+the total date range, evaluated sample-by-sample across all tickers.
+
+### Date-boundary alignment in the split
+
+The split indices in `build_regression_datasets()` are advanced to the nearest
+date boundary to prevent any single trading date from being split across two
+sets. If the 70% index lands mid-day (e.g., between the 400th and 401st ticker
+on 2022-10-28), all remaining tickers from that date are moved to the train set.
+This ensures that `DateGroupedSampler` always sees complete cross-sections in
+each set — no partial-date batches.
+
+### Summary: the full flow for one training step
+
+```
+1. DateGroupedSampler yields all sample indices for trading date T
+2. DataLoader assembles those ~850 (feature_vector, forward_return) pairs
+3. Model forward pass: feature_vector → scalar return prediction (regression)
+4. ICLoss: Pearson(predictions, actual_returns) computed across the ~850 stocks
+5. Backprop: gradient signal = "did you rank the cross-section correctly on date T?"
+6. Optimizer step: weights updated to improve cross-sectional ranking
 ```
 
 ---
@@ -59,6 +189,26 @@ Features are computed by `data/feature_engineer.py::compute_features()`,
 which mirrors `compute_technical_indicators()` from alpha-engine-research
 exactly — same EWM parameters, same rolling windows, same normalization logic.
 
+### Label winsorization
+
+Before training, forward returns are clipped at `±LABEL_CLIP` (default ±15%).
+This eliminates the gradient noise introduced by extreme events — earnings gaps,
+M&A announcements, biotech FDA outcomes — that produce ±20–50% 5-day moves.
+These outliers are real, but a simple MLP has no way to predict them from
+technical indicators. Including them unclipped causes `ICLoss` to spend gradient
+budget on noise instead of the typical ±2–4% signal range.
+
+```python
+# config.py
+LABEL_CLIP = 0.15  # set to None to disable
+```
+
+The dataset logger reports how many samples were clipped and the label
+percentile distribution after clipping so you can verify the clip level
+is appropriate for the current universe.
+
+---
+
 ### RSI(14)
 
 Uses Wilder's exponential smoothing: `ewm(com=13, adjust=False)`. This is
@@ -93,6 +243,52 @@ signal_line = macd_line.ewm(span=9, adjust=False).mean()
 
 Both use `rolling(window=200, min_periods=200).mean()` so rows before the
 200th index produce NaN and are dropped. This is the primary warmup constraint.
+
+### v1.3 macro regime features
+
+Four market-wide features added in v1.3 capture interest rate regime and
+commodity cycle signals that technical price indicators cannot express.
+
+**yield_10y** — `TNX / 10.0`
+The 10-Year Treasury yield normalized to 0–1 scale. High rates increase the
+discount rate for equity cash flows; the level also signals whether the Fed is
+in a tightening or easing cycle. `^TNX` from yfinance provides this in percent
+(e.g. 4.5), forward-filled across equity trading days.
+
+**yield_curve_slope** — `(TNX - IRX) / 10.0`
+The spread between 10Y and 3M Treasury yields. Positive = normal/steep curve
+(growth expected); negative = inverted (historical recession precursor).
+`^IRX` (13-week T-bill) is the short leg. Forward-filled like `^TNX`.
+
+**gold_mom_5d** — `(GLD[T] / GLD[T-5]) - 1`
+5-day momentum of the GLD gold ETF. Rising gold signals risk-off positioning
+or inflation expectations — both environments that historically suppress equity
+alpha from technical momentum strategies. Falling gold implies risk-on.
+
+**oil_mom_5d** — `(USO[T] / USO[T-5]) - 1`
+5-day momentum of the USO oil ETF (WTI crude proxy). Directly relevant for
+energy sector stocks; indirectly affects consumer discretionary, airlines, and
+industrials through input cost sensitivity. Also an inflation leading indicator.
+
+These four features are market-wide (identical across all tickers on a given
+date) so they follow the same loading pattern as VIX: downloaded once as
+parquets by `bootstrap_fetcher.py`, loaded at the dataset level, and aligned
+to each ticker's date index with forward-fill.
+
+---
+
+### On FRED integration
+
+If you have FRED API access (which the alpha-engine-research stack already
+uses), the `DFF` (Daily Effective Federal Funds Rate) series is a more precise
+source for the short rate leg than `^IRX` (which is the 3M T-bill market rate,
+a close but not identical proxy). To use it, add a `data/macro_fetcher.py` that
+fetches `DFF` and `GS10` from FRED and saves them as `FEDFUNDS.parquet` and
+`TNX_FRED.parquet`, then swap the `irx_series` loader in `dataset.py` to read
+`FEDFUNDS.parquet`. The feature computation in `feature_engineer.py` is
+unchanged — it only cares about the aligned pandas Series.
+
+---
 
 ### Momentum and volume
 
