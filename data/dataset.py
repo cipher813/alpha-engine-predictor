@@ -31,121 +31,149 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import torch
-from torch.utils.data import DataLoader, Dataset, Sampler
+
+# PyTorch is imported lazily — only needed for DataLoader-based functions
+# (build_datasets, build_regression_datasets), not for build_regression_arrays.
+try:
+    import torch
+    from torch.utils.data import DataLoader, Dataset, Sampler
+    _HAS_TORCH = True
+except ImportError:
+    _HAS_TORCH = False
 
 log = logging.getLogger(__name__)
 
 
-class PredictorDataset(Dataset):
-    """
-    PyTorch Dataset wrapping (feature_vector, direction_label) pairs.
+# ── PyTorch-dependent classes (only defined when torch is available) ──────────
+# These are used by build_datasets() and build_regression_datasets() which
+# return DataLoaders. build_regression_arrays() does NOT need them.
 
-    Parameters
-    ----------
-    X : np.ndarray, shape (N, n_features)
-        Feature matrix — technical indicators per sample.
-    y : np.ndarray, shape (N,)
-        Integer direction labels: 0=DOWN, 1=FLAT, 2=UP.
-    """
+if _HAS_TORCH:
 
-    def __init__(self, X: np.ndarray, y: np.ndarray, date_indices: np.ndarray | None = None) -> None:
-        if X.shape[0] != y.shape[0]:
-            raise ValueError(
-                f"X and y must have same number of samples: {X.shape[0]} != {y.shape[0]}"
+    class PredictorDataset(Dataset):
+        """
+        PyTorch Dataset wrapping (feature_vector, direction_label) pairs.
+
+        Parameters
+        ----------
+        X : np.ndarray, shape (N, n_features)
+            Feature matrix — technical indicators per sample.
+        y : np.ndarray, shape (N,)
+            Integer direction labels: 0=DOWN, 1=FLAT, 2=UP.
+        """
+
+        def __init__(self, X: np.ndarray, y: np.ndarray, date_indices: np.ndarray | None = None) -> None:
+            if X.shape[0] != y.shape[0]:
+                raise ValueError(
+                    f"X and y must have same number of samples: {X.shape[0]} != {y.shape[0]}"
+                )
+            self.X = X.astype(np.float32)
+            self.y = y.astype(np.int64)
+            self.date_indices = date_indices  # for DateGroupedSampler; not returned by __getitem__
+
+        def __len__(self) -> int:
+            return len(self.y)
+
+        def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+            return (
+                torch.FloatTensor(self.X[idx]),
+                torch.LongTensor([self.y[idx]])[0],
             )
-        self.X = X.astype(np.float32)
-        self.y = y.astype(np.int64)
-        self.date_indices = date_indices  # for DateGroupedSampler; not returned by __getitem__
-
-    def __len__(self) -> int:
-        return len(self.y)
-
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        return (
-            torch.FloatTensor(self.X[idx]),
-            torch.LongTensor([self.y[idx]])[0],
-        )
 
 
-class RegressionDataset(Dataset):
-    """
-    PyTorch Dataset wrapping (feature_vector, forward_return) pairs for
-    regression-mode training (directly predicting continuous 5-day returns).
+    class RegressionDataset(Dataset):
+        """
+        PyTorch Dataset wrapping (feature_vector, forward_return) pairs for
+        regression-mode training (directly predicting continuous 5-day returns).
 
-    Parameters
-    ----------
-    X : np.ndarray, shape (N, n_features)
-        Feature matrix — technical indicators per sample.
-    y : np.ndarray, shape (N,)
-        Continuous forward return values (float32).
-    date_indices : np.ndarray or None
-        Integer date group IDs for DateGroupedSampler. Not returned by __getitem__.
-    """
+        Parameters
+        ----------
+        X : np.ndarray, shape (N, n_features)
+            Feature matrix — technical indicators per sample.
+        y : np.ndarray, shape (N,)
+            Continuous forward return values (float32).
+        date_indices : np.ndarray or None
+            Integer date group IDs for DateGroupedSampler. Not returned by __getitem__.
+        """
 
-    def __init__(self, X: np.ndarray, y: np.ndarray, date_indices: np.ndarray | None = None) -> None:
-        if X.shape[0] != y.shape[0]:
-            raise ValueError(
-                f"X and y must have same number of samples: {X.shape[0]} != {y.shape[0]}"
+        def __init__(self, X: np.ndarray, y: np.ndarray, date_indices: np.ndarray | None = None) -> None:
+            if X.shape[0] != y.shape[0]:
+                raise ValueError(
+                    f"X and y must have same number of samples: {X.shape[0]} != {y.shape[0]}"
+                )
+            self.X = X.astype(np.float32)
+            self.y = y.astype(np.float32)
+            self.date_indices = date_indices  # for DateGroupedSampler; not returned by __getitem__
+
+        def __len__(self) -> int:
+            return len(self.y)
+
+        def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+            return (
+                torch.FloatTensor(self.X[idx]),
+                torch.FloatTensor([self.y[idx]])[0],
             )
-        self.X = X.astype(np.float32)
-        self.y = y.astype(np.float32)
-        self.date_indices = date_indices  # for DateGroupedSampler; not returned by __getitem__
-
-    def __len__(self) -> int:
-        return len(self.y)
-
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        return (
-            torch.FloatTensor(self.X[idx]),
-            torch.FloatTensor([self.y[idx]])[0],
-        )
 
 
-class DateGroupedSampler(Sampler):
-    """
-    Batch sampler that yields all sample indices for a single trading date
-    as one batch. Aligns mini-batch ICLoss with true cross-sectional IC.
+    class DateGroupedSampler(Sampler):
+        """
+        Batch sampler that yields all sample indices for a single trading date
+        as one batch. Aligns mini-batch ICLoss with true cross-sectional IC.
 
-    Each batch contains all stocks from one date (~770-900 samples).
-    Date order is shuffled for training; kept sequential for val/test.
+        Each batch contains all stocks from one date (~770-900 samples).
+        Date order is shuffled for training; kept sequential for val/test.
 
-    Use with DataLoader(batch_sampler=...) — mutually exclusive with
-    batch_size, shuffle, sampler, and drop_last.
-    """
+        Use with DataLoader(batch_sampler=...) — mutually exclusive with
+        batch_size, shuffle, sampler, and drop_last.
+        """
 
-    def __init__(self, date_indices: np.ndarray, shuffle: bool = True, seed: int = 42) -> None:
-        self.shuffle = shuffle
-        self.seed = seed
-        self._epoch = 0
+        def __init__(self, date_indices: np.ndarray, shuffle: bool = True, seed: int = 42) -> None:
+            self.shuffle = shuffle
+            self.seed = seed
+            self._epoch = 0
 
-        # Build mapping: date_group_id → list of sample indices
-        self._date_to_indices: dict[int, list[int]] = {}
-        for sample_idx, date_id in enumerate(date_indices):
-            self._date_to_indices.setdefault(int(date_id), []).append(sample_idx)
-        self._date_ids = sorted(self._date_to_indices.keys())
+            # Build mapping: date_group_id → list of sample indices
+            self._date_to_indices: dict[int, list[int]] = {}
+            for sample_idx, date_id in enumerate(date_indices):
+                self._date_to_indices.setdefault(int(date_id), []).append(sample_idx)
+            self._date_ids = sorted(self._date_to_indices.keys())
 
-    def __iter__(self):
-        date_order = list(self._date_ids)
-        if self.shuffle:
-            rng = np.random.RandomState(self.seed + self._epoch)
-            rng.shuffle(date_order)
-        for date_id in date_order:
-            yield self._date_to_indices[date_id]
+        def __iter__(self):
+            date_order = list(self._date_ids)
+            if self.shuffle:
+                rng = np.random.RandomState(self.seed + self._epoch)
+                rng.shuffle(date_order)
+            for date_id in date_order:
+                yield self._date_to_indices[date_id]
 
-    def __len__(self) -> int:
-        return len(self._date_ids)
+        def __len__(self) -> int:
+            return len(self._date_ids)
 
-    def set_epoch(self, epoch: int) -> None:
-        """Set epoch for deterministic per-epoch shuffling."""
-        self._epoch = epoch
+        def set_epoch(self, epoch: int) -> None:
+            """Set epoch for deterministic per-epoch shuffling."""
+            self._epoch = epoch
+
+
+def _parquet_engine() -> str:
+    """Return best available parquet engine (pyarrow preferred, fastparquet fallback)."""
+    try:
+        import pyarrow  # noqa: F401
+        return "pyarrow"
+    except ImportError:
+        return "fastparquet"
 
 
 def _load_ticker_parquet(path: Path) -> pd.DataFrame:
     """Load a single parquet file and return its DataFrame. Returns empty on error."""
     try:
-        df = pd.read_parquet(path, engine="pyarrow")
-        df.index = pd.to_datetime(df.index)
+        df = pd.read_parquet(path, engine=_parquet_engine())
+        idx = pd.to_datetime(df.index)
+        # Always normalize to timezone-naive UTC so compute_features' reindex() calls
+        # don't raise TypeError when mixing pyarrow-written (tz-naive) and
+        # fastparquet-written (potentially tz-aware) parquets.
+        if idx.tz is not None:
+            idx = idx.tz_convert("UTC").tz_localize(None)
+        df.index = idx
         if not df.index.is_monotonic_increasing:
             df = df.sort_index()
         return df
@@ -343,26 +371,65 @@ def build_datasets(
     N = len(y_all)
     log.info("Total samples: %d (date range: %s → %s)", N, all_dates[0], all_dates[-1])
 
-    # ── Time-based split ──────────────────────────────────────────────────────
+    # ── Time-based split with purge gaps ────────────────────────────────────
+    # Forward-return labels use FORWARD_DAYS of future prices. Without a
+    # purge gap, the last train label and first val label share 4 of 5
+    # price days (~80% overlap). We skip FORWARD_DAYS unique dates at each
+    # boundary to eliminate this information leakage.
+    purge_days = getattr(config_module, "FORWARD_DAYS", 5)
     n_train = int(N * config_module.TRAIN_FRAC)
-    n_val = int(N * config_module.VAL_FRAC)
-    # test gets the remainder (most recent data)
+    n_val_raw = int(N * config_module.VAL_FRAC)
+
+    # --- Purge gap 1: train → val ---
+    train_end_date = all_dates[n_train - 1]
+    unique_post_train = sorted(set(d for d in all_dates[n_train:] if d > train_end_date))
+    if len(unique_post_train) >= purge_days:
+        purge_cutoff_1 = unique_post_train[purge_days - 1]
+        val_start = next(i for i in range(n_train, N) if all_dates[i] > purge_cutoff_1)
+    else:
+        val_start = n_train
+
+    # --- Val slice ---
+    val_end = val_start + n_val_raw
+    if val_end > N:
+        val_end = N
+
+    # --- Purge gap 2: val → test ---
+    val_end_date = all_dates[min(val_end - 1, N - 1)]
+    unique_post_val = sorted(set(d for d in all_dates[val_end:] if d > val_end_date))
+    if len(unique_post_val) >= purge_days:
+        purge_cutoff_2 = unique_post_val[purge_days - 1]
+        test_start = next(i for i in range(val_end, N) if all_dates[i] > purge_cutoff_2)
+    else:
+        test_start = val_end
+
+    n_purged_1 = val_start - n_train
+    n_purged_2 = test_start - val_end
+    log.info(
+        "Purge gaps: train_end=%s → val_start=%s (%d samples, %d dates skipped) | "
+        "val_end=%s → test_start=%s (%d samples, %d dates skipped)",
+        train_end_date, all_dates[val_start] if val_start < N else "END",
+        n_purged_1, purge_days,
+        val_end_date, all_dates[test_start] if test_start < N else "END",
+        n_purged_2, purge_days,
+    )
 
     X_train = X_all[:n_train]
     y_train = y_all[:n_train]
 
-    X_val = X_all[n_train : n_train + n_val]
-    y_val = y_all[n_train : n_train + n_val]
+    X_val = X_all[val_start:val_end]
+    y_val = y_all[val_start:val_end]
 
-    X_test = X_all[n_train + n_val :]
-    y_test = y_all[n_train + n_val :]
-    fwd_test = fwd_all[n_train + n_val :]
+    X_test = X_all[test_start:]
+    y_test = y_all[test_start:]
+    fwd_test = fwd_all[test_start:]
 
     log.info(
-        "Split: train=%d  val=%d  test=%d",
+        "Split: train=%d  val=%d  test=%d  (purged=%d)",
         len(y_train),
         len(y_val),
         len(y_test),
+        n_purged_1 + n_purged_2,
     )
 
     # ── Z-score normalization (fit on train, apply to all) ────────────────────
@@ -415,6 +482,130 @@ def build_datasets(
     )
 
     return train_loader, val_loader, test_loader, fwd_test
+
+
+def build_regression_arrays(
+    data_dir: str,
+    config_module,
+) -> tuple[np.ndarray, np.ndarray, list]:
+    """
+    Load parquets, compute features + labels, return unsplit arrays.
+
+    Same pipeline as build_regression_datasets() but stops before splitting,
+    normalization, or DataLoader construction. Used by walk-forward evaluation
+    which performs its own splitting.
+
+    Returns
+    -------
+    (X_all, fwd_all, all_dates)
+        X_all : np.ndarray, shape (N, n_features) — raw features (not normalized)
+        fwd_all : np.ndarray, shape (N,) — forward_return_5d (winsorized)
+        all_dates : list — one pd.Timestamp per sample, sorted ascending
+    """
+    from data.feature_engineer import compute_features
+    from data.label_generator import compute_labels
+
+    data_path = Path(data_dir)
+    parquet_files = sorted(data_path.glob("*.parquet"))
+    if not parquet_files:
+        raise FileNotFoundError(f"No parquet files found in {data_dir}.")
+
+    # Load reference series (same logic as build_regression_datasets)
+    spy_series = None
+    spy_path = data_path / "SPY.parquet"
+    if spy_path.exists():
+        spy_df = _load_ticker_parquet(spy_path)
+        if not spy_df.empty and "Close" in spy_df.columns:
+            spy_series = spy_df["Close"].astype(float)
+
+    vix_series = None
+    vix_path = data_path / "VIX.parquet"
+    if vix_path.exists():
+        vix_df = _load_ticker_parquet(vix_path)
+        if not vix_df.empty and "Close" in vix_df.columns:
+            vix_series = vix_df["Close"].astype(float)
+
+    def _load_close(fn):
+        p = data_path / fn
+        if not p.exists():
+            return None
+        d = _load_ticker_parquet(p)
+        if d.empty or "Close" not in d.columns:
+            return None
+        return d["Close"].astype(float)
+
+    tnx_series = _load_close("TNX.parquet")
+    irx_series = _load_close("IRX.parquet")
+    gld_series = _load_close("GLD.parquet")
+    uso_series = _load_close("USO.parquet")
+
+    sector_map: dict[str, str] = {}
+    sector_map_path = data_path / "sector_map.json"
+    if sector_map_path.exists():
+        sector_map = json.loads(sector_map_path.read_text())
+
+    sector_etf_cache: dict[str, pd.Series] = {}
+    for etf_symbol in set(sector_map.values()):
+        etf_path = data_path / f"{etf_symbol}.parquet"
+        if etf_path.exists():
+            etf_df = _load_ticker_parquet(etf_path)
+            if not etf_df.empty and "Close" in etf_df.columns:
+                sector_etf_cache[etf_symbol] = etf_df["Close"].astype(float)
+
+    _SKIP = {
+        "SPY", "VIX", "TNX", "IRX", "GLD", "USO",
+        "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "XLB", "XLRE", "XLC",
+    }
+
+    all_rows: list[tuple] = []
+    for path in parquet_files:
+        ticker_name = path.stem
+        if ticker_name in _SKIP:
+            continue
+        raw_df = _load_ticker_parquet(path)
+        if raw_df.empty or len(raw_df) < 265:
+            continue
+        sector_etf_sym = sector_map.get(ticker_name)
+        sector_etf_series = sector_etf_cache.get(sector_etf_sym) if sector_etf_sym else None
+        try:
+            featured_df = compute_features(
+                raw_df, spy_series=spy_series, vix_series=vix_series,
+                sector_etf_series=sector_etf_series, tnx_series=tnx_series,
+                irx_series=irx_series, gld_series=gld_series, uso_series=uso_series,
+            )
+            labeled_df = compute_labels(
+                featured_df,
+                forward_days=config_module.FORWARD_DAYS,
+                up_threshold=config_module.UP_THRESHOLD,
+                down_threshold=config_module.DOWN_THRESHOLD,
+                benchmark_returns=sector_etf_series if sector_etf_series is not None else spy_series,
+            )
+        except Exception:
+            continue
+        if labeled_df.empty:
+            continue
+        features_arr = labeled_df[config_module.FEATURES].to_numpy(dtype=np.float32)
+        fwd_returns_arr = labeled_df["forward_return_5d"].to_numpy(dtype=np.float32)
+        dates = labeled_df.index
+        for j in range(len(dates)):
+            all_rows.append((dates[j], features_arr[j], float(fwd_returns_arr[j])))
+
+    if not all_rows:
+        raise ValueError("No valid samples generated.")
+
+    all_rows.sort(key=lambda r: r[0])
+    all_dates = [r[0] for r in all_rows]
+    X_all = np.stack([r[1] for r in all_rows], axis=0)
+    fwd_all = np.array([r[2] for r in all_rows], dtype=np.float32)
+
+    # Winsorize
+    label_clip = getattr(config_module, "LABEL_CLIP", None)
+    if label_clip is not None:
+        fwd_all = np.clip(fwd_all, -label_clip, label_clip)
+
+    log.info("build_regression_arrays: %d samples, %d unique dates",
+             len(fwd_all), len(set(all_dates)))
+    return X_all, fwd_all, all_dates
 
 
 def build_regression_datasets(
@@ -592,24 +783,62 @@ def build_regression_datasets(
     N = len(fwd_all)
     log.info("Regression dataset: %d samples, %d unique dates", N, len(unique_dates))
 
-    # Time-based split with date-boundary alignment
-    n_train = int(N * config_module.TRAIN_FRAC)
-    n_val = int(N * config_module.VAL_FRAC)
+    # Time-based split with date-boundary alignment and purge gaps.
+    # Forward-return labels use FORWARD_DAYS of future prices. Without a
+    # purge gap, the last train label and first val label share 4 of 5
+    # price days (~80% overlap). We skip FORWARD_DAYS unique dates at each
+    # boundary to eliminate this information leakage.
+    purge_days = getattr(config_module, "FORWARD_DAYS", 5)
 
-    # Advance split points to date boundaries (don't split a date across sets)
+    n_train = int(N * config_module.TRAIN_FRAC)
+    n_val_raw = int(N * config_module.VAL_FRAC)
+
+    # Advance train boundary to date boundary (don't split a date across sets)
     while n_train < N and all_dates[n_train] == all_dates[n_train - 1]:
         n_train += 1
-    val_end = n_train + n_val
+
+    # --- Purge gap 1: train → val ---
+    train_end_date = all_dates[n_train - 1]
+    unique_post_train = sorted(set(d for d in all_dates[n_train:] if d > train_end_date))
+    if len(unique_post_train) >= purge_days:
+        purge_cutoff_1 = unique_post_train[purge_days - 1]
+        val_start = next(i for i in range(n_train, N) if all_dates[i] > purge_cutoff_1)
+    else:
+        val_start = n_train
+
+    # --- Val slice with date-boundary alignment ---
+    val_end = val_start + n_val_raw
+    if val_end > N:
+        val_end = N
     while val_end < N and all_dates[val_end] == all_dates[val_end - 1]:
         val_end += 1
-    n_val = val_end - n_train
+
+    # --- Purge gap 2: val → test ---
+    val_end_date = all_dates[min(val_end - 1, N - 1)]
+    unique_post_val = sorted(set(d for d in all_dates[val_end:] if d > val_end_date))
+    if len(unique_post_val) >= purge_days:
+        purge_cutoff_2 = unique_post_val[purge_days - 1]
+        test_start = next(i for i in range(val_end, N) if all_dates[i] > purge_cutoff_2)
+    else:
+        test_start = val_end
+
+    n_purged_1 = val_start - n_train
+    n_purged_2 = test_start - val_end
+    log.info(
+        "Purge gaps: train_end=%s → val_start=%s (%d samples, %d dates skipped) | "
+        "val_end=%s → test_start=%s (%d samples, %d dates skipped)",
+        train_end_date, all_dates[val_start] if val_start < N else "END",
+        n_purged_1, purge_days,
+        val_end_date, all_dates[test_start] if test_start < N else "END",
+        n_purged_2, purge_days,
+    )
 
     X_train = X_all[:n_train]
     fwd_train = fwd_all[:n_train]
-    X_val = X_all[n_train : n_train + n_val]
-    fwd_val = fwd_all[n_train : n_train + n_val]
-    X_test = X_all[n_train + n_val :]
-    fwd_test = fwd_all[n_train + n_val :]
+    X_val = X_all[val_start:val_end]
+    fwd_val = fwd_all[val_start:val_end]
+    X_test = X_all[test_start:]
+    fwd_test = fwd_all[test_start:]
 
     # Split and re-index date IDs within each set (0-based contiguous)
     def _reindex(ids: np.ndarray) -> np.ndarray:
@@ -618,10 +847,14 @@ def build_regression_datasets(
         return np.array([m[x] for x in ids], dtype=np.int64)
 
     date_ids_train = _reindex(date_ids_all[:n_train])
-    date_ids_val = _reindex(date_ids_all[n_train : n_train + n_val])
-    date_ids_test = _reindex(date_ids_all[n_train + n_val :])
+    date_ids_val = _reindex(date_ids_all[val_start:val_end])
+    date_ids_test = _reindex(date_ids_all[test_start:])
 
-    log.info("Regression split: train=%d  val=%d  test=%d", len(fwd_train), len(fwd_val), len(fwd_test))
+    log.info(
+        "Regression split: train=%d  val=%d  test=%d  (purged=%d)",
+        len(fwd_train), len(fwd_val), len(fwd_test),
+        n_purged_1 + n_purged_2,
+    )
 
     # Z-score normalize (fit on train, apply to all)
     feat_mean = X_train.mean(axis=0)

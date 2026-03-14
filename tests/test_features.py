@@ -51,7 +51,7 @@ class TestComputeFeatures:
     """Tests for compute_features()."""
 
     def test_output_has_all_feature_columns(self):
-        """compute_features() must return a DataFrame with all 8 feature columns."""
+        """compute_features() must return a DataFrame with all feature columns."""
         df = _make_ohlcv(250)
         result = compute_features(df)
 
@@ -59,7 +59,7 @@ class TestComputeFeatures:
             assert col in result.columns, f"Missing column: {col}"
 
     def test_output_column_count(self):
-        """All 8 config.FEATURES must be present."""
+        """All config.FEATURES must be present."""
         df = _make_ohlcv(250)
         result = compute_features(df)
         for feat in FEATURES:
@@ -129,7 +129,7 @@ class TestComputeFeatures:
         assert result.empty
 
     def test_features_to_array_shape(self):
-        """features_to_array() must return shape (N, 8)."""
+        """features_to_array() must return shape (N, N_FEATURES)."""
         df = _make_ohlcv(300)
         result = compute_features(df)
         arr = features_to_array(result)
@@ -154,10 +154,11 @@ class TestComputeFeatures:
         assert len(result) == len(result_sorted)
 
     def test_sufficient_rows_after_warmup(self):
-        """With 300 rows, there should be at least 100 usable rows after MA200 warmup."""
+        """With 300 rows, there should be some usable rows after 252-day warmup."""
         df = _make_ohlcv(300)
         result = compute_features(df)
-        assert len(result) >= 100, f"Expected >=100 rows, got {len(result)}"
+        # 252-day warmup for 52w rolling windows leaves ~48 rows from 300 input
+        assert len(result) >= 30, f"Expected >=30 rows, got {len(result)}"
 
     def test_price_vs_ma50_range(self):
         """price_vs_ma50 should be a small decimal ratio, not a percent like ±100."""
@@ -166,4 +167,63 @@ class TestComputeFeatures:
         # For a random walk around 100, should be within ±50% = ±0.50 ratio
         assert result["price_vs_ma50"].abs().max() < 1.0, (
             "price_vs_ma50 seems to be in percent (×100) rather than ratio"
+        )
+
+    # ── v1.4 feature tests ──────────────────────────────────────────────────
+
+    def test_atr_14_pct_positive(self):
+        """ATR is always positive (it's an average of absolute ranges)."""
+        df = _make_ohlcv(300)
+        result = compute_features(df)
+        assert (result["atr_14_pct"] > 0).all(), "atr_14_pct has non-positive values"
+        # For a random walk with 1% daily vol, ATR/price should be < 10%
+        assert result["atr_14_pct"].max() < 0.20, "atr_14_pct unreasonably large"
+
+    def test_realized_vol_20d_positive(self):
+        """Realized volatility must be positive."""
+        df = _make_ohlcv(300)
+        result = compute_features(df)
+        assert (result["realized_vol_20d"] > 0).all(), "realized_vol_20d has non-positive values"
+        # Annualized vol should typically be < 100% for a random walk
+        assert result["realized_vol_20d"].max() < 1.0, "realized_vol_20d unreasonably large"
+
+    def test_volume_trend_positive(self):
+        """Volume trend (SMA5/SMA20 ratio) must be positive."""
+        df = _make_ohlcv(300)
+        result = compute_features(df)
+        assert (result["volume_trend"] > 0).all(), "volume_trend has non-positive values"
+
+    def test_volume_price_div_in_valid_range(self):
+        """volume_price_div must be in {-1.0, 0.0, 1.0}."""
+        df = _make_ohlcv(300)
+        result = compute_features(df)
+        unique_vals = set(result["volume_price_div"].unique())
+        assert unique_vals.issubset({-1.0, 0.0, 1.0}), (
+            f"volume_price_div has unexpected values: {unique_vals}"
+        )
+
+    def test_rsi_slope_5d_reasonable(self):
+        """RSI slope should be a small number (RSI range 0-100, divided by 5)."""
+        df = _make_ohlcv(300)
+        result = compute_features(df)
+        # Max RSI change over 5 days / 5 should be < 20 (100/5)
+        assert result["rsi_slope_5d"].abs().max() < 20, "rsi_slope_5d unreasonably large"
+
+    def test_new_features_no_nan(self):
+        """All v1.4 features must have no NaN after warmup."""
+        df = _make_ohlcv(300)
+        result = compute_features(df)
+        v14_features = [
+            "price_accel", "ema_cross_8_21", "atr_14_pct", "realized_vol_20d",
+            "volume_trend", "obv_slope_10d", "rsi_slope_5d", "volume_price_div",
+        ]
+        for col in v14_features:
+            assert col in result.columns, f"Missing v1.4 column: {col}"
+            nan_count = result[col].isnull().sum()
+            assert nan_count == 0, f"v1.4 column {col} has {nan_count} NaN values"
+
+    def test_n_features_matches_config(self):
+        """The FEATURES list length must match N_FEATURES constant."""
+        assert len(FEATURES) == N_FEATURES, (
+            f"FEATURES list has {len(FEATURES)} entries but N_FEATURES={N_FEATURES}"
         )

@@ -5,7 +5,11 @@ Called by the Lambda handler (inference/handler.py) and optionally from the
 CLI for local testing. Orchestrates:
   1. Load model weights from S3 (or local path with --local flag).
   2. Determine the active ticker universe.
-  3. Fetch today's 1-year OHLCV data via yfinance.
+  3. Fetch today's 2-year adjusted OHLCV data via yfinance (for features).
+  3b. Load sector map + fetch macro/sector ETF series.
+  3c. Save raw (unadjusted) daily closes to S3 at
+      predictor/daily_closes/{date}.parquet — building the independent
+      price archive over time (see save_daily_closes() for rationale).
   4. Compute features and run inference for each ticker.
   5. Write predictions JSON to S3 at both dated path and latest.json.
   6. Write metrics/latest.json.
@@ -308,7 +312,7 @@ def load_watchlist(
         "= %d unique tickers (%d overlap)",
         len(universe_tickers), len(buy_cand_tickers), len(tickers), n_overlap,
     )
-    return tickers, sources
+    return tickers, sources, data
 
 
 # ── Price fetch ───────────────────────────────────────────────────────────────
@@ -472,6 +476,422 @@ def fetch_macro_series(
 
     log.info("Macro series loaded: %s", sorted(keyed.keys()))
     return keyed
+
+
+# ── Daily raw-price archive ────────────────────────────────────────────────────
+
+def save_daily_closes(
+    tickers: list[str],
+    date_str: str,
+    s3_bucket: str,
+    dry_run: bool = False,
+) -> int:
+    """
+    Fetch and archive today's OHLCV for all tickers using ``auto_adjust=False``.
+
+    Writes one parquet file per trading day:
+        predictor/daily_closes/{date_str}.parquet
+    Schema: index=ticker (str), columns=[date, open, high, low, close, adj_close, volume]
+
+    **What yfinance actually stores — no truly raw mode exists:**
+    yfinance provides NO mode that yields truly raw (unadjusted) prices via batch
+    download.  ``auto_adjust=False``, ``back_adjust=False``, and ``actions=False``
+    all return the same *backward-split-adjusted* series — every historical price
+    is retroactively divided by the cumulative split factor so the current price is
+    the reference point.  Example: NVDA's true raw close on Jan 2, 2024 was ~$481;
+    yfinance returns ~$48 because it has already divided by the 10× June 2024 split.
+    ``adj_close / close`` captures only the dividend adjustment factor (~0.999 on
+    dividend dates, 1.0 otherwise).  True raw prices would require a separate data
+    provider (e.g., Polygon.io) that stores prices and corporate actions independently.
+
+    What we actually save:
+    - ``close``     = backward-split-adjusted close (same basis as the training
+                      cache / slim cache which use auto_adjust=True).  The two modes
+                      differ only by the dividend factor, which is negligible for
+                      momentum/RSI/MACD features (~0.1% per dividend event).
+    - ``adj_close`` = fully adjusted (splits + dividends) = auto_adjust=True close.
+
+    **Split-boundary staleness and how it is handled:**
+    When a stock splits after a daily_closes entry has been saved, yfinance
+    retroactively revises that ticker's historical prices to the new split basis.
+    The saved entry retains its original value, creating a price discontinuity
+    in the combined slim-cache + daily-closes series.  ``load_price_data_from_cache``
+    detects any |single-day return| > 45% as a split event and re-fetches that
+    ticker from yfinance.  Splits affect ~1-2 tickers per week; the remaining ~898
+    tickers every day require no yfinance call at all.  The slim cache is rebuilt
+    every Sunday, clearing all stale split-boundary entries.
+
+    Parameters
+    ----------
+    tickers :   Tickers to capture.
+    date_str :  Trading date label YYYY-MM-DD (file key and 'date' column value).
+    s3_bucket : S3 bucket name.
+    dry_run :   Log what would be written but skip the S3 put.
+
+    Returns
+    -------
+    Number of tickers successfully captured (0 on failure).
+    """
+    import io
+
+    import boto3
+    import yfinance as yf
+
+    log.info(
+        "Capturing daily closes for %d tickers, date=%s …",
+        len(tickers), date_str,
+    )
+
+    records: list[dict] = []
+    batch_size = 100
+    batches = [tickers[i : i + batch_size] for i in range(0, len(tickers), batch_size)]
+
+    for batch in batches:
+        try:
+            tickers_arg = batch[0] if len(batch) == 1 else batch
+            raw = yf.download(
+                tickers=tickers_arg,
+                period="5d",        # only need the most-recent row — fast fetch
+                interval="1d",
+                auto_adjust=False,  # keeps both Close (split-adj) and Adj Close (full-adj)
+                progress=False,
+                group_by="ticker",
+                threads=True,
+            )
+            is_multi = isinstance(raw.columns, pd.MultiIndex)
+
+            for ticker in batch:
+                try:
+                    df = (raw[ticker] if is_multi else raw).copy()
+                    df.index = pd.to_datetime(df.index)
+                    if df.index.tz is not None:
+                        df.index = df.index.tz_convert("UTC").tz_localize(None)
+                    df = df.dropna(subset=["Close"])
+                    if df.empty:
+                        continue
+
+                    last = df.iloc[-1]
+                    raw_close = float(last["Close"])
+                    adj_close = float(last["Adj Close"]) if "Adj Close" in df.columns else raw_close
+                    records.append({
+                        "ticker":    ticker,
+                        "date":      date_str,
+                        "open":      round(float(last["Open"]),  4),
+                        "high":      round(float(last["High"]),  4),
+                        "low":       round(float(last["Low"]),   4),
+                        "close":     round(raw_close,            4),
+                        "adj_close": round(adj_close,            4),
+                        "volume":    int(last["Volume"]) if pd.notna(last.get("Volume")) else 0,
+                    })
+                except Exception as exc:
+                    log.debug("Close extract failed for %s: %s", ticker, exc)
+
+        except Exception as exc:
+            log.warning("Raw price batch failed: %s", exc)
+
+    if not records:
+        log.warning("No raw closes captured for %s — skipping S3 write", date_str)
+        return 0
+
+    closes_df = pd.DataFrame(records).set_index("ticker")
+    log.info(
+        "Raw closes captured: %d / %d tickers for %s",
+        len(closes_df), len(tickers), date_str,
+    )
+
+    if dry_run:
+        log.info(
+            "[dry-run] Would write %d closes to s3://%s/predictor/daily_closes/%s.parquet",
+            len(closes_df), s3_bucket, date_str,
+        )
+        return len(closes_df)
+
+    try:
+        s3  = boto3.client("s3")
+        buf = io.BytesIO()
+        closes_df.to_parquet(buf, engine="pyarrow", compression="snappy", index=True)
+        buf.seek(0)
+        key = f"predictor/daily_closes/{date_str}.parquet"
+        s3.put_object(
+            Bucket=s3_bucket,
+            Key=key,
+            Body=buf.getvalue(),
+            ContentType="application/octet-stream",
+        )
+        log.info(
+            "Daily closes written to s3://%s/%s  (%d tickers)",
+            s3_bucket, key, len(closes_df),
+        )
+        return len(closes_df)
+    except Exception as exc:
+        log.error("Failed to write daily closes to S3: %s", exc)
+        return 0
+
+
+# ── Slim-cache + daily-closes price loader ────────────────────────────────────
+
+_SLIM_PREFIX   = "predictor/price_cache_slim/"
+_CLOSES_PREFIX = "predictor/daily_closes/"
+
+# Single-day return magnitude above which we assume a split occurred.
+# A legitimate limit-up/down is ±20%; a split creates ±50%+ moves.
+_SPLIT_RETURN_THRESHOLD = 0.45
+
+
+def _download_slim_cache(s3_bucket: str, local_dir: Path) -> int:
+    """
+    Download all parquets from predictor/price_cache_slim/ to local_dir in parallel.
+    Returns number of files downloaded, or 0 if the prefix has no objects.
+    """
+    import boto3
+    from concurrent.futures import ThreadPoolExecutor
+
+    s3 = boto3.client("s3")
+    local_dir.mkdir(parents=True, exist_ok=True)
+
+    paginator = s3.get_paginator("list_objects_v2")
+    keys: list[str] = []
+    for page in paginator.paginate(Bucket=s3_bucket, Prefix=_SLIM_PREFIX):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            if key.endswith(".parquet"):
+                keys.append(key)
+
+    if not keys:
+        return 0
+
+    def _get(key: str) -> None:
+        fname = key[len(_SLIM_PREFIX):]
+        s3.download_file(s3_bucket, key, str(local_dir / fname))
+
+    with ThreadPoolExecutor(max_workers=20) as pool:
+        list(pool.map(_get, keys))
+
+    return len(keys)
+
+
+def _load_delta_from_daily_closes(
+    s3_bucket: str,
+    start_date: pd.Timestamp,
+    end_date: pd.Timestamp,
+) -> dict[str, list[dict]]:
+    """
+    Load daily_closes parquets for every trading day in (start_date, end_date).
+    Returns dict: ticker → list of {date, open, high, low, close, adj_close} dicts,
+    one entry per trading day found in S3.
+
+    start_date is exclusive (we already have it in the slim cache).
+    end_date   is inclusive (we want data up to and including this date).
+    """
+    import io
+    import boto3
+
+    s3 = boto3.client("s3")
+
+    # Build business-day range strictly after start_date and up to end_date
+    delta_dates = [
+        d.strftime("%Y-%m-%d")
+        for d in pd.bdate_range(
+            start_date + pd.Timedelta(days=1), end_date
+        )
+    ]
+
+    if not delta_dates:
+        return {}
+
+    log.info(
+        "Loading daily_closes delta: %d trading days (%s → %s)",
+        len(delta_dates), delta_dates[0], delta_dates[-1],
+    )
+
+    ticker_rows: dict[str, list[dict]] = {}
+
+    for d in delta_dates:
+        key = f"{_CLOSES_PREFIX}{d}.parquet"
+        try:
+            resp = s3.get_object(Bucket=s3_bucket, Key=key)
+            buf  = io.BytesIO(resp["Body"].read())
+            day_df = pd.read_parquet(buf, engine="pyarrow")
+            # index is ticker string
+            for ticker, row in day_df.iterrows():
+                if ticker not in ticker_rows:
+                    ticker_rows[ticker] = []
+                ticker_rows[ticker].append({
+                    "date":      pd.Timestamp(d),
+                    "open":      float(row.get("open",      row.get("Open",      np.nan))),
+                    "high":      float(row.get("high",      row.get("High",      np.nan))),
+                    "low":       float(row.get("low",       row.get("Low",       np.nan))),
+                    "close":     float(row.get("close",     row.get("Close",     np.nan))),
+                    "adj_close": float(row.get("adj_close", row.get("close",     np.nan))),
+                    "volume":    int(row.get("volume",      row.get("Volume",    0))),
+                })
+        except s3.exceptions.NoSuchKey:
+            log.debug("daily_closes/%s.parquet not found in S3 (non-trading day?)", d)
+        except Exception as exc:
+            log.warning("Could not load daily_closes/%s: %s", d, exc)
+
+    n_tickers = len(ticker_rows)
+    n_rows    = sum(len(v) for v in ticker_rows.values())
+    log.info("Delta loaded: %d rows across %d tickers", n_rows, n_tickers)
+    return ticker_rows
+
+
+def load_price_data_from_cache(
+    tickers: list[str],
+    date_str: str,
+    s3_bucket: str,
+) -> "tuple[dict[str, pd.DataFrame] | None, dict[str, pd.Series] | None]":
+    """
+    Load price history for inference from the slim cache + daily_closes delta.
+
+    This replaces the 2-year-per-day yfinance full download with:
+      1. S3 download of the slim cache (~9 MB, created weekly by train_handler).
+      2. S3 reads of daily_closes/{date}.parquet for each trading day between the
+         slim cache's last date and today (typically 1–4 files, each ~100 KB).
+      3. For tickers where the combined series shows a single-day price move
+         > ±45% (a stock split), re-fetch only those tickers from yfinance.
+
+    Also builds a macro dict (SPY, VIX, TNX, IRX, GLD, USO, sector ETFs) from
+    the slim cache, eliminating fetch_macro_series() entirely.
+
+    Returns
+    -------
+    (price_data, macro) in the same formats as fetch_today_prices() and
+    fetch_macro_series().  Returns (None, None) if the slim cache does not yet
+    exist — callers should fall back to fetch_today_prices() + fetch_macro_series().
+    """
+    import tempfile
+    from data.dataset import _load_ticker_parquet
+
+    today = pd.Timestamp(date_str).normalize()
+
+    # ── Step 1: Download slim cache ───────────────────────────────────────────
+    tmp_dir  = Path(tempfile.mkdtemp())
+    slim_dir = tmp_dir / "slim_cache"
+
+    log.info("Attempting slim-cache load from s3://%s/%s …", s3_bucket, _SLIM_PREFIX)
+    n_slim = _download_slim_cache(s3_bucket, slim_dir)
+
+    if n_slim == 0:
+        log.info("Slim cache not found — will fall back to yfinance")
+        return None, None
+
+    log.info("Slim cache downloaded: %d parquets", n_slim)
+
+    # ── Step 2: Load slim cache into memory ───────────────────────────────────
+    slim_data: dict[str, pd.DataFrame] = {}
+    for pq in slim_dir.glob("*.parquet"):
+        df = _load_ticker_parquet(pq)
+        if not df.empty:
+            slim_data[pq.stem] = df
+
+    if not slim_data:
+        log.warning("Slim cache parquets empty — falling back to yfinance")
+        return None, None
+
+    slim_last_date = max(df.index.max() for df in slim_data.values())
+    slim_last_date = pd.Timestamp(slim_last_date).normalize()
+    log.info(
+        "Slim cache loaded: %d tickers, last date: %s",
+        len(slim_data), slim_last_date.date(),
+    )
+
+    # ── Step 3: Load daily_closes delta ──────────────────────────────────────
+    ticker_rows = _load_delta_from_daily_closes(
+        s3_bucket, slim_last_date, today - pd.Timedelta(days=1),
+    )
+
+    # ── Step 4: Build combined price_data per ticker ──────────────────────────
+    price_data:    dict[str, pd.DataFrame] = {}
+    split_tickers: set[str]                = set()
+
+    # Start with all tickers found in the slim cache
+    for ticker, slim_df in slim_data.items():
+        base_cols = ["Open", "High", "Low", "Close", "Volume"]
+        # Only keep columns that exist
+        base = slim_df[[c for c in base_cols if c in slim_df.columns]].copy()
+
+        delta = ticker_rows.get(ticker, [])
+        if not delta:
+            price_data[ticker] = base
+            continue
+
+        # Build delta DataFrame (capitalize to match slim cache schema)
+        delta_df = pd.DataFrame(
+            [{
+                "Open":   r["open"],
+                "High":   r["high"],
+                "Low":    r["low"],
+                "Close":  r["close"],
+                "Volume": r["volume"],
+            } for r in delta],
+            index=pd.DatetimeIndex([r["date"] for r in delta]),
+        )
+
+        combined = pd.concat([base, delta_df])
+        combined = combined[~combined.index.duplicated(keep="last")].sort_index()
+
+        # Split detection: any single-day Close return beyond threshold
+        returns = combined["Close"].pct_change().dropna()
+        if (returns.abs() > _SPLIT_RETURN_THRESHOLD).any():
+            log.info(
+                "Split/large-move detected in %s — will re-fetch from yfinance", ticker,
+            )
+            split_tickers.add(ticker)
+        else:
+            price_data[ticker] = combined
+
+    # Tickers in requested list but not in slim cache get re-fetched too
+    missing = set(tickers) - set(slim_data.keys())
+    if missing:
+        log.info("%d tickers not in slim cache — adding to re-fetch list", len(missing))
+        split_tickers.update(missing)
+
+    # ── Step 5: Re-fetch split/missing tickers from yfinance ─────────────────
+    if split_tickers:
+        log.info(
+            "Re-fetching %d tickers from yfinance (splits/missing): %s …",
+            len(split_tickers),
+            sorted(split_tickers)[:10],
+        )
+        fresh = fetch_today_prices(sorted(split_tickers))
+        price_data.update(fresh)
+
+    n_success = sum(1 for df in price_data.values() if not df.empty)
+    log.info(
+        "Cache-based price load complete: %d/%d tickers  "
+        "(%d from slim+delta, %d yfinance re-fetches)",
+        n_success, len(tickers),
+        n_success - len(split_tickers) + sum(1 for t in split_tickers if not price_data.get(t, pd.DataFrame()).empty),
+        len(split_tickers),
+    )
+
+    # ── Step 6: Build macro dict from slim cache ──────────────────────────────
+    # These symbols are stored without caret in the training cache parquets.
+    _MACRO_SLIM_KEYS = {
+        "SPY": "SPY",
+        "VIX": "VIX",   # stored as VIX, yfinance ticker is ^VIX
+        "TNX": "TNX",   # stored as TNX, yfinance ticker is ^TNX
+        "IRX": "IRX",
+        "GLD": "GLD",
+        "USO": "USO",
+    }
+    macro: dict[str, pd.Series] = {}
+    for key, stem in _MACRO_SLIM_KEYS.items():
+        # Prefer combined price_data (includes delta) over raw slim_data
+        source = price_data.get(stem) or slim_data.get(stem)
+        if source is not None and "Close" in source.columns:
+            macro[key] = source["Close"].dropna()
+        else:
+            log.debug("Macro series %s not in slim cache", key)
+
+    # Sector ETFs: any XL* symbols in the slim cache
+    for stem, df in slim_data.items():
+        if stem.startswith("XL") and "Close" in df.columns:
+            source = price_data.get(stem) or df
+            macro[stem] = source["Close"].dropna()
+
+    return price_data, macro
 
 
 # ── Per-ticker prediction ─────────────────────────────────────────────────────
@@ -765,6 +1185,367 @@ def write_predictions(
         log.error("Predictions not written to S3. Check IAM permissions for s3://%s", s3_bucket)
 
 
+# ── Predictor email ────────────────────────────────────────────────────────────
+
+def _build_predictor_email(
+    predictions: list[dict],
+    metrics: dict,
+    date_str: str,
+    signals_data: dict | None = None,
+) -> tuple[str, str, str]:
+    """
+    Build subject, HTML body, and plain-text body for the combined morning briefing.
+
+    When signals_data is supplied (the raw signals.json payload from the research
+    pipeline), a research section is prepended containing market regime, buy
+    candidates, and sector ratings. The GBM predictions follow as the second half.
+
+    Returns
+    -------
+    (subject, html_body, plain_body)
+    """
+    import datetime as _dt
+
+    model_version = metrics.get("model_version", "unknown")
+    val_ic        = metrics.get("val_loss")      # GBM stores IC here
+    n_total       = len(predictions)
+
+    # Group by direction (predictions are pre-sorted descending p_up - p_down)
+    ups   = [p for p in predictions if p.get("predicted_direction") == "UP"]
+    flats = [p for p in predictions if p.get("predicted_direction") == "FLAT"]
+    downs = [p for p in predictions if p.get("predicted_direction") == "DOWN"]
+
+    # Option A vetoes: high-confidence DOWN signals that will trigger HOLD overrides
+    vetoes   = [p for p in downs if p.get("prediction_confidence", 0) >= cfg.MIN_CONFIDENCE]
+    n_vetoed = len(vetoes)
+
+    # ── Research data extraction ───────────────────────────────────────────────
+    sd = signals_data or {}
+    market_regime    = sd.get("market_regime", "")
+    buy_candidates   = sd.get("buy_candidates", [])
+    sector_ratings   = sd.get("sector_ratings", {})
+    sorted_sectors: list = []
+
+    # ── Subject ───────────────────────────────────────────────────────────────
+    veto_str    = f" | {n_vetoed} veto{'es' if n_vetoed != 1 else ''}" if n_vetoed else ""
+    regime_str  = f" | {market_regime.upper()}" if market_regime else ""
+    cand_str    = f" | {len(buy_candidates)} candidates" if buy_candidates else ""
+    subject = (
+        f"Alpha Engine Brief | {date_str}{regime_str}{cand_str} | "
+        f"{len(ups)} UP / {len(flats)} FLAT / {len(downs)} DOWN"
+        f"{veto_str}"
+    )
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+    run_time = _dt.datetime.now().strftime("%-I:%M %p PT")
+    ic_str   = f"{val_ic:.4f}" if isinstance(val_ic, (int, float)) else "—"
+
+    def _source_tag(p: dict) -> str:
+        return " ★" if p.get("watchlist_source") in ("buy_candidate", "both") else ""
+
+    def _alpha_str(p: dict) -> str:
+        a = p.get("predicted_alpha")
+        if a is None:
+            return "—"
+        return f"{'+' if a >= 0 else ''}{a * 100:.2f}%"
+
+    def _conf_pct(p: dict) -> str:
+        return f"{p.get('prediction_confidence', 0) * 100:.0f}%"
+
+    # ── HTML ──────────────────────────────────────────────────────────────────
+    TH = 'style="background:#f0f0f0; padding:4px 8px; text-align:left; border:1px solid #ccc;"'
+    TD = 'style="padding:4px 8px; border:1px solid #ddd;"'
+    TDR = 'style="padding:4px 8px; border:1px solid #ddd; text-align:right;"'
+    TABLE = 'style="border-collapse:collapse; width:100%; font-family:monospace; font-size:12px;"'
+
+    def _html_rows(group: list[dict]) -> str:
+        if not group:
+            return '<tr><td colspan="4" style="padding:4px 8px; color:#888; font-style:italic;">none</td></tr>'
+        rows = []
+        for p in group:
+            is_veto = (
+                p.get("predicted_direction") == "DOWN"
+                and p.get("prediction_confidence", 0) >= cfg.MIN_CONFIDENCE
+            )
+            veto_badge = ' <span style="color:#c62828; font-weight:bold;">⚠ VETO</span>' if is_veto else ""
+            rows.append(
+                f'<tr>'
+                f'<td {TD}><b>{p["ticker"]}{_source_tag(p)}</b>{veto_badge}</td>'
+                f'<td {TDR}>{_alpha_str(p)}</td>'
+                f'<td {TDR}>{_conf_pct(p)}</td>'
+                f'<td {TD}>{p.get("watchlist_source", "—")}</td>'
+                f'</tr>'
+            )
+        return "\n".join(rows)
+
+    def _html_section(title: str, color: str, group: list[dict]) -> str:
+        return (
+            f'<h3 style="color:{color}; margin-bottom:4px;">{title} ({len(group)})</h3>'
+            f'<table {TABLE}>'
+            f'<tr><th {TH}>Ticker</th><th {TH}>α score</th><th {TH}>Conf</th><th {TH}>Source</th></tr>'
+            f'{_html_rows(group)}'
+            f'</table>'
+        )
+
+    veto_section_html = ""
+    if vetoes:
+        veto_tickers = ", ".join(p["ticker"] for p in vetoes)
+        pct = int(cfg.MIN_CONFIDENCE * 100)
+        veto_section_html = (
+            f'<hr style="border:1px solid #eee; margin:16px 0;">'
+            f'<h3 style="color:#c62828;">⚠ Option A Vetoes ({n_vetoed})</h3>'
+            f'<p style="font-size:12px; margin:4px 0;">'
+            f'DOWN predictions with confidence ≥{pct}% — executor will override ENTER → HOLD:</p>'
+            f'<p style="font-family:monospace; font-size:13px;"><b>{veto_tickers}</b></p>'
+        )
+
+    # ── Research section HTML ─────────────────────────────────────────────────
+    research_html = ""
+    if sd:
+        # Market regime pill
+        regime_color = {"bullish": "#2e7d32", "bearish": "#c62828"}.get(
+            market_regime.lower(), "#555"
+        )
+        regime_pill = (
+            f'<span style="display:inline-block; background:{regime_color}; color:#fff; '
+            f'font-size:11px; padding:2px 8px; border-radius:3px; font-weight:bold;">'
+            f'{market_regime.upper() if market_regime else "NEUTRAL"}</span>'
+        )
+
+        # Buy candidates table
+        cand_rows = ""
+        for c in buy_candidates:
+            score      = c.get("score") or "—"
+            conviction = c.get("conviction", "—")
+            signal     = c.get("signal", "—")
+            sector     = c.get("sector", "—")
+            gbm_veto   = c.get("gbm_veto", False)
+            veto_badge = ' <span style="color:#c62828; font-weight:bold; font-size:10px;">GBM⚠</span>' if gbm_veto else ""
+            score_str  = f"{score:.1f}" if isinstance(score, (int, float)) else str(score)
+            cand_rows += (
+                f'<tr>'
+                f'<td {TD}><b>{c.get("ticker","?")}</b>{veto_badge}</td>'
+                f'<td {TDR}>{score_str}</td>'
+                f'<td {TD}>{conviction}</td>'
+                f'<td {TD}>{signal}</td>'
+                f'<td {TD}>{sector}</td>'
+                f'</tr>'
+            )
+        if not cand_rows:
+            cand_rows = f'<tr><td colspan="5" style="padding:4px 8px; color:#888; font-style:italic;">none</td></tr>'
+        cand_table = (
+            f'<table {TABLE}>'
+            f'<tr><th {TH}>Ticker</th><th {TH}>Score</th><th {TH}>Conviction</th>'
+            f'<th {TH}>Signal</th><th {TH}>Sector</th></tr>'
+            f'{cand_rows}'
+            f'</table>'
+        )
+
+        # Sector ratings (top sectors sorted by rating desc, skip empty)
+        sector_rows = ""
+        sorted_sectors = sorted(
+            [(s, v) for s, v in sector_ratings.items() if isinstance(v, dict)],
+            key=lambda x: x[1].get("rating", 0),
+            reverse=True,
+        )
+        for sector, v in sorted_sectors[:8]:
+            rating   = v.get("rating", "—")
+            modifier = v.get("modifier", "—")
+            rating_str   = f"{rating:.0f}" if isinstance(rating, (int, float)) else str(rating)
+            modifier_str = f"{modifier:.2f}x" if isinstance(modifier, (int, float)) else str(modifier)
+            sector_rows += f'<tr><td {TD}>{sector}</td><td {TDR}>{rating_str}</td><td {TDR}>{modifier_str}</td></tr>'
+        sector_table = ""
+        if sector_rows:
+            sector_table = (
+                f'<table {TABLE}>'
+                f'<tr><th {TH}>Sector</th><th {TH}>Rating</th><th {TH}>Modifier</th></tr>'
+                f'{sector_rows}'
+                f'</table>'
+            )
+
+        research_html = (
+            f'<div style="background:#f8f9fa; border-left:3px solid #555; padding:12px 16px; margin-bottom:16px;">'
+            f'<h3 style="margin:0 0 8px 0; font-size:14px; color:#333;">Research Brief</h3>'
+            f'<p style="margin:0 0 8px 0;">Market Regime: {regime_pill}</p>'
+            f'<h4 style="margin:8px 0 4px 0; font-size:12px; color:#555;">Buy Candidates ({len(buy_candidates)})</h4>'
+            f'{cand_table}'
+            f'{"<h4 style=margin:8px 0 4px 0; font-size:12px; color:#555;>Sector Ratings</h4>" + sector_table if sector_table else ""}'
+            f'</div>'
+        )
+
+    html_body = (
+        f'<html><body style="font-family:sans-serif; font-size:13px; color:#222; max-width:700px;">'
+        f'<h2 style="margin-bottom:4px;">Alpha Engine Brief — {date_str}</h2>'
+        f'<p style="color:#555; font-size:12px; margin-top:0;">'
+        f'Model: <b>{model_version}</b> &nbsp;|&nbsp;'
+        f'IC (val): <b>{ic_str}</b> &nbsp;|&nbsp;'
+        f'Universe: <b>{n_total}</b> tickers &nbsp;|&nbsp;'
+        f'Run at <b>{run_time}</b></p>'
+        f'{research_html}'
+        f'<h3 style="font-size:13px; color:#333; margin-bottom:4px;">GBM Predictions</h3>'
+        f'{_html_section("↑ BULLISH", "#2e7d32", ups)}'
+        f'{_html_section("→ NEUTRAL", "#888888", flats)}'
+        f'{_html_section("↓ BEARISH", "#c62828", downs)}'
+        f'{veto_section_html}'
+        f'<p style="font-size:11px; color:#aaa; margin-top:24px;">'
+        f'★ = buy_candidate from research signals.json &nbsp;|&nbsp;'
+        f'⚠ VETO = Option A gate trigger (conf ≥{int(cfg.MIN_CONFIDENCE * 100)}%)</p>'
+        f'</body></html>'
+    )
+
+    # ── Plain text ────────────────────────────────────────────────────────────
+    def _plain_rows(group: list[dict]) -> str:
+        if not group:
+            return "  (none)\n"
+        lines = []
+        for p in group:
+            veto = " [VETO]" if (
+                p.get("predicted_direction") == "DOWN"
+                and p.get("prediction_confidence", 0) >= cfg.MIN_CONFIDENCE
+            ) else ""
+            lines.append(
+                f"  {p['ticker']:<6}  α={_alpha_str(p):>7}  conf={_conf_pct(p)}"
+                f"  {p.get('watchlist_source', '—')}{_source_tag(p)}{veto}"
+            )
+        return "\n".join(lines) + "\n"
+
+    # Research plain section
+    research_plain = ""
+    if sd:
+        research_plain = (
+            f"\n{'='*60}\n"
+            f"RESEARCH BRIEF\n"
+            f"{'='*60}\n"
+            f"Market Regime: {market_regime.upper() if market_regime else 'NEUTRAL'}\n"
+        )
+        if buy_candidates:
+            research_plain += f"\nBuy Candidates ({len(buy_candidates)}):\n"
+            for c in buy_candidates:
+                score = c.get("score")
+                score_str = f"{score:.1f}" if isinstance(score, (int, float)) else "—"
+                veto_str_c = " [GBM VETO]" if c.get("gbm_veto") else ""
+                research_plain += (
+                    f"  {c.get('ticker','?'):<6}  score={score_str:>5}  "
+                    f"{c.get('conviction','—'):<10}  {c.get('signal','—'):<8}  "
+                    f"{c.get('sector','—')}{veto_str_c}\n"
+                )
+        if sector_ratings:
+            research_plain += "\nSector Ratings:\n"
+            for sector, v in sorted_sectors[:8]:
+                rating = v.get("rating", "—")
+                modifier = v.get("modifier", "—")
+                rating_str   = f"{rating:.0f}" if isinstance(rating, (int, float)) else str(rating)
+                modifier_str = f"{modifier:.2f}x" if isinstance(modifier, (int, float)) else str(modifier)
+                research_plain += f"  {sector:<20}  rating={rating_str:>3}  modifier={modifier_str}\n"
+
+    plain_body = (
+        f"Alpha Engine Brief — {date_str}\n"
+        f"Model: {model_version}  IC(val): {ic_str}  Universe: {n_total}  Run: {run_time}\n"
+        f"{research_plain}"
+        f"\n{'='*60}\n"
+        f"GBM PREDICTIONS\n"
+        f"{'='*60}\n"
+        f"\nBULLISH ({len(ups)})\n{_plain_rows(ups)}"
+        f"\nNEUTRAL ({len(flats)})\n{_plain_rows(flats)}"
+        f"\nBEARISH ({len(downs)})\n{_plain_rows(downs)}"
+    )
+    if vetoes:
+        veto_tickers = ", ".join(p["ticker"] for p in vetoes)
+        plain_body += (
+            f"\nOPTION A VETOES ({n_vetoed}): {veto_tickers}\n"
+            f"(DOWN + conf >= {int(cfg.MIN_CONFIDENCE * 100)}% → executor HOLD override)\n"
+        )
+
+    return subject, html_body, plain_body
+
+
+def send_predictor_email(
+    predictions: list[dict],
+    metrics: dict,
+    date_str: str,
+    signals_data: dict | None = None,
+) -> bool:
+    """
+    Send combined morning briefing email via Gmail SMTP (primary) or SES (fallback).
+
+    When signals_data is provided (research pipeline's signals.json payload),
+    the email includes a research section (market regime, buy candidates, sector
+    ratings) followed by the GBM predictions — one complete morning briefing.
+
+    Reads from environment / config:
+        EMAIL_SENDER        — from-address
+        EMAIL_RECIPIENTS    — list of recipient addresses
+        GMAIL_APP_PASSWORD  — enables Gmail SMTP path (recommended)
+        AWS_REGION          — SES region fallback
+
+    Returns True on success, False on any failure. Never raises.
+    """
+    sender     = cfg.EMAIL_SENDER
+    recipients = cfg.EMAIL_RECIPIENTS
+
+    if not sender or not recipients:
+        log.info(
+            "Predictor email skipped — set EMAIL_SENDER and EMAIL_RECIPIENTS "
+            "env vars in the Lambda to enable"
+        )
+        return False
+
+    try:
+        subject, html_body, plain_body = _build_predictor_email(
+            predictions, metrics, date_str, signals_data=signals_data
+        )
+    except Exception as exc:
+        log.warning("Failed to build predictor email body: %s", exc)
+        return False
+
+    app_password = os.environ.get("GMAIL_APP_PASSWORD", "").strip()
+
+    if app_password:
+        import smtplib
+        from email.mime.multipart import MIMEMultipart
+        from email.mime.text import MIMEText
+
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"]    = sender
+        msg["To"]      = ", ".join(recipients)
+        msg.attach(MIMEText(plain_body, "plain", "utf-8"))
+        msg.attach(MIMEText(html_body,  "html",  "utf-8"))
+
+        try:
+            with smtplib.SMTP("smtp.gmail.com", 587) as server:
+                server.ehlo()
+                server.starttls()
+                server.ehlo()
+                server.login(sender, app_password.replace(" ", ""))
+                server.sendmail(sender, recipients, msg.as_string())
+            log.info("Predictor email sent via Gmail SMTP: '%s'", subject)
+            return True
+        except Exception as exc:
+            log.warning("Gmail SMTP failed (%s) — trying SES fallback", exc)
+
+    # SES fallback
+    try:
+        import boto3
+        ses = boto3.client("ses", region_name=cfg.AWS_REGION)
+        ses.send_email(
+            Source=sender,
+            Destination={"ToAddresses": recipients},
+            Message={
+                "Subject": {"Data": subject, "Charset": "UTF-8"},
+                "Body": {
+                    "Text": {"Data": plain_body, "Charset": "UTF-8"},
+                    "Html": {"Data": html_body,  "Charset": "UTF-8"},
+                },
+            },
+        )
+        log.info("Predictor email sent via SES: '%s'", subject)
+        return True
+    except Exception as exc:
+        log.warning("SES send failed: %s — predictor email not delivered", exc)
+        return False
+
+
 # ── Orchestration ─────────────────────────────────────────────────────────────
 
 def main(
@@ -834,8 +1615,9 @@ def main(
 
     # ── Step 2: Get universe ──────────────────────────────────────────────────
     ticker_sources: dict[str, str] = {}   # ticker → watchlist_source annotation
+    signals_data: dict = {}               # raw signals.json payload for email
     if watchlist_path:
-        tickers, ticker_sources = load_watchlist(
+        tickers, ticker_sources, signals_data = load_watchlist(
             path=watchlist_path,
             s3_bucket=bucket,
             date_str=date_str,
@@ -843,10 +1625,7 @@ def main(
     else:
         tickers = get_universe_tickers(bucket, date_str)
 
-    # ── Step 3: Fetch prices ──────────────────────────────────────────────────
-    price_data = fetch_today_prices(tickers)
-
-    # ── Step 3b: Load sector map + fetch macro/sector ETF series ─────────────
+    # ── Step 3: Load sector map ───────────────────────────────────────────────
     # sector_map: ticker → sector ETF symbol (e.g. "AAPL" → "XLK")
     # Built by bootstrap_fetcher.py and stored in data/cache/sector_map.json.
     sector_map: dict[str, str] = {}
@@ -863,13 +1642,45 @@ def main(
             "Run bootstrap_fetcher.py to generate it."
         )
 
-    # Collect the unique sector ETFs needed for the active ticker universe
-    sector_etfs_needed = sorted({
-        sector_map[t] for t in tickers if t in sector_map
-    })
+    # ── Step 3b: Prices + macro — slim cache preferred, yfinance fallback ─────
+    # Primary path (after first Sunday training run):
+    #   slim cache (2y, weekly) + daily_closes delta (Mon–Fri, 1–4 rows/ticker)
+    #   → eliminates the 2y × 900 ticker yfinance fetch entirely.
+    # Fallback (slim cache not yet created or download failure):
+    #   fetch_today_prices() + fetch_macro_series() from yfinance as before.
+    price_data: dict[str, pd.DataFrame] = {}
+    macro:      dict[str, pd.Series]    = {}
 
-    # Fetch macro series + any required sector ETFs in one batch
-    macro = fetch_macro_series(extra_tickers=sector_etfs_needed)
+    cached_prices, cached_macro = load_price_data_from_cache(
+        tickers, date_str, bucket,
+    )
+
+    if cached_prices is not None:
+        price_data = cached_prices
+        macro      = cached_macro or {}
+        log.info("Using slim-cache + daily_closes for prices and macro")
+    else:
+        log.info("Slim cache unavailable — fetching from yfinance (full 2y)")
+        price_data = fetch_today_prices(tickers)
+        sector_etfs_needed = sorted({sector_map[t] for t in tickers if t in sector_map})
+        macro = fetch_macro_series(extra_tickers=sector_etfs_needed)
+
+    # Ensure all sector ETFs needed are present in macro (may be missing from
+    # slim cache if a ticker's sector changed since the last bootstrap)
+    sector_etfs_needed = sorted({sector_map[t] for t in tickers if t in sector_map})
+    missing_etfs = [e for e in sector_etfs_needed if e not in macro]
+    if missing_etfs:
+        log.info("Fetching %d missing sector ETFs from yfinance: %s", len(missing_etfs), missing_etfs)
+        extra = fetch_macro_series(extra_tickers=missing_etfs)
+        macro.update({k: v for k, v in extra.items() if k not in macro})
+
+    # ── Step 3c: Persist daily closes to S3 (independent price archive) ───────
+    # Saves split-adjusted (auto_adjust=False) OHLCV + adj_close to:
+    #   predictor/daily_closes/{date_str}.parquet
+    # These files are the delta source for the slim-cache inference path.
+    # adj_close = full (split + dividend) adjusted close; the ratio adj_close/close
+    # captures the dividend factor and helps detect splits via sudden price jumps.
+    save_daily_closes(tickers, date_str, bucket, dry_run=dry_run)
 
     # ── Step 4: Run inference ─────────────────────────────────────────────────
     predictions: list[dict] = []
@@ -911,8 +1722,23 @@ def main(
     predictions.sort(key=lambda p: p["p_up"] - p["p_down"], reverse=True)
 
     # ── Step 5: Build metrics ─────────────────────────────────────────────────
+    # For GBM: read training-time meta from S3 to populate training_samples,
+    # last_trained (date string), ic_30d, ic_ir_30d. Falls back gracefully if
+    # meta is absent (e.g. model was never promoted through train_handler.py).
+    gbm_meta: dict = {}
+    if model_type == "gbm" and not local:
+        try:
+            import boto3 as _boto3
+            _s3 = _boto3.client("s3")
+            _resp = _s3.get_object(Bucket=bucket, Key=cfg.GBM_WEIGHTS_META_KEY)
+            gbm_meta = json.loads(_resp["Body"].read())
+            log.info("GBM weights meta loaded: trained_date=%s  n_train=%s",
+                     gbm_meta.get("trained_date"), gbm_meta.get("n_train"))
+        except Exception as _exc:
+            log.debug("GBM weights meta not found or unreadable: %s", _exc)
+
     if model_type == "gbm":
-        last_trained = scorer._best_iteration
+        last_trained = gbm_meta.get("trained_date", scorer._best_iteration)
     else:
         last_trained = checkpoint.get("epoch", "unknown")
 
@@ -920,15 +1746,22 @@ def main(
         "model_version": model_version,
         "model_type": model_type,
         "last_trained": last_trained,
+        "training_samples": gbm_meta.get("n_train") if model_type == "gbm" else None,
         "val_loss": round(float(val_loss), 6) if isinstance(val_loss, (int, float)) else None,
-        # Rolling hit rate requires outcome tracking (populated by backtester)
+        # ic_30d/ic_ir_30d seeded from training-time values; overwritten by backtester
+        # once 30 days of live outcome data accumulates.
+        "ic_30d": gbm_meta.get("test_ic") if model_type == "gbm" else None,
+        "ic_ir_30d": gbm_meta.get("ic_ir") if model_type == "gbm" else None,
+        # Rolling hit rate requires 30 days of resolved outcomes (populated by backtester)
         "hit_rate_30d_rolling": None,
-        "ic_30d": None,
-        "ic_ir_30d": None,
     }
 
     # ── Step 6: Write output ──────────────────────────────────────────────────
     write_predictions(predictions, date_str, bucket, metrics, dry_run=dry_run)
+
+    # ── Step 7: Send combined morning briefing email ──────────────────────────
+    if not dry_run:
+        send_predictor_email(predictions, metrics, date_str, signals_data=signals_data)
 
     log.info("Predictor run complete for %s", date_str)
 

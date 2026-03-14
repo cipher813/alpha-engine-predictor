@@ -4,12 +4,12 @@ data/feature_engineer.py — Rolling technical feature computation.
 Mirrors compute_technical_indicators() from alpha-engine-research exactly,
 but operates on a full OHLCV DataFrame (rolling window per row) rather than
 returning a single snapshot dict. Every row in the output has a complete
-21-feature vector. Rows lacking sufficient price history for any indicator
+29-feature vector. Rows lacking sufficient price history for any indicator
 are dropped after all features are computed.
 
 Feature list (must stay in sync with config.FEATURES):
     rsi_14              RSI(14), range 0–100
-    macd_cross          +1 bullish cross / -1 bearish cross / 0 no cross (last 3 days)
+    macd_cross          +1 bullish / -1 bearish / 0 no cross (last 3 days)
     macd_above_zero     1.0 if MACD line > 0, else 0.0
     macd_line_last      raw MACD line value
     price_vs_ma50       (close - ma50) / ma50
@@ -29,6 +29,14 @@ Feature list (must stay in sync with config.FEATURES):
     yield_curve_slope   (10Y yield - 3M yield) / 10.0 (>0 normal, <0 inv.) [v1.3]
     gold_mom_5d         5d momentum of GLD (risk-off indicator)             [v1.3]
     oil_mom_5d          5d momentum of USO (commodity cycle / inflation)    [v1.3]
+    price_accel         momentum_5d - momentum_20d (acceleration)           [v1.4]
+    ema_cross_8_21      EMA(8) / EMA(21) - 1 (short vs medium trend)       [v1.4]
+    atr_14_pct          ATR(14) / close (normalized volatility)             [v1.4]
+    realized_vol_20d    20d realized vol annualized (√252 scaled)           [v1.4]
+    volume_trend        SMA(vol,5) / SMA(vol,20) (short-term vol surge)    [v1.4]
+    obv_slope_10d       (OBV_fast - OBV_slow) / SMA(vol,20) (accumulation) [v1.4]
+    rsi_slope_5d        (RSI - RSI.shift(5)) / 5 (RSI momentum)            [v1.4]
+    volume_price_div    sign(volume_trend-1) * sign(momentum_5d)            [v1.4]
 
 RSI uses EWM with com=13 (equiv. to Wilder's 14-period smoothing), identical
 to the research pipeline.
@@ -125,7 +133,7 @@ def compute_features(
     uso_series: pd.Series | None = None,
 ) -> pd.DataFrame:
     """
-    Compute all 21 technical and macro features for a full OHLCV DataFrame.
+    Compute all 29 technical and macro features for a full OHLCV DataFrame.
 
     Parameters
     ----------
@@ -158,7 +166,7 @@ def compute_features(
     Returns
     -------
     pd.DataFrame
-        Original columns plus the 21 feature columns. Rows without
+        Original columns plus the 29 feature columns. Rows without
         sufficient history for any feature are dropped.
 
     Notes
@@ -343,30 +351,66 @@ def compute_features(
     else:
         df["oil_mom_5d"] = 0.0
 
+    # ── v1.4 features — design doc Appendix A completions ────────────────────
+
+    # price_accel: momentum acceleration. Positive = momentum is increasing
+    # (price accelerating upward); negative = momentum is decelerating.
+    df["price_accel"] = df["momentum_5d"] - df["momentum_20d"]
+
+    # ema_cross_8_21: short vs medium-term trend alignment.
+    # Positive = short-term EMA above medium-term (bullish alignment).
+    ema_8 = close.ewm(span=8, adjust=False).mean()
+    ema_21 = close.ewm(span=21, adjust=False).mean()
+    df["ema_cross_8_21"] = ema_8 / ema_21 - 1.0
+
+    # atr_14_pct: normalized average true range. Measures intraday volatility
+    # independent of price level. Requires High/Low; falls back to close if
+    # OHLCV data only has Close (e.g. some data providers).
+    high = df["High"].astype(float) if "High" in df.columns else close
+    low = df["Low"].astype(float) if "Low" in df.columns else close
+    tr = pd.concat([
+        high - low,
+        (high - close.shift(1)).abs(),
+        (low - close.shift(1)).abs(),
+    ], axis=1).max(axis=1)
+    atr = tr.ewm(span=14, adjust=False).mean()
+    df["atr_14_pct"] = atr / close
+
+    # realized_vol_20d: 20-day annualized realized volatility of daily returns.
+    # Distinct from vol_ratio_10_60 which is a *ratio* of two vol windows;
+    # this is the absolute volatility level itself.
+    daily_returns = close.pct_change()
+    df["realized_vol_20d"] = daily_returns.rolling(20).std() * np.sqrt(252)
+
+    # volume_trend: ratio of short-term to medium-term average volume.
+    # > 1 = volume is expanding (institutional activity); < 1 = contracting.
+    vol_5 = volume.rolling(5).mean()
+    vol_20 = volume.rolling(20).mean()
+    df["volume_trend"] = (vol_5 / vol_20.replace(0, float("nan"))).fillna(1.0)
+
+    # obv_slope_10d: On-Balance Volume trend, normalized by average volume.
+    # OBV accumulates volume on up-days and subtracts on down-days.
+    # The fast/slow EMA crossover of OBV flags accumulation (positive) or
+    # distribution (negative) patterns.
+    obv_direction = np.sign(close.diff()).fillna(0)
+    obv = (obv_direction * volume).cumsum()
+    obv_fast = obv.rolling(5).mean()
+    obv_slow = obv.rolling(20).mean()
+    df["obv_slope_10d"] = ((obv_fast - obv_slow) / vol_20.replace(0, float("nan"))).fillna(0.0)
+
+    # rsi_slope_5d: rate of change of RSI over 5 days. Rising RSI = strengthening
+    # momentum; falling RSI = weakening. Captures RSI trend, not just level.
+    rsi = df["rsi_14"]
+    df["rsi_slope_5d"] = (rsi - rsi.shift(5)) / 5.0
+
+    # volume_price_div: sign divergence between volume and price momentum.
+    # +1 = volume and price moving in same direction (confirmation)
+    # -1 = divergence (volume up / price down, or vice versa — reversal signal)
+    #  0 = neutral (volume or price flat)
+    df["volume_price_div"] = np.sign(df["volume_trend"] - 1.0) * np.sign(df["momentum_5d"])
+
     # ── Drop rows with any NaN in the feature columns ─────────────────────────
-    feature_cols = [
-        "rsi_14",
-        "macd_cross",
-        "macd_above_zero",
-        "macd_line_last",
-        "price_vs_ma50",
-        "price_vs_ma200",
-        "momentum_20d",
-        "avg_volume_20d",
-        "dist_from_52w_high",
-        "momentum_5d",
-        "rel_volume_ratio",
-        "return_vs_spy_5d",
-        "vix_level",
-        "dist_from_52w_low",
-        "vol_ratio_10_60",
-        "bollinger_pct",
-        "sector_vs_spy_5d",
-        "yield_10y",
-        "yield_curve_slope",
-        "gold_mom_5d",
-        "oil_mom_5d",
-    ]
+    from config import FEATURES as feature_cols
     df = df.dropna(subset=feature_cols)
 
     return df
@@ -374,8 +418,8 @@ def compute_features(
 
 def features_to_array(df: pd.DataFrame) -> np.ndarray:
     """
-    Extract the 17 feature columns from a featured DataFrame as a float32 array.
-    Shape: (N, 17).
+    Extract all feature columns from a featured DataFrame as a float32 array.
+    Shape: (N, N_FEATURES).
     """
     from config import FEATURES
     return df[FEATURES].to_numpy(dtype=np.float32)

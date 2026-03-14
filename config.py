@@ -5,6 +5,8 @@ All S3 paths, model hyperparameters, feature definitions, and production
 gates live here. Import this module everywhere rather than hard-coding values.
 """
 
+import os
+
 # ── S3 paths ─────────────────────────────────────────────────────────────────
 S3_BUCKET = "alpha-engine-research"
 
@@ -25,6 +27,9 @@ PRICE_CACHE_KEY = "predictor/price_cache/{ticker}.parquet"
 # Must stay in sync with data/feature_engineer.py::compute_features().
 # First 8 mirror compute_technical_indicators() in alpha-engine-research.
 # v1.1 added 4 alpha features; v1.2 adds 5 market-context features.
+# v1.5 note: SHAP showed 7 features with ~zero mean importance, but ablation
+#   study found they contribute regime-specific signal (especially Folds 3-4)
+#   and interact positively when combined. Retained all 29.
 FEATURES = [
     "rsi_14",
     "macd_cross",
@@ -50,8 +55,17 @@ FEATURES = [
     "yield_curve_slope",    # (10Y yield - 3M yield) / 10.0 (normal>0, inverted<0)
     "gold_mom_5d",          # 5d momentum of GLD (risk-off indicator)
     "oil_mom_5d",           # 5d momentum of USO (commodity cycle)
+    # v1.4 additions — design doc Appendix A feature completions
+    "price_accel",          # momentum_5d - momentum_20d (acceleration)
+    "ema_cross_8_21",       # EMA(8) / EMA(21) - 1 (short vs medium trend)
+    "atr_14_pct",           # ATR(14) / close (normalized volatility)
+    "realized_vol_20d",     # 20d realized vol annualized (√252 scaled)
+    "volume_trend",         # SMA(vol,5) / SMA(vol,20) (short-term vol surge)
+    "obv_slope_10d",        # (OBV_fast - OBV_slow) / SMA(vol,20) (accumulation)
+    "rsi_slope_5d",         # (RSI - RSI.shift(5)) / 5 (RSI momentum)
+    "volume_price_div",     # sign(volume_trend-1) * sign(momentum_5d) (divergence)
 ]
-N_FEATURES = 21
+N_FEATURES = 29
 N_CLASSES = 3  # UP, FLAT, DOWN
 
 # Class labels — index matches model output neuron order
@@ -86,10 +100,29 @@ DOWN_THRESHOLD = -0.01  # < -1% forward return → DOWN
 # Set to None to disable. Recommended: 0.15 (±15%).
 LABEL_CLIP = 0.15
 
+# ── GBM tuned hyperparameters (Optuna v1.4, 150 trials, trial #44) ──────
+# These override GBMScorer._default_params() for weekly Lambda retraining
+# and any --params invocation. Walk-forward: mean IC 0.057, IC IR 2.51.
+GBM_TUNED_PARAMS = {
+    "objective": "regression",
+    "metric": "mse",
+    "num_leaves": 103,
+    "min_child_samples": 113,
+    "max_depth": 3,
+    "learning_rate": 0.126,
+    "feature_fraction": 0.559,
+    "bagging_fraction": 0.872,
+    "lambda_l1": 0.889,
+    "lambda_l2": 0.136,
+    "num_threads": 4,
+    "verbosity": -1,
+    "seed": 42,
+}
+
 # ── Production gates ─────────────────────────────────────────────────────────
 # Model must meet these thresholds before being applied in production.
 MIN_HIT_RATE = 0.55       # >55% directional accuracy required
-MIN_IC = 0.05             # >0.05 Pearson IC (predicted vs actual return)
+MIN_IC = 0.03             # >0.03 Pearson IC (0.03-0.04 is SOTA at 5-day horizon per design doc)
 MIN_CONFIDENCE = 0.65     # predictions below this gate are not applied as score modifiers
 
 # ── Training split (by time, no lookahead) ───────────────────────────────────
@@ -99,3 +132,17 @@ VAL_FRAC = 0.15
 
 # ── Prediction horizon ───────────────────────────────────────────────────────
 FORWARD_DAYS = 5  # predict 5-trading-day forward return
+
+# ── AWS / Email ────────────────────────────────────────────────────────────────
+# Set these as Lambda environment variables before enabling the predictor email.
+#   EMAIL_SENDER     — from-address (e.g. your.name@gmail.com)
+#   EMAIL_RECIPIENTS — comma-separated recipient list
+#   GMAIL_APP_PASSWORD — 16-char Gmail App Password (enables SMTP path)
+#   AWS_REGION       — SES region if GMAIL_APP_PASSWORD is not set
+AWS_REGION       = os.environ.get("AWS_REGION", "us-east-1")
+EMAIL_SENDER     = os.environ.get("EMAIL_SENDER", "")
+EMAIL_RECIPIENTS = [
+    r.strip()
+    for r in os.environ.get("EMAIL_RECIPIENTS", "").split(",")
+    if r.strip()
+]
