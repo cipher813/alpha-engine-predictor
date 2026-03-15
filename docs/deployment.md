@@ -76,6 +76,8 @@ cp -r lib/scipy_stub/scipy /tmp/lambda-pkg/scipy
 
 # Copy application source
 cp config.py /tmp/lambda-pkg/
+mkdir -p /tmp/lambda-pkg/config
+cp config/predictor.yaml /tmp/lambda-pkg/config/  # gitignored — must exist locally
 cp -r model /tmp/lambda-pkg/
 cp -r inference /tmp/lambda-pkg/
 cp -r data /tmp/lambda-pkg/
