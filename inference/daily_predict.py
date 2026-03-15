@@ -181,6 +181,41 @@ def load_gbm_s3(s3_bucket: str, weights_key: str):
         ) from exc
 
 
+# ── S3-delivered predictor params (veto threshold) ────────────────────────────
+
+_predictor_params_cache: dict | None = None
+_predictor_params_loaded: bool = False
+
+
+def _load_predictor_params_from_s3(s3_bucket: str) -> dict | None:
+    """Read config/predictor_params.json from S3. Cache per cold-start."""
+    global _predictor_params_cache, _predictor_params_loaded
+    if _predictor_params_loaded:
+        return _predictor_params_cache
+    _predictor_params_loaded = True
+
+    try:
+        import boto3
+        s3 = boto3.client("s3")
+        obj = s3.get_object(Bucket=s3_bucket, Key="config/predictor_params.json")
+        data = json.loads(obj["Body"].read())
+        if "veto_confidence" in data:
+            _predictor_params_cache = data
+            log.info("Loaded predictor params from S3: veto_confidence=%.2f", data["veto_confidence"])
+        return _predictor_params_cache
+    except Exception as e:
+        log.debug("No S3 predictor params (using defaults): %s", e)
+        return None
+
+
+def get_veto_threshold(s3_bucket: str) -> float:
+    """Return the active veto confidence threshold (S3 override or default)."""
+    params = _load_predictor_params_from_s3(s3_bucket)
+    if params and "veto_confidence" in params:
+        return float(params["veto_confidence"])
+    return cfg.MIN_CONFIDENCE
+
+
 # ── Universe ──────────────────────────────────────────────────────────────────
 
 def get_universe_tickers(s3_bucket: str, date_str: Optional[str] = None) -> list[str]:
@@ -1127,6 +1162,7 @@ def write_predictions(
     s3_bucket: str,
     metrics: dict,
     dry_run: bool = False,
+    veto_threshold: float | None = None,
 ) -> None:
     """
     Write predictions JSON to S3 at both the dated key and latest.json.
@@ -1139,11 +1175,13 @@ def write_predictions(
     s3_bucket :   S3 bucket name.
     metrics :     Metrics dict to write to predictor/metrics/latest.json.
     dry_run :     If True, print to stdout instead of writing to S3.
+    veto_threshold : Confidence threshold for veto gate. Defaults to cfg.MIN_CONFIDENCE.
     """
+    threshold = veto_threshold if veto_threshold is not None else cfg.MIN_CONFIDENCE
     # Build the predictions envelope
     n_high_confidence = sum(
         1 for p in predictions
-        if p.get("prediction_confidence", 0) >= cfg.MIN_CONFIDENCE
+        if p.get("prediction_confidence", 0) >= threshold
     )
 
     output = {
@@ -1217,6 +1255,7 @@ def _build_predictor_email(
     metrics: dict,
     date_str: str,
     signals_data: dict | None = None,
+    veto_threshold: float | None = None,
 ) -> tuple[str, str, str]:
     """
     Build subject, HTML body, and plain-text body for the combined morning briefing.
@@ -1231,6 +1270,7 @@ def _build_predictor_email(
     """
     import datetime as _dt
 
+    _vt = veto_threshold if veto_threshold is not None else cfg.MIN_CONFIDENCE
     model_version = metrics.get("model_version", "unknown")
     val_ic        = metrics.get("val_loss")      # GBM stores IC here
     n_total       = len(predictions)
@@ -1241,7 +1281,7 @@ def _build_predictor_email(
     downs = [p for p in predictions if p.get("predicted_direction") == "DOWN"]
 
     # Option A vetoes: high-confidence DOWN signals that will trigger HOLD overrides
-    vetoes   = [p for p in downs if p.get("prediction_confidence", 0) >= cfg.MIN_CONFIDENCE]
+    vetoes   = [p for p in downs if p.get("prediction_confidence", 0) >= _vt]
     n_vetoed = len(vetoes)
 
     # ── Research data extraction ───────────────────────────────────────────────
@@ -1290,7 +1330,7 @@ def _build_predictor_email(
         for p in group:
             is_veto = (
                 p.get("predicted_direction") == "DOWN"
-                and p.get("prediction_confidence", 0) >= cfg.MIN_CONFIDENCE
+                and p.get("prediction_confidence", 0) >= _vt
             )
             veto_badge = ' <span style="color:#c62828; font-weight:bold;">⚠ VETO</span>' if is_veto else ""
             rows.append(
@@ -1315,7 +1355,7 @@ def _build_predictor_email(
     veto_section_html = ""
     if vetoes:
         veto_tickers = ", ".join(p["ticker"] for p in vetoes)
-        pct = int(cfg.MIN_CONFIDENCE * 100)
+        pct = int(_vt * 100)
         veto_section_html = (
             f'<hr style="border:1px solid #eee; margin:16px 0;">'
             f'<h3 style="color:#c62828;">⚠ Option A Vetoes ({n_vetoed})</h3>'
@@ -1414,7 +1454,7 @@ def _build_predictor_email(
         f'{veto_section_html}'
         f'<p style="font-size:11px; color:#aaa; margin-top:24px;">'
         f'★ = buy_candidate from research signals.json &nbsp;|&nbsp;'
-        f'⚠ VETO = Option A gate trigger (conf ≥{int(cfg.MIN_CONFIDENCE * 100)}%)</p>'
+        f'⚠ VETO = Option A gate trigger (conf ≥{int(_vt * 100)}%)</p>'
         f'</body></html>'
     )
 
@@ -1426,7 +1466,7 @@ def _build_predictor_email(
         for p in group:
             veto = " [VETO]" if (
                 p.get("predicted_direction") == "DOWN"
-                and p.get("prediction_confidence", 0) >= cfg.MIN_CONFIDENCE
+                and p.get("prediction_confidence", 0) >= _vt
             ) else ""
             lines.append(
                 f"  {p['ticker']:<6}  α={_alpha_str(p):>7}  conf={_conf_pct(p)}"
@@ -1478,7 +1518,7 @@ def _build_predictor_email(
         veto_tickers = ", ".join(p["ticker"] for p in vetoes)
         plain_body += (
             f"\nOPTION A VETOES ({n_vetoed}): {veto_tickers}\n"
-            f"(DOWN + conf >= {int(cfg.MIN_CONFIDENCE * 100)}% → executor HOLD override)\n"
+            f"(DOWN + conf >= {int(_vt * 100)}% → executor HOLD override)\n"
         )
 
     return subject, html_body, plain_body
@@ -1489,6 +1529,7 @@ def send_predictor_email(
     metrics: dict,
     date_str: str,
     signals_data: dict | None = None,
+    veto_threshold: float | None = None,
 ) -> bool:
     """
     Send combined morning briefing email via Gmail SMTP (primary) or SES (fallback).
@@ -1517,7 +1558,8 @@ def send_predictor_email(
 
     try:
         subject, html_body, plain_body = _build_predictor_email(
-            predictions, metrics, date_str, signals_data=signals_data
+            predictions, metrics, date_str, signals_data=signals_data,
+            veto_threshold=veto_threshold,
         )
     except Exception as exc:
         log.warning("Failed to build predictor email body: %s", exc)
@@ -1781,12 +1823,17 @@ def main(
         "hit_rate_30d_rolling": None,
     }
 
-    # ── Step 6: Write output ──────────────────────────────────────────────────
-    write_predictions(predictions, date_str, bucket, metrics, dry_run=dry_run)
+    # ── Step 6: Resolve veto threshold (S3 override or default) ──────────────
+    veto_thresh = get_veto_threshold(bucket)
 
-    # ── Step 7: Send combined morning briefing email ──────────────────────────
+    # ── Step 7: Write output ──────────────────────────────────────────────────
+    write_predictions(predictions, date_str, bucket, metrics, dry_run=dry_run,
+                      veto_threshold=veto_thresh)
+
+    # ── Step 8: Send combined morning briefing email ──────────────────────────
     if not dry_run:
-        send_predictor_email(predictions, metrics, date_str, signals_data=signals_data)
+        send_predictor_email(predictions, metrics, date_str, signals_data=signals_data,
+                             veto_threshold=veto_thresh)
 
     log.info("Predictor run complete for %s", date_str)
 
