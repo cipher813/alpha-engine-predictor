@@ -3,9 +3,32 @@ config.py — Central configuration for alpha-engine-predictor.
 
 All S3 paths, model hyperparameters, feature definitions, and production
 gates live here. Import this module everywhere rather than hard-coding values.
+
+Tunable parameters are loaded from config/predictor.yaml (gitignored).
+Copy config/predictor.sample.yaml to get started.
 """
 
 import os
+from pathlib import Path
+
+import yaml
+
+# ── Load predictor config YAML ────────────────────────────────────────────────
+_CONFIG_DIR = Path(__file__).parent / "config"
+_CONFIG_PATH = _CONFIG_DIR / "predictor.yaml"
+
+
+def _load() -> dict:
+    if not _CONFIG_PATH.exists():
+        raise FileNotFoundError(
+            f"Predictor config not found: {_CONFIG_PATH}\n"
+            "Copy config/predictor.sample.yaml to config/predictor.yaml and customise."
+        )
+    with open(_CONFIG_PATH) as f:
+        return yaml.safe_load(f)
+
+
+_cfg = _load()
 
 # ── S3 paths ─────────────────────────────────────────────────────────────────
 S3_BUCKET = "alpha-engine-research"
@@ -25,11 +48,6 @@ PRICE_CACHE_KEY = "predictor/price_cache/{ticker}.parquet"
 
 # ── Features ──────────────────────────────────────────────────────────────────
 # Must stay in sync with data/feature_engineer.py::compute_features().
-# First 8 mirror compute_technical_indicators() in alpha-engine-research.
-# v1.1 added 4 alpha features; v1.2 adds 5 market-context features.
-# v1.5 note: SHAP showed 7 features with ~zero mean importance, but ablation
-#   study found they contribute regime-specific signal (especially Folds 3-4)
-#   and interact positively when combined. Retained all 29.
 FEATURES = [
     "rsi_14",
     "macd_cross",
@@ -40,30 +58,30 @@ FEATURES = [
     "momentum_20d",
     "avg_volume_20d",
     # v1.1 additions
-    "dist_from_52w_high",   # (close - 252d rolling max) / 252d rolling max
-    "momentum_5d",          # (close / close.shift(5)) - 1
-    "rel_volume_ratio",     # today's volume / 20d rolling mean volume
-    "return_vs_spy_5d",     # 5d momentum of stock minus 5d momentum of SPY
+    "dist_from_52w_high",
+    "momentum_5d",
+    "rel_volume_ratio",
+    "return_vs_spy_5d",
     # v1.2 additions — market context features
-    "vix_level",            # VIX Close / 20.0 (fear regime indicator)
-    "dist_from_52w_low",    # (close - 252d rolling min) / 252d rolling min
-    "vol_ratio_10_60",      # 10d realized vol / 60d realized vol
-    "bollinger_pct",        # (close - lower_bb20) / (upper_bb20 - lower_bb20)
-    "sector_vs_spy_5d",     # sector ETF 5d return - SPY 5d return
+    "vix_level",
+    "dist_from_52w_low",
+    "vol_ratio_10_60",
+    "bollinger_pct",
+    "sector_vs_spy_5d",
     # v1.3 additions — macro regime features
-    "yield_10y",            # 10Y Treasury yield / 10.0 (rate level)
-    "yield_curve_slope",    # (10Y yield - 3M yield) / 10.0 (normal>0, inverted<0)
-    "gold_mom_5d",          # 5d momentum of GLD (risk-off indicator)
-    "oil_mom_5d",           # 5d momentum of USO (commodity cycle)
+    "yield_10y",
+    "yield_curve_slope",
+    "gold_mom_5d",
+    "oil_mom_5d",
     # v1.4 additions — design doc Appendix A feature completions
-    "price_accel",          # momentum_5d - momentum_20d (acceleration)
-    "ema_cross_8_21",       # EMA(8) / EMA(21) - 1 (short vs medium trend)
-    "atr_14_pct",           # ATR(14) / close (normalized volatility)
-    "realized_vol_20d",     # 20d realized vol annualized (√252 scaled)
-    "volume_trend",         # SMA(vol,5) / SMA(vol,20) (short-term vol surge)
-    "obv_slope_10d",        # (OBV_fast - OBV_slow) / SMA(vol,20) (accumulation)
-    "rsi_slope_5d",         # (RSI - RSI.shift(5)) / 5 (RSI momentum)
-    "volume_price_div",     # sign(volume_trend-1) * sign(momentum_5d) (divergence)
+    "price_accel",
+    "ema_cross_8_21",
+    "atr_14_pct",
+    "realized_vol_20d",
+    "volume_trend",
+    "obv_slope_10d",
+    "rsi_slope_5d",
+    "volume_price_div",
 ]
 N_FEATURES = 29
 N_CLASSES = 3  # UP, FLAT, DOWN
@@ -72,73 +90,65 @@ N_CLASSES = 3  # UP, FLAT, DOWN
 CLASS_LABELS = ["DOWN", "FLAT", "UP"]  # index 0, 1, 2
 
 # ── Model architecture hyperparameters ───────────────────────────────────────
-HIDDEN_1 = 64
-HIDDEN_2 = 32
-DROPOUT_1 = 0.3
-DROPOUT_2 = 0.2
+_model_cfg = _cfg["model"]
+HIDDEN_1 = _model_cfg["hidden_1"]
+HIDDEN_2 = _model_cfg["hidden_2"]
+DROPOUT_1 = _model_cfg["dropout_1"]
+DROPOUT_2 = _model_cfg["dropout_2"]
 
 # ── Training hyperparameters ─────────────────────────────────────────────────
-BATCH_SIZE = 512
-LEARNING_RATE = 3e-4   # reduced from 1e-3; 1e-3 caused best_epoch=9 with early
-                        # stopping at epoch 19, indicating premature convergence on
-                        # the financial IC/MSE landscape
-WEIGHT_DECAY = 1e-4
-MAX_EPOCHS = 100
-EARLY_STOPPING_PATIENCE = 20  # increased from 10; gives optimizer more room to
-                                # explore after ReduceLROnPlateau steps down LR
+_train_cfg = _cfg["training"]
+BATCH_SIZE = _train_cfg["batch_size"]
+LEARNING_RATE = float(_train_cfg["learning_rate"])
+WEIGHT_DECAY = float(_train_cfg["weight_decay"])
+MAX_EPOCHS = _train_cfg["max_epochs"]
+EARLY_STOPPING_PATIENCE = _train_cfg["early_stopping_patience"]
+SCHEDULER_FACTOR = _train_cfg["scheduler_factor"]
+SCHEDULER_PATIENCE = _train_cfg["scheduler_patience"]
+MIN_LR = float(_train_cfg["min_lr"])
+GRAD_CLIP_NORM = _train_cfg["grad_clip_norm"]
 
 # ── Label thresholds ─────────────────────────────────────────────────────────
-# 5-day forward return bins that define UP / DOWN / FLAT
-UP_THRESHOLD = 0.01     # > +1% forward return → UP
-DOWN_THRESHOLD = -0.01  # < -1% forward return → DOWN
-# everything in between → FLAT
+_label_cfg = _cfg["labeling"]
+FORWARD_DAYS = _label_cfg["forward_days"]
+UP_THRESHOLD = _label_cfg["up_threshold"]
+DOWN_THRESHOLD = _label_cfg["down_threshold"]
+LABEL_CLIP = _label_cfg["label_clip"]
 
-# ── Label winsorization ───────────────────────────────────────────────────────
-# Clips extreme forward returns before training to reduce outlier influence.
-# Earnings gaps, M&A, biotech FDA events can produce ±30–50% 5-day moves that
-# distort ICLoss gradients away from the typical ±2–4% signal range.
-# Set to None to disable. Recommended: 0.15 (±15%).
-LABEL_CLIP = 0.15
-
-# ── GBM tuned hyperparameters (Optuna v1.4, 150 trials, trial #44) ──────
-# These override GBMScorer._default_params() for weekly Lambda retraining
-# and any --params invocation. Walk-forward: mean IC 0.057, IC IR 2.51.
-GBM_TUNED_PARAMS = {
-    "objective": "regression",
-    "metric": "mse",
-    "num_leaves": 103,
-    "min_child_samples": 113,
-    "max_depth": 3,
-    "learning_rate": 0.126,
-    "feature_fraction": 0.559,
-    "bagging_fraction": 0.872,
-    "lambda_l1": 0.889,
-    "lambda_l2": 0.136,
-    "num_threads": 4,
-    "verbosity": -1,
-    "seed": 42,
-}
+# ── GBM tuned hyperparameters ────────────────────────────────────────────────
+_gbm_cfg = _cfg["gbm"]
+GBM_N_ESTIMATORS = _gbm_cfg["n_estimators"]
+GBM_EARLY_STOPPING_ROUNDS = _gbm_cfg["early_stopping_rounds"]
+GBM_IC_IR_GATE = _gbm_cfg["ic_ir_gate"]
+GBM_TUNED_PARAMS = _gbm_cfg["tuned_params"]
 
 # ── Production gates ─────────────────────────────────────────────────────────
-# Model must meet these thresholds before being applied in production.
-MIN_HIT_RATE = 0.55       # >55% directional accuracy required
-MIN_IC = 0.03             # >0.03 Pearson IC (0.03-0.04 is SOTA at 5-day horizon per design doc)
-MIN_CONFIDENCE = 0.65     # predictions below this gate are not applied as score modifiers
+_gates_cfg = _cfg["gates"]
+MIN_HIT_RATE = _gates_cfg["min_hit_rate"]
+MIN_IC = _gates_cfg["min_ic"]
+MIN_CONFIDENCE = _gates_cfg["min_confidence"]
 
 # ── Training split (by time, no lookahead) ───────────────────────────────────
-TRAIN_FRAC = 0.70
-VAL_FRAC = 0.15
-# TEST_FRAC = 0.15 (remainder — always the most recent data)
+_split_cfg = _cfg["split"]
+TRAIN_FRAC = _split_cfg["train_frac"]
+VAL_FRAC = _split_cfg["val_frac"]
 
-# ── Prediction horizon ───────────────────────────────────────────────────────
-FORWARD_DAYS = 5  # predict 5-trading-day forward return
+# ── Data fetching ────────────────────────────────────────────────────────────
+_data_cfg = _cfg["data"]
+REFRESH_BATCH_SIZE = _data_cfg["refresh_batch_size"]
+BOOTSTRAP_PERIOD = _data_cfg["bootstrap_period"]
+INFERENCE_PERIOD = _data_cfg["inference_period"]
+DAILY_CLOSES_PERIOD = _data_cfg["daily_closes_period"]
+STALENESS_THRESHOLD_DAYS = _data_cfg["staleness_threshold_days"]
+SLIM_CACHE_LOOKBACK_DAYS = _data_cfg["slim_cache_lookback_days"]
+INFERENCE_BATCH_SIZE = _data_cfg["inference_batch_size"]
+MIN_ROWS_FOR_FEATURES = _data_cfg["min_rows_for_features"]
+SPLIT_RETURN_THRESHOLD = _data_cfg["split_return_threshold"]
 
-# ── AWS / Email ────────────────────────────────────────────────────────────────
-# Set these as Lambda environment variables before enabling the predictor email.
-#   EMAIL_SENDER     — from-address (e.g. your.name@gmail.com)
-#   EMAIL_RECIPIENTS — comma-separated recipient list
-#   GMAIL_APP_PASSWORD — 16-char Gmail App Password (enables SMTP path)
-#   AWS_REGION       — SES region if GMAIL_APP_PASSWORD is not set
+# ── Feature engineering parameters ───────────────────────────────────────────
+FEATURE_CFG: dict = _cfg["features"]
+
+# ── AWS / Email ──────────────────────────────────────────────────────────────
 AWS_REGION       = os.environ.get("AWS_REGION", "us-east-1")
 EMAIL_SENDER     = os.environ.get("EMAIL_SENDER", "")
 EMAIL_RECIPIENTS = [

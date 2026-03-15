@@ -56,15 +56,19 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from config import FEATURE_CFG as _FC
+
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
-def _compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
+def _compute_rsi(close: pd.Series, period: int | None = None) -> pd.Series:
     """
     Wilder's RSI using EWM (com = period - 1).
     Matches research's compute_technical_indicators() exactly.
     Returns a Series of RSI values, same index as close.
     """
+    if period is None:
+        period = _FC["rsi_period"]
     delta = close.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
@@ -77,14 +81,20 @@ def _compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
 
 def _compute_macd(
     close: pd.Series,
-    fast: int = 12,
-    slow: int = 26,
-    signal: int = 9,
+    fast: int | None = None,
+    slow: int | None = None,
+    signal: int | None = None,
 ) -> tuple[pd.Series, pd.Series]:
     """
     Standard MACD. Returns (macd_line, signal_line) as Series.
     All EWM calls use adjust=False to match research.
     """
+    if fast is None:
+        fast = _FC["macd_fast"]
+    if slow is None:
+        slow = _FC["macd_slow"]
+    if signal is None:
+        signal = _FC["macd_signal"]
     ema_fast = close.ewm(span=fast, adjust=False).mean()
     ema_slow = close.ewm(span=slow, adjust=False).mean()
     macd_line = ema_fast - ema_slow
@@ -190,11 +200,11 @@ def compute_features(
     close = df["Close"].astype(float)
     volume = df["Volume"].astype(float) if "Volume" in df.columns else pd.Series(0.0, index=df.index)
 
-    # ── RSI 14 ────────────────────────────────────────────────────────────────
-    df["rsi_14"] = _compute_rsi(close, period=14)
+    # ── RSI ─────────────────────────────────────────────────────────────────
+    df["rsi_14"] = _compute_rsi(close)
 
     # ── MACD ──────────────────────────────────────────────────────────────────
-    macd_line, signal_line = _compute_macd(close, fast=12, slow=26, signal=9)
+    macd_line, signal_line = _compute_macd(close)
     df["macd_line_last"] = macd_line
     df["macd_above_zero"] = (macd_line > 0).astype(float)
 
@@ -212,8 +222,10 @@ def compute_features(
     df["macd_cross"] = macd_cross
 
     # ── Moving averages ───────────────────────────────────────────────────────
-    ma50 = close.rolling(window=50, min_periods=50).mean()
-    ma200 = close.rolling(window=200, min_periods=200).mean()
+    _ma_short = _FC["ma_short"]
+    _ma_long = _FC["ma_long"]
+    ma50 = close.rolling(window=_ma_short, min_periods=_ma_short).mean()
+    ma200 = close.rolling(window=_ma_long, min_periods=_ma_long).mean()
 
     # price_vs_ma50 / price_vs_ma200 expressed as ratio (not ×100) for ML input
     # Research uses ×100 for human-readable output; we keep raw ratio here
@@ -222,14 +234,16 @@ def compute_features(
     df["price_vs_ma200"] = (close - ma200) / ma200
 
     # ── 20-day momentum ───────────────────────────────────────────────────────
-    df["momentum_20d"] = (close / close.shift(20)) - 1.0
+    _mom_long = _FC["momentum_long"]
+    df["momentum_20d"] = (close / close.shift(_mom_long)) - 1.0
 
     # ── Average volume (normalized) ───────────────────────────────────────────
     # 20-day rolling mean volume, then normalized by the global mean of the
     # full series. This keeps the feature on a stable scale across all rows.
+    _vol_slow = _FC["volume_slow"]
     volume_global_mean = volume.mean()
     if volume_global_mean > 0:
-        avg_vol_20d = volume.rolling(window=20, min_periods=20).mean()
+        avg_vol_20d = volume.rolling(window=_vol_slow, min_periods=_vol_slow).mean()
         df["avg_volume_20d"] = avg_vol_20d / volume_global_mean
     else:
         df["avg_volume_20d"] = 1.0  # degenerate case
@@ -237,17 +251,19 @@ def compute_features(
     # ── Distance from 52-week high ─────────────────────────────────────────────
     # Documented momentum factor: stocks near their 52w high tend to continue up.
     # Expressed as a negative ratio: 0.0 = at the high, -0.20 = 20% below.
-    rolling_max_252 = close.rolling(window=252, min_periods=252).max()
+    _52w = _FC["weeks_52_days"]
+    rolling_max_252 = close.rolling(window=_52w, min_periods=_52w).max()
     df["dist_from_52w_high"] = (close - rolling_max_252) / rolling_max_252
 
     # ── 5-day momentum ─────────────────────────────────────────────────────────
     # Short-term reversal / continuation signal.
-    df["momentum_5d"] = (close / close.shift(5)) - 1.0
+    _mom_short = _FC["momentum_short"]
+    df["momentum_5d"] = (close / close.shift(_mom_short)) - 1.0
 
     # ── Relative volume ratio ──────────────────────────────────────────────────
     # Current 20d avg volume vs. the rolling mean — flags institutional activity.
     # Differs from avg_volume_20d: this is a relative ratio, not an absolute level.
-    rolling_mean_vol_20 = volume.rolling(window=20, min_periods=20).mean()
+    rolling_mean_vol_20 = volume.rolling(window=_vol_slow, min_periods=_vol_slow).mean()
     df["rel_volume_ratio"] = volume / rolling_mean_vol_20.replace(0, float("nan"))
     df["rel_volume_ratio"] = df["rel_volume_ratio"].fillna(1.0)
 
@@ -257,7 +273,7 @@ def compute_features(
     spy_mom_5d: pd.Series | None = None
     if spy_series is not None:
         spy_aligned = spy_series.reindex(df.index)
-        spy_mom_5d = (spy_aligned / spy_aligned.shift(5)) - 1.0
+        spy_mom_5d = (spy_aligned / spy_aligned.shift(_mom_short)) - 1.0
         df["return_vs_spy_5d"] = df["momentum_5d"] - spy_mom_5d
     else:
         df["return_vs_spy_5d"] = 0.0
@@ -268,28 +284,32 @@ def compute_features(
     # Forward-filled so that non-trading days in the VIX series don't create NaNs.
     if vix_series is not None:
         vix_aligned = vix_series.reindex(df.index, method="ffill")
-        df["vix_level"] = vix_aligned / 20.0
+        df["vix_level"] = vix_aligned / _FC["vix_baseline"]
     else:
         df["vix_level"] = 1.0  # neutral (VIX ≈ 20)
 
     # Distance from 52-week low — symmetric counterpart to dist_from_52w_high.
     # Positive ratio: 0.0 = exactly at the low, larger = further above.
-    rolling_min_252 = close.rolling(window=252, min_periods=252).min()
+    rolling_min_252 = close.rolling(window=_52w, min_periods=_52w).min()
     df["dist_from_52w_low"] = (close - rolling_min_252) / rolling_min_252
 
     # Historical volatility ratio (10d / 60d). > 1 = vol expansion (breakout),
     # < 1 = vol compression (consolidating). Capped to avoid extreme outliers.
+    _vol_short = _FC["vol_short_window"]
+    _vol_long = _FC["vol_long_window"]
     log_ret = np.log(close / close.shift(1))
-    vol_10d = log_ret.rolling(window=10, min_periods=10).std() * np.sqrt(252)
-    vol_60d = log_ret.rolling(window=60, min_periods=60).std() * np.sqrt(252)
+    vol_10d = log_ret.rolling(window=_vol_short, min_periods=_vol_short).std() * np.sqrt(_52w)
+    vol_60d = log_ret.rolling(window=_vol_long, min_periods=_vol_long).std() * np.sqrt(_52w)
     df["vol_ratio_10_60"] = (vol_10d / vol_60d.replace(0, float("nan"))).fillna(1.0)
 
     # Bollinger band position: 0 = at lower band, 0.5 = at mid, 1 = at upper band.
     # Values outside [0, 1] are possible (close outside bands).
-    ma20 = close.rolling(window=20, min_periods=20).mean()
-    std20 = close.rolling(window=20, min_periods=20).std()
-    upper_bb = ma20 + 2.0 * std20
-    lower_bb = ma20 - 2.0 * std20
+    _bb_win = _FC["bollinger_window"]
+    _bb_std = _FC["bollinger_std"]
+    ma20 = close.rolling(window=_bb_win, min_periods=_bb_win).mean()
+    std20 = close.rolling(window=_bb_win, min_periods=_bb_win).std()
+    upper_bb = ma20 + _bb_std * std20
+    lower_bb = ma20 - _bb_std * std20
     band_width = (upper_bb - lower_bb).replace(0, float("nan"))
     df["bollinger_pct"] = ((close - lower_bb) / band_width).fillna(0.5)
 
@@ -297,12 +317,12 @@ def compute_features(
     # Positive = sector outperforming SPY; negative = sector underperforming.
     if sector_etf_series is not None and spy_mom_5d is not None:
         sec_aligned = sector_etf_series.reindex(df.index)
-        sec_mom_5d = (sec_aligned / sec_aligned.shift(5)) - 1.0
+        sec_mom_5d = (sec_aligned / sec_aligned.shift(_mom_short)) - 1.0
         df["sector_vs_spy_5d"] = sec_mom_5d - spy_mom_5d
     elif sector_etf_series is not None:
         # SPY not available — compute sector momentum only (no relative adjustment)
         sec_aligned = sector_etf_series.reindex(df.index)
-        df["sector_vs_spy_5d"] = (sec_aligned / sec_aligned.shift(5)) - 1.0
+        df["sector_vs_spy_5d"] = (sec_aligned / sec_aligned.shift(_mom_short)) - 1.0
     else:
         df["sector_vs_spy_5d"] = 0.0  # no sector info: neutral signal
 
@@ -313,8 +333,9 @@ def compute_features(
     # so the typical 0–10% range maps to 0.0–1.0.
     # Forward-fill so bond market holidays don't create equity-day NaNs.
     if tnx_series is not None:
+        _tnx_norm = _FC["tnx_normalizer"]
         tnx_aligned = tnx_series.reindex(df.index, method="ffill")
-        df["yield_10y"] = tnx_aligned / 10.0
+        df["yield_10y"] = tnx_aligned / _tnx_norm
     else:
         df["yield_10y"] = 0.4  # neutral: ~4% 10Y yield
 
@@ -323,10 +344,10 @@ def compute_features(
     # IRX from yfinance is the 13-week T-bill annualized yield in percent.
     if tnx_series is not None and irx_series is not None:
         irx_aligned = irx_series.reindex(df.index, method="ffill")
-        df["yield_curve_slope"] = (tnx_aligned - irx_aligned) / 10.0
+        df["yield_curve_slope"] = (tnx_aligned - irx_aligned) / _tnx_norm
     elif tnx_series is not None:
         # No short rate — use yield level as a rough slope proxy (vs zero)
-        df["yield_curve_slope"] = tnx_aligned / 10.0
+        df["yield_curve_slope"] = tnx_aligned / _tnx_norm
     else:
         df["yield_curve_slope"] = 0.0  # neutral: assume normal curve
 
@@ -335,7 +356,7 @@ def compute_features(
     # all tickers; z-score normalization lets the model weight it appropriately.
     if gld_series is not None:
         gld_aligned = gld_series.reindex(df.index, method="ffill")
-        df["gold_mom_5d"] = (gld_aligned / gld_aligned.shift(5)) - 1.0
+        df["gold_mom_5d"] = (gld_aligned / gld_aligned.shift(_mom_short)) - 1.0
         df["gold_mom_5d"] = df["gold_mom_5d"].fillna(0.0)
     else:
         df["gold_mom_5d"] = 0.0
@@ -346,7 +367,7 @@ def compute_features(
     # for energy, industrials, and consumer discretionary sectors.
     if uso_series is not None:
         uso_aligned = uso_series.reindex(df.index, method="ffill")
-        df["oil_mom_5d"] = (uso_aligned / uso_aligned.shift(5)) - 1.0
+        df["oil_mom_5d"] = (uso_aligned / uso_aligned.shift(_mom_short)) - 1.0
         df["oil_mom_5d"] = df["oil_mom_5d"].fillna(0.0)
     else:
         df["oil_mom_5d"] = 0.0
@@ -359,8 +380,8 @@ def compute_features(
 
     # ema_cross_8_21: short vs medium-term trend alignment.
     # Positive = short-term EMA above medium-term (bullish alignment).
-    ema_8 = close.ewm(span=8, adjust=False).mean()
-    ema_21 = close.ewm(span=21, adjust=False).mean()
+    ema_8 = close.ewm(span=_FC["ema_fast_span"], adjust=False).mean()
+    ema_21 = close.ewm(span=_FC["ema_slow_span"], adjust=False).mean()
     df["ema_cross_8_21"] = ema_8 / ema_21 - 1.0
 
     # atr_14_pct: normalized average true range. Measures intraday volatility
@@ -373,19 +394,20 @@ def compute_features(
         (high - close.shift(1)).abs(),
         (low - close.shift(1)).abs(),
     ], axis=1).max(axis=1)
-    atr = tr.ewm(span=14, adjust=False).mean()
+    atr = tr.ewm(span=_FC["atr_period"], adjust=False).mean()
     df["atr_14_pct"] = atr / close
 
     # realized_vol_20d: 20-day annualized realized volatility of daily returns.
     # Distinct from vol_ratio_10_60 which is a *ratio* of two vol windows;
     # this is the absolute volatility level itself.
     daily_returns = close.pct_change()
-    df["realized_vol_20d"] = daily_returns.rolling(20).std() * np.sqrt(252)
+    df["realized_vol_20d"] = daily_returns.rolling(_FC["realized_vol_window"]).std() * np.sqrt(_52w)
 
     # volume_trend: ratio of short-term to medium-term average volume.
     # > 1 = volume is expanding (institutional activity); < 1 = contracting.
-    vol_5 = volume.rolling(5).mean()
-    vol_20 = volume.rolling(20).mean()
+    _vf = _FC["volume_fast"]
+    vol_5 = volume.rolling(_vf).mean()
+    vol_20 = volume.rolling(_vol_slow).mean()
     df["volume_trend"] = (vol_5 / vol_20.replace(0, float("nan"))).fillna(1.0)
 
     # obv_slope_10d: On-Balance Volume trend, normalized by average volume.
@@ -394,14 +416,15 @@ def compute_features(
     # distribution (negative) patterns.
     obv_direction = np.sign(close.diff()).fillna(0)
     obv = (obv_direction * volume).cumsum()
-    obv_fast = obv.rolling(5).mean()
-    obv_slow = obv.rolling(20).mean()
+    obv_fast = obv.rolling(_FC["obv_fast"]).mean()
+    obv_slow = obv.rolling(_FC["obv_slow"]).mean()
     df["obv_slope_10d"] = ((obv_fast - obv_slow) / vol_20.replace(0, float("nan"))).fillna(0.0)
 
     # rsi_slope_5d: rate of change of RSI over 5 days. Rising RSI = strengthening
     # momentum; falling RSI = weakening. Captures RSI trend, not just level.
     rsi = df["rsi_14"]
-    df["rsi_slope_5d"] = (rsi - rsi.shift(5)) / 5.0
+    _rsi_slope_w = _FC["rsi_slope_window"]
+    df["rsi_slope_5d"] = (rsi - rsi.shift(_rsi_slope_w)) / float(_rsi_slope_w)
 
     # volume_price_div: sign divergence between volume and price momentum.
     # +1 = volume and price moving in same direction (confirmation)

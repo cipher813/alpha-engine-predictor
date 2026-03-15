@@ -145,12 +145,10 @@ def train(
 
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
-        mode="min",       # minimize val_loss
-        factor=0.5,       # halve LR on plateau
-        patience=8,       # 8 epochs before reducing LR (was 3 — too aggressive for
-                          # noisy financial IC/MSE landscapes; caused premature LR
-                          # decay and early stopping at epoch 9)
-        min_lr=1e-6,
+        mode="min",
+        factor=config.SCHEDULER_FACTOR,
+        patience=config.SCHEDULER_PATIENCE,
+        min_lr=config.MIN_LR,
     )
 
     if regression_mode:
@@ -230,7 +228,7 @@ def train(
             loss.backward()
 
             # Gradient clipping to stabilize training
-            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.GRAD_CLIP_NORM)
 
             optimizer.step()
 

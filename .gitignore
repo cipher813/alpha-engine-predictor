@@ -31,6 +31,9 @@ tune.db
 # Evaluation and prediction outputs
 eval_report.json
 
+# Config (real values — gitignored; use *.sample.yaml for onboarding)
+config/predictor.yaml
+
 # Secrets and environment
 .env
 .env.*

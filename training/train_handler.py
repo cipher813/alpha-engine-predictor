@@ -89,16 +89,16 @@ def download_price_cache(bucket: str, prefix: str, local_dir: Path) -> int:
 # yfinance requires a leading caret for these index / rate tickers.
 _CARET_SYMBOLS = {"VIX", "TNX", "IRX"}
 
-# Batch size for yfinance multi-ticker downloads.
-_REFRESH_BATCH_SIZE = 50
+# Batch size for yfinance multi-ticker downloads (from config).
+from config import REFRESH_BATCH_SIZE as _REFRESH_BATCH_SIZE
 
 
 def refresh_price_cache(
     bucket: str,
     prefix: str,
     local_dir: Path,
-    fetch_period: str = "10y",
-    staleness_threshold_days: int = 2,
+    fetch_period: str | None = None,
+    staleness_threshold_days: int | None = None,
 ) -> int:
     """
     Fully rewrite stale .parquet files in local_dir with fresh yfinance data and
@@ -136,6 +136,12 @@ def refresh_price_cache(
     import yfinance as yf
     import boto3
     from data.dataset import _parquet_engine
+    from config import BOOTSTRAP_PERIOD, STALENESS_THRESHOLD_DAYS as _DEFAULT_STALE_DAYS
+
+    if fetch_period is None:
+        fetch_period = BOOTSTRAP_PERIOD
+    if staleness_threshold_days is None:
+        staleness_threshold_days = _DEFAULT_STALE_DAYS
 
     engine = _parquet_engine()
     today  = pd.Timestamp.now().normalize()  # timezone-naive, matches bootstrap index
@@ -254,7 +260,7 @@ def write_slim_cache(
     bucket: str,
     full_cache_dir: Path,
     slim_prefix: str = "predictor/price_cache_slim/",
-    lookback_days: int = 730,
+    lookback_days: int | None = None,
 ) -> int:
     """
     After weekly training, write a 2-year slice of each ticker parquet to S3 at
@@ -287,6 +293,10 @@ def write_slim_cache(
     import pandas as pd
     import boto3
     from data.dataset import _parquet_engine
+    from config import SLIM_CACHE_LOOKBACK_DAYS
+
+    if lookback_days is None:
+        lookback_days = SLIM_CACHE_LOOKBACK_DAYS
 
     engine  = _parquet_engine()
     s3      = boto3.client("s3")
@@ -409,13 +419,14 @@ def run_gbm_training(
     # ── Train with Optuna-tuned hyperparameters ───────────────────────────────
     tuned_params = getattr(cfg, "GBM_TUNED_PARAMS", None)
     log.info(
-        "Training GBMScorer (n_estimators=2000, early_stopping=50, %s) ...",
+        "Training GBMScorer (n_estimators=%d, early_stopping=%d, %s) ...",
+        cfg.GBM_N_ESTIMATORS, cfg.GBM_EARLY_STOPPING_ROUNDS,
         "Optuna-tuned params" if tuned_params else "default params",
     )
     scorer = GBMScorer(
         params=tuned_params,
-        n_estimators=2000,
-        early_stopping_rounds=50,
+        n_estimators=cfg.GBM_N_ESTIMATORS,
+        early_stopping_rounds=cfg.GBM_EARLY_STOPPING_ROUNDS,
     )
     scorer.fit(X_train, y_train, X_val, y_val, feature_names=cfg.FEATURES)
 
@@ -438,7 +449,7 @@ def run_gbm_training(
     top10      = sorted(importance.items(), key=lambda x: -x[1])[:10]
 
     passes_ic    = float(test_ic) >= cfg.MIN_IC
-    passes_ic_ir = ic_ir >= 0.3
+    passes_ic_ir = ic_ir >= cfg.GBM_IC_IR_GATE
     elapsed_s    = (datetime.now(timezone.utc) - start_ts).total_seconds()
     model_version = f"GBM-v{scorer._best_iteration}"
 
@@ -582,7 +593,7 @@ def send_training_email(result: dict, date_str: str) -> bool:
         f'<tr style="background:#f9f9f9;">'
         f'  <td style="padding:5px 10px; color:#555;">IC IR</td>'
         f'  <td style="padding:5px 10px; font-family:monospace;">'
-        f'  {ic_ir:.3f} {"✓" if ic_ir >= 0.3 else "✗"}</td>'
+        f'  {ic_ir:.3f} {"✓" if ic_ir >= cfg.GBM_IC_IR_GATE else "✗"}</td>'
         f'</tr>'
         f'<tr>'
         f'  <td style="padding:5px 10px; color:#555;">IC positive periods</td>'
@@ -598,7 +609,7 @@ def send_training_email(result: dict, date_str: str) -> bool:
         f'<table>{feat_rows}</table>'
 
         f'<p style="font-size:11px; color:#aaa; margin-top:20px;">'
-        f'IC gate: ≥{cfg.MIN_IC:.2f} to promote &nbsp;|&nbsp; IC IR gate: ≥0.30</p>'
+        f'IC gate: ≥{cfg.MIN_IC:.2f} to promote &nbsp;|&nbsp; IC IR gate: ≥{cfg.GBM_IC_IR_GATE:.2f}</p>'
         f'</body></html>'
     )
 

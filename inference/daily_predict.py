@@ -388,11 +388,11 @@ def fetch_today_prices(tickers: list[str]) -> dict[str, pd.DataFrame]:
     # 2y lookback: compute_features needs 252 rows of warmup (52w rolling windows).
     # With only 1y of data (~252 rows) the dropna step in compute_features leaves
     # 0–1 rows, causing empty featured_df and skipped predictions.
-    log.info("Fetching 2y price data for %d tickers...", len(tickers))
+    log.info("Fetching %s price data for %d tickers...", cfg.INFERENCE_PERIOD, len(tickers))
     result: dict[str, pd.DataFrame] = {}
 
     # Batch download for efficiency
-    batch_size = 100
+    batch_size = cfg.INFERENCE_BATCH_SIZE
     batches = [tickers[i : i + batch_size] for i in range(0, len(tickers), batch_size)]
 
     for batch in batches:
@@ -400,7 +400,7 @@ def fetch_today_prices(tickers: list[str]) -> dict[str, pd.DataFrame]:
             if len(batch) == 1:
                 raw = yf.download(
                     batch[0],
-                    period="2y",
+                    period=cfg.INFERENCE_PERIOD,
                     interval="1d",
                     auto_adjust=True,
                     progress=False,
@@ -411,7 +411,7 @@ def fetch_today_prices(tickers: list[str]) -> dict[str, pd.DataFrame]:
             else:
                 raw = yf.download(
                     tickers=batch,
-                    period="2y",
+                    period=cfg.INFERENCE_PERIOD,
                     interval="1d",
                     auto_adjust=True,
                     progress=False,
@@ -603,7 +603,7 @@ def save_daily_closes(
     )
 
     records: list[dict] = []
-    batch_size = 100
+    batch_size = cfg.INFERENCE_BATCH_SIZE
     batches = [tickers[i : i + batch_size] for i in range(0, len(tickers), batch_size)]
 
     for batch in batches:
@@ -611,7 +611,7 @@ def save_daily_closes(
             tickers_arg = batch[0] if len(batch) == 1 else batch
             raw = yf.download(
                 tickers=tickers_arg,
-                period="5d",        # only need the most-recent row — fast fetch
+                period=cfg.DAILY_CLOSES_PERIOD,
                 interval="1d",
                 auto_adjust=False,  # keeps both Close (split-adj) and Adj Close (full-adj)
                 progress=False,
@@ -695,7 +695,7 @@ _CLOSES_PREFIX = "predictor/daily_closes/"
 
 # Single-day return magnitude above which we assume a split occurred.
 # A legitimate limit-up/down is ±20%; a split creates ±50%+ moves.
-_SPLIT_RETURN_THRESHOLD = 0.45
+from config import SPLIT_RETURN_THRESHOLD as _SPLIT_RETURN_THRESHOLD
 
 
 def _download_slim_cache(s3_bucket: str, local_dir: Path) -> int:
@@ -993,7 +993,7 @@ def predict_ticker(
     """
     from data.feature_engineer import compute_features
 
-    if df.empty or len(df) < 265:
+    if df.empty or len(df) < cfg.MIN_ROWS_FOR_FEATURES:
         # Need 252 rows for 52w rolling windows + buffer; 265 is a safe minimum
         log.debug("Skipping %s: insufficient data (%d rows)", ticker, len(df))
         return None
@@ -1093,7 +1093,7 @@ def predict_ticker_gbm(
     """
     from data.feature_engineer import compute_features
 
-    if df.empty or len(df) < 265:
+    if df.empty or len(df) < cfg.MIN_ROWS_FOR_FEATURES:
         # Need 252 rows for 52w rolling windows + buffer; 265 is a safe minimum
         log.debug("Skipping %s: insufficient data (%d rows)", ticker, len(df))
         return None

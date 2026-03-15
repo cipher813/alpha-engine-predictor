@@ -1,0 +1,100 @@
+# Predictor configuration — model hyperparameters, production gates, and training params.
+# Copy to predictor.yaml and customise all values below.
+# These are intentionally naive defaults — tune them to your own data.
+
+# ── Model architecture (NN — currently inactive, GBM is primary) ─────────────
+model:
+  hidden_1: 32                     # first hidden layer size
+  hidden_2: 16                     # second hidden layer size
+  dropout_1: 0.4                   # dropout rate after first layer
+  dropout_2: 0.3                   # dropout rate after second layer
+
+# ── Training hyperparameters (NN) ─────────────────────────────────────────────
+training:
+  batch_size: 256                  # training batch size
+  learning_rate: 1.0e-3            # AdamW learning rate
+  weight_decay: 1.0e-5             # L2 regularization
+  max_epochs: 50                   # max training epochs
+  early_stopping_patience: 10      # epochs to wait before early stopping
+  scheduler_factor: 0.5            # ReduceLROnPlateau factor
+  scheduler_patience: 5            # ReduceLROnPlateau patience
+  min_lr: 1.0e-6                   # minimum learning rate
+  grad_clip_norm: 1.0              # gradient clipping max norm
+
+# ── Label thresholds ──────────────────────────────────────────────────────────
+labeling:
+  forward_days: 5                  # prediction horizon (trading days)
+  up_threshold: 0.02               # forward return > this → UP label
+  down_threshold: -0.02            # forward return < this → DOWN label
+  label_clip: 0.20                 # clip extreme returns (±20%), null to disable
+
+# ── GBM hyperparameters ──────────────────────────────────────────────────────
+gbm:
+  n_estimators: 1000               # max boosting rounds
+  early_stopping_rounds: 30        # stop if no improvement for N rounds
+  ic_ir_gate: 0.20                 # IC IR threshold for model promotion
+  tuned_params:
+    objective: regression
+    metric: mse
+    num_leaves: 63                 # tree complexity
+    min_child_samples: 200         # min samples per leaf
+    max_depth: -1                  # no depth limit (-1)
+    learning_rate: 0.05            # boosting learning rate
+    feature_fraction: 0.8          # fraction of features per tree
+    bagging_fraction: 0.8          # fraction of rows per tree
+    lambda_l1: 0.1                 # L1 regularization
+    lambda_l2: 0.1                 # L2 regularization
+    num_threads: 4
+    verbosity: -1
+    seed: 42
+
+# ── Production gates ──────────────────────────────────────────────────────────
+gates:
+  min_hit_rate: 0.52               # min directional accuracy to deploy
+  min_ic: 0.02                     # min Pearson IC to promote model
+  min_confidence: 0.60             # min confidence for veto gate
+
+# ── Training split ────────────────────────────────────────────────────────────
+split:
+  train_frac: 0.70                 # fraction of data for training
+  val_frac: 0.15                   # fraction for validation (rest = test)
+
+# ── Data fetching ─────────────────────────────────────────────────────────────
+data:
+  refresh_batch_size: 50           # yfinance batch size for downloads
+  bootstrap_period: "10y"          # historical period for price cache
+  inference_period: "2y"           # price lookback for daily inference
+  daily_closes_period: "5d"        # period for daily closes fetch
+  staleness_threshold_days: 2      # business days before refresh
+  slim_cache_lookback_days: 730    # calendar days for slim cache (2y)
+  inference_batch_size: 100        # ticker batch size for inference
+  min_rows_for_features: 265       # min rows for feature computation (252 warmup + buffer)
+  split_return_threshold: 0.45     # ±45% return threshold for split detection
+
+# ── Feature engineering parameters ────────────────────────────────────────────
+features:
+  rsi_period: 14                   # RSI lookback period
+  macd_fast: 12                    # MACD fast EMA span
+  macd_slow: 26                    # MACD slow EMA span
+  macd_signal: 9                   # MACD signal line span
+  macd_cross_window: 3             # days to look back for MACD cross
+  ma_short: 50                     # short moving average window
+  ma_long: 200                     # long moving average window
+  momentum_short: 5                # short momentum window (days)
+  momentum_long: 20                # long momentum window (days)
+  weeks_52_days: 252               # trading days in 52 weeks
+  vol_short_window: 10             # short volatility window
+  vol_long_window: 60              # long volatility window
+  bollinger_window: 20             # Bollinger Band SMA window
+  bollinger_std: 2.0               # Bollinger Band standard deviations
+  vix_baseline: 20.0               # VIX normalization baseline
+  tnx_normalizer: 10.0             # TNX yield normalizer (10% → 1.0)
+  ema_fast_span: 8                 # EMA cross fast span
+  ema_slow_span: 21                # EMA cross slow span
+  atr_period: 14                   # ATR lookback period
+  realized_vol_window: 20          # realized volatility window
+  volume_fast: 5                   # volume trend fast window
+  volume_slow: 20                  # volume trend slow window
+  obv_fast: 5                      # OBV fast rolling window
+  obv_slow: 20                     # OBV slow rolling window
+  rsi_slope_window: 5              # RSI slope lookback
