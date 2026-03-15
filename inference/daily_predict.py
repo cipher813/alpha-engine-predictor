@@ -232,41 +232,58 @@ def load_watchlist(
     date_str: Optional[str] = None,
 ) -> tuple[list[str], dict[str, str]]:
     """
-    Build a focused prediction universe from the research module's signals.json.
+    Build a focused prediction universe from Research's population or signals.
 
-    signals.json (written by alpha-engine-research) contains two relevant keys:
-
-        "universe"       — tickers the research pipeline actively monitors
-                           → watchlist_source = "tracked"
-        "buy_candidates" — scanner-identified entry candidates for the run
-                           → watchlist_source = "buy_candidate"
+    Priority order for ``path="auto"``:
+      1. population/latest.json  — new population-based architecture
+      2. signals/{date}/signals.json  — legacy fallback
 
     Parameters
     ----------
-    path      : "auto" → fetch today's signals.json from S3
-                         at signals/{date}/signals.json.
-                Any other string → local file path to a signals.json produced
-                by alpha-engine-research (for offline / dry-run use).
+    path      : "auto" → fetch from S3 (population first, then signals).
+                Any other string → local file path to signals.json or
+                population.json for offline / dry-run use.
     s3_bucket : S3 bucket name. Required when path="auto".
-    date_str  : YYYY-MM-DD override. Defaults to today. Used for the S3 key
-                when path="auto".
+    date_str  : YYYY-MM-DD override. Defaults to today.
 
     Returns
     -------
-    tickers : Deduplicated, sorted list of tickers from universe + buy_candidates.
-    sources : Dict mapping ticker → "tracked" | "buy_candidate" | "both".
+    tickers : Deduplicated, sorted list of tickers.
+    sources : Dict mapping ticker → "population" | "tracked" | "buy_candidate" | "both".
+    data    : Raw JSON payload (population or signals).
     """
     if date_str is None:
         date_str = datetime.now().strftime("%Y-%m-%d")
 
-    # ── Load raw signals payload ──────────────────────────────────────────────
+    data = None
+
+    # ── Load raw payload ──────────────────────────────────────────────────────
     if path == "auto":
         if not s3_bucket:
             raise ValueError("s3_bucket is required when --watchlist auto is used")
+
+        import boto3
+        s3 = boto3.client("s3")
+
+        # Try population/latest.json first (new architecture)
+        try:
+            obj = s3.get_object(Bucket=s3_bucket, Key="population/latest.json")
+            data = json.loads(obj["Body"].read().decode("utf-8"))
+            pop_tickers = [p["ticker"] for p in data.get("population", []) if "ticker" in p]
+            if pop_tickers:
+                sources = {t.upper(): "population" for t in pop_tickers}
+                tickers = sorted(sources.keys())
+                log.info(
+                    "Watchlist: loaded %d tickers from population/latest.json",
+                    len(tickers),
+                )
+                return tickers, sources, data
+        except Exception as exc:
+            log.info("population/latest.json not available (%s), falling back to signals.json", exc)
+
+        # Fallback: signals/{date}/signals.json (legacy)
         signals_key = f"signals/{date_str}/signals.json"
         try:
-            import boto3
-            s3 = boto3.client("s3")
             obj = s3.get_object(Bucket=s3_bucket, Key=signals_key)
             data = json.loads(obj["Body"].read().decode("utf-8"))
             log.info(
@@ -275,22 +292,30 @@ def load_watchlist(
             )
         except Exception as exc:
             raise RuntimeError(
-                f"Could not load signals.json from s3://{s3_bucket}/{signals_key}: {exc}\n"
-                "Ensure the research pipeline has run for today before the predictor, "
+                f"Could not load signals from s3://{s3_bucket}: {exc}\n"
+                "Ensure the research pipeline has run before the predictor, "
                 "or provide a local path: --watchlist /path/to/signals.json"
             ) from exc
     else:
         local_path = Path(path)
         if not local_path.exists():
             raise FileNotFoundError(
-                f"signals.json not found: {path}\n"
-                "Use --watchlist auto to pull from S3, or provide the path to a "
-                "local signals.json from alpha-engine-research."
+                f"File not found: {path}\n"
+                "Use --watchlist auto to pull from S3, or provide a local path."
             )
         data = json.loads(local_path.read_text())
-        log.info("Watchlist: loaded signals from %s", path)
+        log.info("Watchlist: loaded from %s", path)
 
-    # ── Extract and annotate tickers ─────────────────────────────────────────
+        # Check if this is a population file
+        if "population" in data and isinstance(data["population"], list):
+            pop_tickers = [p["ticker"] for p in data["population"] if "ticker" in p]
+            if pop_tickers:
+                sources = {t.upper(): "population" for t in pop_tickers}
+                tickers = sorted(sources.keys())
+                log.info("Watchlist: %d tickers from population file", len(tickers))
+                return tickers, sources, data
+
+    # ── Extract and annotate tickers from signals.json ─────────────────────
     universe_tickers = {
         e["ticker"].upper() for e in data.get("universe", []) if "ticker" in e
     }
