@@ -8,7 +8,7 @@ Supports two actions via the event payload:
     on the research watchlist and writes predictions to S3. Sends predictor email.
 
   action == "train":
-    Triggered by EventBridge Sunday at 5:00am PT. Downloads the price cache
+    Triggered by EventBridge Monday 07:00 UTC (Sun ~11pm PT). Downloads the price cache
     from S3, retrains GBMScorer, uploads new weights if IC gate passes,
     and sends a training summary email.
 

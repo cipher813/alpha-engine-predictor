@@ -31,7 +31,7 @@ S3 layout:
                                           load_price_data_from_cache(), reducing daily yfinance
                                           fetches to only the ~1-2 split tickers per week.
   predictor/price_cache_slim/*.parquet  — 2-year slice of each ticker (written by
-                                          write_slim_cache() after each Sunday training run).
+                                          write_slim_cache() after each weekly training run).
                                           The inference Lambda downloads this (~9 MB) instead
                                           of re-fetching 2y from yfinance each morning.
 
@@ -711,6 +711,17 @@ def run_gbm_training(
                     ContentType="application/json",
                 )
                 log.info("Promoted to active weights: s3://%s/%s", bucket, cfg.GBM_WEIGHTS_KEY)
+
+                # Mirror to backtest/ prefix (EC2 IAM role can't read predictor/weights/)
+                s3.upload_file(str(booster_path), bucket, "backtest/gbm_latest.txt")
+                s3.put_object(
+                    Bucket=bucket,
+                    Key="backtest/gbm_latest.txt.meta.json",
+                    Body=json.dumps(meta, indent=2).encode(),
+                    ContentType="application/json",
+                )
+                log.info("Mirrored to backtest/ prefix for EC2 backtester")
+
                 promoted = True
             else:
                 reason = "walk-forward" if (wf_result and not wf_result.get("fallback")) else "single-split IC"
