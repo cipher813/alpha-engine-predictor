@@ -185,10 +185,20 @@ def load_gbm_s3(s3_bucket: str, weights_key: str):
 
 _predictor_params_cache: dict | None = None
 _predictor_params_loaded: bool = False
+# Local cache persists last known optimal across Lambda cold-starts (via /tmp)
+# and EC2 restarts (via project dir).
+_PREDICTOR_PARAMS_CACHE_PATH = Path(
+    os.environ.get("PREDICTOR_PARAMS_CACHE", "/tmp/predictor_params_cache.json")
+)
 
 
 def _load_predictor_params_from_s3(s3_bucket: str) -> dict | None:
-    """Read config/predictor_params.json from S3. Cache per cold-start."""
+    """Read config/predictor_params.json from S3. Cache per cold-start.
+
+    Fallback chain: S3 → local cache file → None (hardcoded defaults).
+    On successful S3 read, writes a local cache so the last known optimal
+    params survive transient S3 failures.
+    """
     global _predictor_params_cache, _predictor_params_loaded
     if _predictor_params_loaded:
         return _predictor_params_cache
@@ -202,10 +212,30 @@ def _load_predictor_params_from_s3(s3_bucket: str) -> dict | None:
         if "veto_confidence" in data:
             _predictor_params_cache = data
             log.info("Loaded predictor params from S3: veto_confidence=%.2f", data["veto_confidence"])
+            # Persist to local cache for fault tolerance
+            try:
+                _PREDICTOR_PARAMS_CACHE_PATH.write_text(json.dumps(data, indent=2))
+            except Exception:
+                pass  # best-effort
         return _predictor_params_cache
     except Exception as e:
-        log.debug("No S3 predictor params (using defaults): %s", e)
-        return None
+        log.warning("Could not read predictor params from S3: %s", e)
+
+    # Fallback: last known optimal from local cache
+    try:
+        if _PREDICTOR_PARAMS_CACHE_PATH.exists():
+            data = json.loads(_PREDICTOR_PARAMS_CACHE_PATH.read_text())
+            if "veto_confidence" in data:
+                _predictor_params_cache = data
+                log.info(
+                    "Loaded predictor params from local cache (last known optimal): veto_confidence=%.2f",
+                    data["veto_confidence"],
+                )
+                return _predictor_params_cache
+    except Exception as e2:
+        log.debug("Could not read local predictor params cache: %s", e2)
+
+    return None
 
 
 def get_veto_threshold(s3_bucket: str) -> float:
@@ -316,21 +346,49 @@ def load_watchlist(
         except Exception as exc:
             log.info("population/latest.json not available (%s), falling back to signals.json", exc)
 
-        # Fallback: signals/{date}/signals.json (legacy)
-        signals_key = f"signals/{date_str}/signals.json"
-        try:
-            obj = s3.get_object(Bucket=s3_bucket, Key=signals_key)
-            data = json.loads(obj["Body"].read().decode("utf-8"))
-            log.info(
-                "Watchlist: loaded signals from s3://%s/%s",
-                s3_bucket, signals_key,
-            )
-        except Exception as exc:
+        # Fallback: signals/{date}/signals.json with date lookback
+        # Walk back up to 5 calendar days (skipping weekends) to find the
+        # most recent signals — mirrors executor's read_signals_with_fallback.
+        from datetime import date as _date, timedelta as _td
+        from botocore.exceptions import ClientError
+
+        start = _date.fromisoformat(date_str)
+        max_lookback = 5
+        tried: list[str] = []
+
+        for days_back in range(max_lookback + 1):
+            candidate = start - _td(days=days_back)
+            if candidate.weekday() >= 5:  # skip Saturday/Sunday
+                continue
+            signals_key = f"signals/{candidate}/signals.json"
+            try:
+                obj = s3.get_object(Bucket=s3_bucket, Key=signals_key)
+                data = json.loads(obj["Body"].read().decode("utf-8"))
+                if days_back > 0:
+                    log.warning(
+                        "Watchlist: no signals for %s — using %s (%d day(s) old). Tried: %s",
+                        start, candidate, days_back, tried,
+                    )
+                else:
+                    log.info("Watchlist: loaded signals from s3://%s/%s", s3_bucket, signals_key)
+                break
+            except ClientError as e:
+                code = e.response["Error"]["Code"]
+                if code in ("NoSuchKey", "AccessDenied", "403"):
+                    log.info("No signals for %s (%s), looking further back...", candidate, code)
+                    tried.append(str(candidate))
+                    continue
+                raise
+            except Exception as exc:
+                log.info("Error reading signals for %s: %s", candidate, exc)
+                tried.append(str(candidate))
+                continue
+        else:
             raise RuntimeError(
-                f"Could not load signals from s3://{s3_bucket}: {exc}\n"
-                "Ensure the research pipeline has run before the predictor, "
+                f"No signals found within {max_lookback} days of {start}. "
+                f"Dates tried: {tried}. Ensure research pipeline ran recently, "
                 "or provide a local path: --watchlist /path/to/signals.json"
-            ) from exc
+            )
     else:
         local_path = Path(path)
         if not local_path.exists():
