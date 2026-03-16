@@ -432,6 +432,48 @@ def compute_features(
     #  0 = neutral (volume or price flat)
     df["volume_price_div"] = np.sign(df["volume_trend"] - 1.0) * np.sign(df["momentum_5d"])
 
+    # ── v1.5 features — regime interaction terms ───────────────────────────────
+    # Pure macro features (VIX, yields) are identical across all tickers on a
+    # given day and cannot predict cross-sectional alpha.  But *interactions*
+    # between macro regime indicators and ticker-specific signals ARE cross-
+    # sectional: the product varies by ticker, capturing how technical signals
+    # behave differently under different regimes (e.g., momentum works in bull
+    # markets but mean-reverts in high-fear environments).
+
+    # VIX regime indicator: >1 when VIX above baseline (elevated fear).
+    # Centered at 0 so the interaction term is neutral at the baseline.
+    vix_regime = df["vix_level"] - 1.0  # 0 = baseline, +0.5 = VIX at 30
+
+    # momentum × VIX regime: captures regime-dependent momentum behavior.
+    # In high-fear regimes, short-term momentum tends to be mean-reverting
+    # (oversold bounces); in low-fear regimes, momentum tends to persist.
+    df["mom5d_x_vix"] = df["momentum_5d"] * vix_regime
+
+    # RSI × VIX regime: overbought/oversold signals are more predictive
+    # in high-volatility regimes (mean-reversion works better).
+    # Center RSI at 50 so neutral → 0 interaction.
+    rsi_centered = (df["rsi_14"] - 50.0) / 50.0  # range [-1, +1]
+    df["rsi_x_vix"] = rsi_centered * vix_regime
+
+    # sector relative strength × market trend: captures whether sector rotation
+    # signals are more/less predictive in trending vs range-bound markets.
+    # SPY 20d momentum as market trend proxy (already available from momentum_20d).
+    if spy_series is not None:
+        spy_aligned = spy_series.reindex(df.index, method="ffill")
+        spy_trend = (spy_aligned / spy_aligned.shift(20)) - 1.0
+        spy_trend = spy_trend.fillna(0.0)
+    else:
+        spy_trend = pd.Series(0.0, index=df.index)
+    df["sector_x_trend"] = df["sector_vs_spy_5d"] * spy_trend
+
+    # volatility regime interaction: high atr_14_pct in high-VIX environments
+    # signals panic; high atr_14_pct in low-VIX signals stock-specific event.
+    df["atr_x_vix"] = df["atr_14_pct"] * vix_regime
+
+    # volume surge × VIX: distinguishes institutional accumulation in calm
+    # markets from panic liquidation in fearful markets.
+    df["vol_trend_x_vix"] = (df["volume_trend"] - 1.0) * vix_regime
+
     # ── Drop rows with any NaN in the feature columns ─────────────────────────
     from config import FEATURES as feature_cols
     df = df.dropna(subset=feature_cols)

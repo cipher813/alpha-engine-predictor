@@ -339,6 +339,184 @@ def write_slim_cache(
     return written
 
 
+# ── Walk-forward validation ───────────────────────────────────────────────────
+
+def _find_date_boundary(all_dates: list, target_idx: int, purge_days: int, N: int) -> int:
+    """Find the first sample index after purging `purge_days` unique dates past target_idx."""
+    if target_idx >= N:
+        return N
+    boundary_date = all_dates[min(target_idx - 1, N - 1)]
+    unique_post = sorted(set(d for d in all_dates[target_idx:] if d > boundary_date))
+    if len(unique_post) >= purge_days:
+        purge_cutoff = unique_post[purge_days - 1]
+        return next(i for i in range(target_idx, N) if all_dates[i] > purge_cutoff)
+    return target_idx
+
+
+def run_walk_forward(
+    X_all: np.ndarray,
+    fwd_all: np.ndarray,
+    all_dates: list,
+    cfg,
+) -> dict:
+    """
+    Expanding-window walk-forward validation.
+
+    Splits data into ~15 folds of WF_TEST_WINDOW_DAYS each, with expanding
+    training windows (all data before the fold boundary). Each fold trains a
+    fresh GBM and computes IC on the out-of-sample test window.
+
+    Returns dict with fold_ics, median_ic, pct_positive, passes_wf flags,
+    and per-fold detail for email reporting.
+    """
+    from model.gbm_scorer import GBMScorer
+
+    N = len(fwd_all)
+    unique_dates = sorted(set(all_dates))
+    n_unique = len(unique_dates)
+    test_window = cfg.WF_TEST_WINDOW_DAYS
+    min_train = cfg.WF_MIN_TRAIN_DAYS
+    purge_days = cfg.WF_PURGE_DAYS
+
+    # Build date → index mapping for efficient boundary lookup
+    date_to_first_idx: dict = {}
+    for i, d in enumerate(all_dates):
+        if d not in date_to_first_idx:
+            date_to_first_idx[d] = i
+
+    # Generate fold boundaries: expanding train, fixed-size test windows.
+    # After the last full fold, include a partial final fold if at least
+    # half a test window of data remains — ensures recent data is validated.
+    min_partial_days = test_window // 2  # minimum 63 days for partial fold
+    folds: list[dict] = []
+    fold_start_date_idx = min_train  # index into unique_dates
+    while fold_start_date_idx < n_unique:
+        remaining = n_unique - fold_start_date_idx
+        # Skip if less than half a test window remains
+        if remaining < min_partial_days:
+            break
+
+        test_start_date = unique_dates[fold_start_date_idx]
+        test_end_date_idx = min(fold_start_date_idx + test_window - 1, n_unique - 1)
+        test_end_date = unique_dates[test_end_date_idx]
+
+        # Train end: purge_days before test start
+        train_end_date_idx = fold_start_date_idx - purge_days
+        if train_end_date_idx < min_train // 2:
+            fold_start_date_idx += test_window
+            continue
+        train_end_date = unique_dates[train_end_date_idx]
+
+        # Convert date boundaries to sample indices
+        train_mask = np.array([d <= train_end_date for d in all_dates])
+        test_mask = np.array([test_start_date <= d <= test_end_date for d in all_dates])
+
+        train_indices = np.where(train_mask)[0]
+        test_indices = np.where(test_mask)[0]
+
+        if len(train_indices) < 1000 or len(test_indices) < 100:
+            fold_start_date_idx += test_window
+            continue
+
+        is_partial = remaining < test_window
+        folds.append({
+            "train_indices": train_indices,
+            "test_indices": test_indices,
+            "train_end_date": str(train_end_date),
+            "test_start_date": str(test_start_date),
+            "test_end_date": str(test_end_date),
+            "partial": is_partial,
+        })
+        if is_partial:
+            log.info("  Partial final fold: %d/%d test days", remaining, test_window)
+
+        fold_start_date_idx += test_window
+
+    log.info("Walk-forward: %d folds generated from %d unique dates", len(folds), n_unique)
+
+    if len(folds) < 3:
+        log.warning("Walk-forward: too few folds (%d) — falling back to single split", len(folds))
+        return {"folds": [], "median_ic": 0.0, "pct_positive": 0.0, "passes_wf": False,
+                "fallback": True}
+
+    tuned_params = getattr(cfg, "GBM_TUNED_PARAMS", None)
+    fold_results: list[dict] = []
+
+    for i, fold in enumerate(folds):
+        train_idx = fold["train_indices"]
+        test_idx = fold["test_indices"]
+        X_train_fold = X_all[train_idx]
+        y_train_fold = fwd_all[train_idx]
+        X_test_fold = X_all[test_idx]
+        y_test_fold = fwd_all[test_idx]
+
+        # Split train into sub-train (85%) + sub-val (15%) for early stopping
+        n_sub_train = int(len(y_train_fold) * 0.85)
+        X_sub_train = X_train_fold[:n_sub_train]
+        y_sub_train = y_train_fold[:n_sub_train]
+        X_sub_val = X_train_fold[n_sub_train:]
+        y_sub_val = y_train_fold[n_sub_train:]
+
+        scorer = GBMScorer(
+            params=tuned_params,
+            n_estimators=cfg.GBM_N_ESTIMATORS,
+            early_stopping_rounds=cfg.GBM_EARLY_STOPPING_ROUNDS,
+        )
+        scorer.fit(X_sub_train, y_sub_train, X_sub_val, y_sub_val,
+                    feature_names=cfg.GBM_FEATURES)
+
+        test_preds = scorer.predict(X_test_fold)
+
+        # IC for this fold
+        if len(test_preds) > 1 and np.std(test_preds) > 1e-10 and np.std(y_test_fold) > 1e-10:
+            fold_ic = float(np.corrcoef(test_preds, y_test_fold)[0, 1])
+        else:
+            fold_ic = 0.0
+
+        fold_result = {
+            "fold": i + 1,
+            "train_end": fold["train_end_date"],
+            "test_start": fold["test_start_date"],
+            "test_end": fold["test_end_date"],
+            "n_train": len(y_train_fold),
+            "n_test": len(y_test_fold),
+            "ic": round(fold_ic, 6),
+            "best_iteration": scorer._best_iteration,
+        }
+        fold_results.append(fold_result)
+        log.info(
+            "  Fold %d/%d: train=%d test=%d  [%s → %s]  IC=%.4f",
+            i + 1, len(folds), len(y_train_fold), len(y_test_fold),
+            fold["test_start_date"], fold["test_end_date"], fold_ic,
+        )
+
+    fold_ics = np.array([f["ic"] for f in fold_results])
+    median_ic = float(np.median(fold_ics))
+    pct_positive = float((fold_ics > 0).mean())
+
+    passes_median = median_ic >= cfg.WF_MEDIAN_IC_GATE
+    passes_pct = pct_positive >= cfg.WF_MIN_FOLDS_POSITIVE
+    passes_wf = passes_median and passes_pct
+
+    log.info(
+        "Walk-forward summary: median_IC=%.4f (%s %.4f)  "
+        "pct_positive=%.1f%% (%s %.0f%%)  passes=%s",
+        median_ic, ">=" if passes_median else "<", cfg.WF_MEDIAN_IC_GATE,
+        pct_positive * 100, ">=" if passes_pct else "<", cfg.WF_MIN_FOLDS_POSITIVE * 100,
+        passes_wf,
+    )
+
+    return {
+        "folds": fold_results,
+        "median_ic": round(median_ic, 6),
+        "pct_positive": round(pct_positive, 4),
+        "passes_median_ic": passes_median,
+        "passes_pct_positive": passes_pct,
+        "passes_wf": passes_wf,
+        "fallback": False,
+    }
+
+
 # ── Training pipeline ──────────────────────────────────────────────────────────
 
 def run_gbm_training(
@@ -349,6 +527,11 @@ def run_gbm_training(
 ) -> dict:
     """
     Build dataset, train GBMScorer, evaluate, and upload to S3.
+
+    If walk-forward validation is enabled (config.WF_ENABLED), runs expanding-
+    window cross-validation across multiple regime periods before training the
+    final production model. The walk-forward IC summary is included in the
+    result dict and email.
 
     Parameters
     ----------
@@ -372,11 +555,27 @@ def run_gbm_training(
     X_all, fwd_all, all_dates = build_regression_arrays(
         data_dir=data_dir,
         config_module=cfg,
+        feature_list=cfg.GBM_FEATURES,
     )
 
     N = len(fwd_all)
 
-    # ── Time-based split with purge gaps (mirrors dataset.py logic) ───────────
+    # ── Walk-forward validation (if enabled) ──────────────────────────────────
+    wf_result: Optional[dict] = None
+    if cfg.WF_ENABLED:
+        log.info("Walk-forward validation enabled — running expanding-window CV ...")
+        wf_result = run_walk_forward(X_all, fwd_all, all_dates, cfg)
+        if wf_result.get("fallback"):
+            log.warning("Walk-forward fell back — proceeding with single-split evaluation")
+        elif not wf_result["passes_wf"]:
+            log.warning(
+                "Walk-forward FAILED gates (median_IC=%.4f, pct_positive=%.1f%%) "
+                "— training production model anyway but will NOT promote",
+                wf_result["median_ic"], wf_result["pct_positive"] * 100,
+            )
+
+    # ── Train final production model on all data ──────────────────────────────
+    # Use 70/15/15 split for single-split IC metrics (reporting) and early stopping.
     purge_days = cfg.FORWARD_DAYS
     n_train = int(N * cfg.TRAIN_FRAC)
     n_val_raw = int(N * cfg.VAL_FRAC)
@@ -428,7 +627,7 @@ def run_gbm_training(
         n_estimators=cfg.GBM_N_ESTIMATORS,
         early_stopping_rounds=cfg.GBM_EARLY_STOPPING_ROUNDS,
     )
-    scorer.fit(X_train, y_train, X_val, y_val, feature_names=cfg.FEATURES)
+    scorer.fit(X_train, y_train, X_val, y_val, feature_names=cfg.GBM_FEATURES)
 
     # ── Evaluate (numpy-only, no scipy dependency) ──────────────────────────
     test_preds = scorer.predict(X_test)
@@ -448,9 +647,19 @@ def run_gbm_training(
     importance = scorer.feature_importance(importance_type="gain")
     top10      = sorted(importance.items(), key=lambda x: -x[1])[:10]
 
-    passes_ic    = float(test_ic) >= cfg.MIN_IC
+    # ── Promotion decision ────────────────────────────────────────────────────
+    # If walk-forward enabled and passed: use WF gate for promotion.
+    # If walk-forward enabled but failed: do NOT promote regardless of single-split IC.
+    # If walk-forward disabled: fall back to single-split IC gate.
+    passes_single_ic = float(test_ic) >= cfg.MIN_IC
     passes_ic_ir = ic_ir >= cfg.GBM_IC_IR_GATE
-    elapsed_s    = (datetime.now(timezone.utc) - start_ts).total_seconds()
+
+    if wf_result and not wf_result.get("fallback"):
+        passes_ic = wf_result["passes_wf"]
+    else:
+        passes_ic = passes_single_ic
+
+    elapsed_s = (datetime.now(timezone.utc) - start_ts).total_seconds()
     model_version = f"GBM-v{scorer._best_iteration}"
 
     log.info(
@@ -485,7 +694,16 @@ def run_gbm_training(
                     "trained_date":   date_str,
                     "best_iteration": scorer._best_iteration,
                     "n_train":        int(len(y_train)),
+                    "rank_normalized": True,
+                    "feature_list":   cfg.GBM_FEATURES,
+                    "n_features":     len(cfg.GBM_FEATURES),
                 }
+                if wf_result and not wf_result.get("fallback"):
+                    meta["walk_forward"] = {
+                        "median_ic": wf_result["median_ic"],
+                        "pct_positive": wf_result["pct_positive"],
+                        "n_folds": len(wf_result["folds"]),
+                    }
                 s3.put_object(
                     Bucket=bucket,
                     Key=cfg.GBM_WEIGHTS_META_KEY,
@@ -495,12 +713,13 @@ def run_gbm_training(
                 log.info("Promoted to active weights: s3://%s/%s", bucket, cfg.GBM_WEIGHTS_KEY)
                 promoted = True
             else:
+                reason = "walk-forward" if (wf_result and not wf_result.get("fallback")) else "single-split IC"
                 log.warning(
-                    "IC gate FAILED (%.4f < %.4f) — backup saved, NOT promoted",
-                    test_ic, cfg.MIN_IC,
+                    "IC gate FAILED (%s) — backup saved, NOT promoted",
+                    reason,
                 )
 
-    return {
+    result = {
         "model_version":         model_version,
         "best_iteration":        scorer._best_iteration,
         "val_ic":                round(float(scorer._val_ic), 6),
@@ -519,6 +738,12 @@ def run_gbm_training(
             {"feature": f, "gain": round(s, 2)} for f, s in top10
         ],
     }
+
+    # Attach walk-forward detail for email reporting
+    if wf_result and not wf_result.get("fallback"):
+        result["walk_forward"] = wf_result
+
+    return result
 
 
 # ── Training email ─────────────────────────────────────────────────────────────
@@ -572,6 +797,54 @@ def send_training_email(result: dict, date_str: str) -> bool:
         for r in top10[:5]
     )
 
+    # Walk-forward section for email
+    wf_data = result.get("walk_forward")
+    wf_html = ""
+    wf_plain = ""
+    if wf_data and wf_data.get("folds"):
+        wf_median = wf_data["median_ic"]
+        wf_pct = wf_data["pct_positive"]
+        wf_pass = wf_data.get("passes_wf", False)
+        wf_color = "#2e7d32" if wf_pass else "#c62828"
+        wf_label = "PASS ✓" if wf_pass else "FAIL ✗"
+        fold_rows = "".join(
+            f'<tr style="background:{"#f9f9f9" if i % 2 == 0 else "#fff"};">'
+            f'<td style="padding:2px 6px; font-family:monospace; font-size:11px;">{f["fold"]}</td>'
+            f'<td style="padding:2px 6px; font-family:monospace; font-size:11px;">{f["test_start"]}</td>'
+            f'<td style="padding:2px 6px; font-family:monospace; font-size:11px;">{f["test_end"]}</td>'
+            f'<td style="padding:2px 6px; font-family:monospace; font-size:11px;">{f["n_train"]:,}</td>'
+            f'<td style="padding:2px 6px; font-family:monospace; font-size:11px; '
+            f'color:{"#2e7d32" if f["ic"] > 0 else "#c62828"};">{f["ic"]:.4f}</td>'
+            f'</tr>'
+            for i, f in enumerate(wf_data["folds"])
+        )
+        wf_html = (
+            f'<h3 style="margin-top:16px; margin-bottom:4px;">Walk-Forward Validation '
+            f'({len(wf_data["folds"])} folds)</h3>'
+            f'<p style="font-size:12px; margin:2px 0;">Median IC: <b style="color:{wf_color};">'
+            f'{wf_median:.4f}</b> — {wf_label} &nbsp;|&nbsp; '
+            f'Positive folds: <b>{wf_pct*100:.0f}%</b></p>'
+            f'<table style="border-collapse:collapse; width:100%; font-size:11px;">'
+            f'<tr style="background:#e0e0e0;">'
+            f'<th style="padding:3px 6px;">Fold</th>'
+            f'<th style="padding:3px 6px;">Test Start</th>'
+            f'<th style="padding:3px 6px;">Test End</th>'
+            f'<th style="padding:3px 6px;">Train N</th>'
+            f'<th style="padding:3px 6px;">IC</th></tr>'
+            f'{fold_rows}</table>'
+        )
+        wf_plain = (
+            f"\n--- Walk-Forward ({len(wf_data['folds'])} folds) ---"
+            f"\nMedian IC: {wf_median:.4f} — {wf_label}"
+            f"\nPositive folds: {wf_pct*100:.0f}%\n"
+            + "\n".join(
+                f"  Fold {f['fold']}: [{f['test_start']} → {f['test_end']}] "
+                f"train={f['n_train']:,}  IC={f['ic']:.4f}"
+                for f in wf_data["folds"]
+            )
+            + "\n"
+        )
+
     html_body = (
         f'<html><body style="font-family:sans-serif; font-size:13px; color:#222; max-width:600px;">'
         f'<h2 style="margin-bottom:4px;">GBM Weekly Retrain — {date_str}</h2>'
@@ -605,6 +878,8 @@ def send_training_email(result: dict, date_str: str) -> bool:
         f'</tr>'
         f'</table>'
 
+        f'{wf_html}'
+
         f'<h3 style="margin-bottom:4px;">Top 5 Features by Gain</h3>'
         f'<table>{feat_rows}</table>'
 
@@ -621,6 +896,7 @@ def send_training_email(result: dict, date_str: str) -> bool:
         f"\nIC IR:     {ic_ir:.3f}"
         f"\nIC pos:    {ic_pos}/20"
         f"\nPromotion: {promo_label}\n"
+        f"{wf_plain}"
         f"\nTop features: " + ", ".join(r["feature"] for r in top10[:5]) + "\n"
     )
 

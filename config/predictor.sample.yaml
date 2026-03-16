@@ -71,6 +71,15 @@ data:
   min_rows_for_features: 265       # min rows for feature computation (252 warmup + buffer)
   split_return_threshold: 0.45     # ±45% return threshold for split detection
 
+# ── Walk-forward validation ──────────────────────────────────────────────────
+walk_forward:
+  enabled: true
+  test_window_days: 126          # ~6 months per fold
+  min_train_days: 504            # ~2 years minimum training
+  purge_days: 5                  # matches forward_days (prevent label leakage)
+  min_folds_positive: 0.60       # 60% of folds must have IC > 0
+  median_ic_gate: 0.01           # median IC across folds (lower bar — includes black swan periods)
+
 # ── Feature engineering parameters ────────────────────────────────────────────
 features:
   rsi_period: 14                   # RSI lookback period

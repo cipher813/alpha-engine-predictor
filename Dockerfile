@@ -23,9 +23,11 @@ RUN pip install --no-cache-dir -r requirements-lambda.txt
 
 # Copy application code
 COPY config.py .
+COPY config/ config/
 COPY data/ data/
 COPY model/ model/
 COPY inference/ inference/
+COPY training/ training/
 
 # Lambda handler entry point
 CMD ["inference.handler.handler"]

@@ -82,9 +82,22 @@ FEATURES = [
     "obv_slope_10d",
     "rsi_slope_5d",
     "volume_price_div",
+    # v1.5 additions — regime interaction terms (cross-sectional: macro × ticker signal)
+    "mom5d_x_vix",
+    "rsi_x_vix",
+    "sector_x_trend",
+    "atr_x_vix",
+    "vol_trend_x_vix",
 ]
-N_FEATURES = 29
+N_FEATURES = 34
 N_CLASSES = 3  # UP, FLAT, DOWN
+
+# Macro features — identical across all tickers on a given day, cannot predict
+# cross-sectional alpha.  Excluded from GBM training/inference but kept in
+# FEATURES for other callers (Research module, backtester technical scoring).
+MACRO_FEATURES = {"vix_level", "yield_10y", "yield_curve_slope", "gold_mom_5d", "oil_mom_5d"}
+GBM_FEATURES = [f for f in FEATURES if f not in MACRO_FEATURES]
+N_GBM_FEATURES = len(GBM_FEATURES)  # 24
 
 # Class labels — index matches model output neuron order
 CLASS_LABELS = ["DOWN", "FLAT", "UP"]  # index 0, 1, 2
@@ -144,6 +157,15 @@ SLIM_CACHE_LOOKBACK_DAYS = _data_cfg["slim_cache_lookback_days"]
 INFERENCE_BATCH_SIZE = _data_cfg["inference_batch_size"]
 MIN_ROWS_FOR_FEATURES = _data_cfg["min_rows_for_features"]
 SPLIT_RETURN_THRESHOLD = _data_cfg["split_return_threshold"]
+
+# ── Walk-forward validation ────────────────────────────────────────────────
+_wf_cfg = _cfg.get("walk_forward", {})
+WF_ENABLED = _wf_cfg.get("enabled", False)
+WF_TEST_WINDOW_DAYS = _wf_cfg.get("test_window_days", 126)
+WF_MIN_TRAIN_DAYS = _wf_cfg.get("min_train_days", 504)
+WF_PURGE_DAYS = _wf_cfg.get("purge_days", 5)
+WF_MIN_FOLDS_POSITIVE = _wf_cfg.get("min_folds_positive", 0.60)
+WF_MEDIAN_IC_GATE = _wf_cfg.get("median_ic_gate", 0.02)
 
 # ── Feature engineering parameters ───────────────────────────────────────────
 FEATURE_CFG: dict = _cfg["features"]

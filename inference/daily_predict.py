@@ -1118,7 +1118,7 @@ def predict_ticker_gbm(
         return None
 
     latest = featured_df.iloc[-1]
-    x_raw = latest[cfg.FEATURES].to_numpy(dtype=np.float32).reshape(1, -1)
+    x_raw = latest[cfg.GBM_FEATURES].to_numpy(dtype=np.float32).reshape(1, -1)
 
     try:
         s = float(scorer.predict(x_raw)[0])
@@ -1753,31 +1753,123 @@ def main(
     predictions: list[dict] = []
     n_skipped = 0
 
-    for ticker in tickers:
-        df = price_data.get(ticker, pd.DataFrame())
-        # Look up this ticker's sector ETF series (None if not in sector map)
-        sector_etf_sym = sector_map.get(ticker)
-        sector_etf_series = macro.get(sector_etf_sym) if sector_etf_sym else None
+    if model_type == "gbm":
+        # Batch GBM path: compute features for all tickers first, then
+        # cross-sectional rank-normalize, then run inference.
+        # This ensures rank normalization has the full cross-section.
+        from data.feature_engineer import compute_features as _compute_features
 
-        if model_type == "gbm":
-            result = predict_ticker_gbm(
-                ticker, df, scorer,
-                macro=macro,
-                sector_etf_series=sector_etf_series,
-            )
-        else:
+        gbm_feature_cols = cfg.GBM_FEATURES
+        raw_vectors: dict[str, np.ndarray] = {}   # ticker → raw feature vector
+        for ticker in tickers:
+            df = price_data.get(ticker, pd.DataFrame())
+            if df.empty or len(df) < cfg.MIN_ROWS_FOR_FEATURES:
+                n_skipped += 1
+                continue
+            sector_etf_sym = sector_map.get(ticker)
+            sector_etf_series = macro.get(sector_etf_sym) if sector_etf_sym else None
+            try:
+                featured_df = _compute_features(
+                    df,
+                    spy_series=macro.get("SPY") if macro else None,
+                    vix_series=macro.get("VIX") if macro else None,
+                    sector_etf_series=sector_etf_series,
+                    tnx_series=macro.get("TNX") if macro else None,
+                    irx_series=macro.get("IRX") if macro else None,
+                    gld_series=macro.get("GLD") if macro else None,
+                    uso_series=macro.get("USO") if macro else None,
+                )
+            except Exception as exc:
+                log.warning("Feature computation failed for %s: %s", ticker, exc)
+                n_skipped += 1
+                continue
+            if featured_df.empty:
+                n_skipped += 1
+                continue
+            latest = featured_df.iloc[-1]
+            try:
+                raw_vectors[ticker] = latest[gbm_feature_cols].to_numpy(dtype=np.float32)
+            except KeyError:
+                n_skipped += 1
+                continue
+
+        # Cross-sectional rank normalization across all tickers
+        if raw_vectors:
+            ordered_tickers = list(raw_vectors.keys())
+            X_batch = np.stack([raw_vectors[t] for t in ordered_tickers])  # (N_tickers, N_features)
+            n_tickers = X_batch.shape[0]
+            if n_tickers > 1:
+                for f in range(X_batch.shape[1]):
+                    vals = X_batch[:, f]
+                    order = vals.argsort()
+                    ranks = np.empty_like(order, dtype=np.float32)
+                    ranks[order] = np.arange(n_tickers, dtype=np.float32)
+                    # Average ranks for ties
+                    unique_vals, inverse = np.unique(vals, return_inverse=True)
+                    if len(unique_vals) < n_tickers:
+                        for uv_idx in range(len(unique_vals)):
+                            mask = inverse == uv_idx
+                            if mask.sum() > 1:
+                                ranks[mask] = ranks[mask].mean()
+                    X_batch[:, f] = ranks / max(n_tickers - 1, 1)
+                log.info("Rank-normalized GBM features across %d tickers", n_tickers)
+            else:
+                X_batch[:, :] = 0.5  # single ticker defaults to median percentile
+
+            # Run batch inference and build prediction dicts
+            try:
+                scores = scorer.predict(X_batch)  # (N_tickers,)
+            except Exception as exc:
+                log.error("Batch GBM inference failed: %s", exc)
+                scores = np.full(n_tickers, np.nan)
+
+            max_r = getattr(cfg, "LABEL_CLIP", 0.15)
+            for i, ticker in enumerate(ordered_tickers):
+                s = float(scores[i])
+                if np.isnan(s):
+                    n_skipped += 1
+                    continue
+                p_up   = float(np.clip(0.5 + s / (2.0 * max_r), 0.0, 1.0))
+                p_down = float(np.clip(0.5 - s / (2.0 * max_r), 0.0, 1.0))
+                p_flat = float(max(0.0, 1.0 - p_up - p_down))
+                if s > cfg.UP_THRESHOLD:
+                    predicted_direction = "UP"
+                    confidence = p_up
+                elif s < cfg.DOWN_THRESHOLD:
+                    predicted_direction = "DOWN"
+                    confidence = p_down
+                else:
+                    predicted_direction = "FLAT"
+                    confidence = 1.0 - abs(p_up - p_down)
+                result = {
+                    "ticker":                ticker,
+                    "predicted_direction":   predicted_direction,
+                    "prediction_confidence": round(confidence, 4),
+                    "predicted_alpha":       round(s, 6),
+                    "p_up":                  round(p_up, 4),
+                    "p_flat":                round(p_flat, 4),
+                    "p_down":                round(p_down, 4),
+                }
+                if ticker_sources:
+                    result["watchlist_source"] = ticker_sources.get(ticker, "unknown")
+                predictions.append(result)
+    else:
+        # NN path — per-ticker inference (unchanged)
+        for ticker in tickers:
+            df = price_data.get(ticker, pd.DataFrame())
+            sector_etf_sym = sector_map.get(ticker)
+            sector_etf_series = macro.get(sector_etf_sym) if sector_etf_sym else None
             result = predict_ticker(
                 ticker, df, model, norm_stats,
                 macro=macro,
                 sector_etf_series=sector_etf_series,
             )
-        if result is not None:
-            # Annotate with watchlist source when running in watchlist mode
-            if ticker_sources:
-                result["watchlist_source"] = ticker_sources.get(ticker, "unknown")
-            predictions.append(result)
-        else:
-            n_skipped += 1
+            if result is not None:
+                if ticker_sources:
+                    result["watchlist_source"] = ticker_sources.get(ticker, "unknown")
+                predictions.append(result)
+            else:
+                n_skipped += 1
 
     log.info(
         "Inference complete: %d predictions  %d skipped",

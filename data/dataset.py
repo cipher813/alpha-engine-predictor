@@ -484,9 +484,66 @@ def build_datasets(
     return train_loader, val_loader, test_loader, fwd_test
 
 
+def cross_sectional_rank_normalize(
+    X: np.ndarray,
+    dates: list,
+) -> np.ndarray:
+    """
+    Rank-normalize each feature within each date's cross-section.
+
+    For each unique date, ranks all tickers' values for each feature
+    and scales to (0, 1) percentile rank.  This makes features comparable
+    across time — a percentile of 0.9 means the same thing in 2018 and 2024.
+
+    No temporal leakage: ranks are computed per-date (cross-sectional only).
+
+    Parameters
+    ----------
+    X : shape (N, n_features) — raw feature values, sorted by date
+    dates : list of pd.Timestamp, length N, sorted ascending
+
+    Returns
+    -------
+    X_ranked : shape (N, n_features) — rank-normalized features in (0, 1)
+    """
+    # Build date → row-indices mapping
+    date_to_indices: dict[object, list[int]] = {}
+    for i, d in enumerate(dates):
+        date_to_indices.setdefault(d, []).append(i)
+
+    X_ranked = X.copy()
+    n_features = X.shape[1]
+
+    for indices in date_to_indices.values():
+        n = len(indices)
+        if n <= 1:
+            # Single ticker on this date: assign midpoint percentile
+            X_ranked[indices[0], :] = 0.5
+            continue
+        idx_arr = np.array(indices)
+        for f in range(n_features):
+            vals = X[idx_arr, f]
+            # argsort-of-argsort gives ranks (0-based); average ties
+            order = vals.argsort()
+            ranks = np.empty_like(order, dtype=np.float32)
+            ranks[order] = np.arange(n, dtype=np.float32)
+            # Handle ties: average the ranks for equal values
+            unique_vals, inverse = np.unique(vals, return_inverse=True)
+            if len(unique_vals) < n:
+                for uv_idx in range(len(unique_vals)):
+                    mask = inverse == uv_idx
+                    if mask.sum() > 1:
+                        ranks[mask] = ranks[mask].mean()
+            # Scale to (0, 1): rank / (n - 1) maps to [0, 1]
+            X_ranked[idx_arr, f] = ranks / max(n - 1, 1)
+
+    return X_ranked
+
+
 def build_regression_arrays(
     data_dir: str,
     config_module,
+    feature_list: list[str] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, list]:
     """
     Load parquets, compute features + labels, return unsplit arrays.
@@ -584,7 +641,8 @@ def build_regression_arrays(
             continue
         if labeled_df.empty:
             continue
-        features_arr = labeled_df[config_module.FEATURES].to_numpy(dtype=np.float32)
+        _feat_cols = feature_list or config_module.FEATURES
+        features_arr = labeled_df[_feat_cols].to_numpy(dtype=np.float32)
         fwd_returns_arr = labeled_df["forward_return_5d"].to_numpy(dtype=np.float32)
         dates = labeled_df.index
         for j in range(len(dates)):
@@ -603,8 +661,15 @@ def build_regression_arrays(
     if label_clip is not None:
         fwd_all = np.clip(fwd_all, -label_clip, label_clip)
 
-    log.info("build_regression_arrays: %d samples, %d unique dates",
-             len(fwd_all), len(set(all_dates)))
+    # Cross-sectional rank normalization: per-date, per-feature.
+    # Converts raw feature values to percentiles [0, 1] within each day's
+    # cross-section of tickers.  No temporal leakage — ranks are per-date only.
+    X_all = cross_sectional_rank_normalize(X_all, all_dates)
+    log.info("Applied cross-sectional rank normalization (%d unique dates)",
+             len(set(all_dates)))
+
+    log.info("build_regression_arrays: %d samples, %d features, %d unique dates",
+             len(fwd_all), X_all.shape[1], len(set(all_dates)))
     return X_all, fwd_all, all_dates
 
 
