@@ -1330,7 +1330,7 @@ def _build_predictor_email(
 
     _vt = veto_threshold if veto_threshold is not None else cfg.MIN_CONFIDENCE
     model_version = metrics.get("model_version", "unknown")
-    val_ic        = metrics.get("val_loss")      # GBM stores IC here
+    val_ic        = metrics.get("ic_30d")        # 30-day information coefficient
     n_total       = len(predictions)
 
     # Group by direction (predictions are pre-sorted descending p_up - p_down)
