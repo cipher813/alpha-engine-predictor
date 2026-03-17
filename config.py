@@ -127,6 +127,10 @@ FORWARD_DAYS = _label_cfg["forward_days"]
 UP_THRESHOLD = _label_cfg["up_threshold"]
 DOWN_THRESHOLD = _label_cfg["down_threshold"]
 LABEL_CLIP = _label_cfg["label_clip"]
+ADAPTIVE_THRESHOLDS = _label_cfg.get("adaptive_thresholds", False)
+ADAPTIVE_WINDOW = _label_cfg.get("adaptive_window", 63)
+ADAPTIVE_UP_PCT = _label_cfg.get("adaptive_up_pct", 65)
+ADAPTIVE_DOWN_PCT = _label_cfg.get("adaptive_down_pct", 35)
 
 # ── GBM tuned hyperparameters ────────────────────────────────────────────────
 _gbm_cfg = _cfg["gbm"]

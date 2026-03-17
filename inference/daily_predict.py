@@ -238,12 +238,46 @@ def _load_predictor_params_from_s3(s3_bucket: str) -> dict | None:
     return None
 
 
-def get_veto_threshold(s3_bucket: str) -> float:
-    """Return the active veto confidence threshold (S3 override or default)."""
+def get_veto_threshold(s3_bucket: str, market_regime: str = "") -> float:
+    """
+    Return the active veto confidence threshold, adjusted by market regime.
+
+    In bear/caution regimes, the threshold is lowered (more aggressive vetoing)
+    to protect capital. In bull regimes, the threshold is raised (more permissive)
+    to avoid missing opportunities.
+
+    Regime adjustments (applied to the base threshold from S3 or config):
+      bear:    -0.10  (e.g., 0.65 → 0.55 — veto more aggressively)
+      caution: -0.05  (e.g., 0.65 → 0.60)
+      neutral:  0.00  (no adjustment)
+      bullish: +0.05  (e.g., 0.65 → 0.70 — allow more entries)
+    """
     params = _load_predictor_params_from_s3(s3_bucket)
     if params and "veto_confidence" in params:
-        return float(params["veto_confidence"])
-    return cfg.MIN_CONFIDENCE
+        base = float(params["veto_confidence"])
+    else:
+        base = cfg.MIN_CONFIDENCE
+
+    # Regime-adaptive adjustment
+    regime = market_regime.lower().strip() if market_regime else ""
+    regime_adjustments = {
+        "bear": -0.10,
+        "bearish": -0.10,
+        "caution": -0.05,
+        "neutral": 0.0,
+        "bull": 0.05,
+        "bullish": 0.05,
+    }
+    adjustment = regime_adjustments.get(regime, 0.0)
+    adjusted = max(0.40, min(0.90, base + adjustment))
+
+    if adjustment != 0.0:
+        log.info(
+            "Veto threshold regime-adjusted: base=%.2f %+.2f (%s) → %.2f",
+            base, adjustment, regime, adjusted,
+        )
+
+    return adjusted
 
 
 # ── Universe ──────────────────────────────────────────────────────────────────
@@ -435,7 +469,7 @@ def load_watchlist(
 
 # ── Price fetch ───────────────────────────────────────────────────────────────
 
-def fetch_today_prices(tickers: list[str]) -> dict[str, pd.DataFrame]:
+def fetch_today_prices(tickers: list[str], fd=None) -> dict[str, pd.DataFrame]:
     """
     Fetch 1-year OHLCV history for each ticker via yfinance.
     Returns a dict of ticker → DataFrame. Empty DataFrames on failure.
@@ -486,6 +520,11 @@ def fetch_today_prices(tickers: list[str]) -> dict[str, pd.DataFrame]:
                         result[ticker] = pd.DataFrame()
         except Exception as exc:
             log.warning("Batch price fetch failed: %s", exc)
+            if fd:
+                fd.report(exc, severity="error", context={
+                    "site": "batch_price_fetch",
+                    "batch_size": len(batch),
+                })
             for ticker in batch:
                 result[ticker] = pd.DataFrame()
 
@@ -1221,6 +1260,7 @@ def write_predictions(
     metrics: dict,
     dry_run: bool = False,
     veto_threshold: float | None = None,
+    fd=None,
 ) -> None:
     """
     Write predictions JSON to S3 at both the dated key and latest.json.
@@ -1304,6 +1344,12 @@ def write_predictions(
     except Exception as exc:
         log.error("S3 write failed: %s", exc)
         log.error("Predictions not written to S3. Check IAM permissions for s3://%s", s3_bucket)
+        if fd:
+            fd.report(exc, severity="critical", context={
+                "site": "s3_predictions_write",
+                "bucket": s3_bucket,
+                "date": date_str,
+            })
 
 
 # ── Predictor email ────────────────────────────────────────────────────────────
@@ -1702,6 +1748,14 @@ def main(
         datefmt="%H:%M:%S",
     )
 
+    fd = None
+    try:
+        import flow_doctor
+        fd = flow_doctor.init(config_path=os.path.join(
+            str(Path(__file__).resolve().parent.parent), "flow-doctor.yaml"))
+    except Exception:
+        pass
+
     if date_str is None:
         date_str = datetime.now().strftime("%Y-%m-%d")
 
@@ -1786,7 +1840,7 @@ def main(
         log.info("Using slim-cache + daily_closes for prices and macro")
     else:
         log.info("Slim cache unavailable — fetching from yfinance (full 2y)")
-        price_data = fetch_today_prices(tickers)
+        price_data = fetch_today_prices(tickers, fd=fd)
         sector_etfs_needed = sorted({sector_map[t] for t in tickers if t in sector_map})
         macro = fetch_macro_series(extra_tickers=sector_etfs_needed)
 
@@ -1879,6 +1933,11 @@ def main(
                 scores = scorer.predict(X_batch)  # (N_tickers,)
             except Exception as exc:
                 log.error("Batch GBM inference failed: %s", exc)
+                if fd:
+                    fd.report(exc, severity="critical", context={
+                        "site": "batch_gbm_inference",
+                        "n_tickers": len(ordered_tickers),
+                    })
                 scores = np.full(n_tickers, np.nan)
 
             max_r = getattr(cfg, "LABEL_CLIP", 0.15)
@@ -1973,12 +2032,13 @@ def main(
         "hit_rate_30d_rolling": None,
     }
 
-    # ── Step 6: Resolve veto threshold (S3 override or default) ──────────────
-    veto_thresh = get_veto_threshold(bucket)
+    # ── Step 6: Resolve veto threshold (S3 override, regime-adjusted) ───────
+    market_regime = signals_data.get("market_regime", "") if signals_data else ""
+    veto_thresh = get_veto_threshold(bucket, market_regime=market_regime)
 
     # ── Step 7: Write output ──────────────────────────────────────────────────
     write_predictions(predictions, date_str, bucket, metrics, dry_run=dry_run,
-                      veto_threshold=veto_thresh)
+                      veto_threshold=veto_thresh, fd=fd)
 
     # ── Step 8: Send combined morning briefing email ──────────────────────────
     if not dry_run:

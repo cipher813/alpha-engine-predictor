@@ -12,7 +12,7 @@ LightGBM advantages over the MLP for tabular financial data:
   - Captures non-linear threshold interactions (e.g. RSI>70 AND dist_52w_high<-0.1)
   - Built-in feature importance (gain-based and SHAP)
   - Faster to train and tune than the MLP on CPU
-  - Early stopping on val IC prevents overfitting without manual patience tuning
+  - Early stopping on validation MSE prevents overfitting; IC evaluated post-hoc as a promotion gate
 
 Upgrade path: change objective='regression' → 'lambdarank' once baseline IC is
 confirmed, which directly optimises ranking (NDCG) rather than prediction error.

@@ -39,6 +39,10 @@ def compute_labels(
     up_threshold: float = 0.01,
     down_threshold: float = -0.01,
     benchmark_returns: pd.Series | None = None,
+    adaptive_thresholds: bool = False,
+    adaptive_window: int = 63,
+    adaptive_up_pct: float = 65,
+    adaptive_down_pct: float = 35,
 ) -> pd.DataFrame:
     """
     Append forward-return labels to a featured DataFrame.
@@ -53,10 +57,10 @@ def compute_labels(
         Default is 5 (one calendar week).
     up_threshold : float
         Minimum return to classify as UP. Default +1% (0.01).
-        Applied to relative return when benchmark_returns is provided.
+        Ignored when adaptive_thresholds=True.
     down_threshold : float
         Maximum return to classify as DOWN. Default -1% (-0.01).
-        Applied to relative return when benchmark_returns is provided.
+        Ignored when adaptive_thresholds=True.
     benchmark_returns : pd.Series or None
         Benchmark Close prices with a DatetimeIndex. When provided, labels are
         based on stock return minus benchmark return (relative alpha), rather
@@ -67,6 +71,17 @@ def compute_labels(
         Pass a sector ETF Close (e.g. XLK for Information Technology) for
         sector-neutral (idiosyncratic) alpha — recommended when sector_map.json
         is available, as it removes sector-level noise from the training target.
+    adaptive_thresholds : bool
+        When True, UP/DOWN thresholds are computed per-row as rolling percentiles
+        of forward returns, adapting to the current volatility regime. This avoids
+        the problem of fixed ±1% being too easy in high-vol and too hard in low-vol.
+    adaptive_window : int
+        Rolling window (trading days) for computing adaptive percentiles.
+        Default 63 (~3 months).
+    adaptive_up_pct : float
+        Percentile for UP threshold (e.g. 65 = top 35% of returns → UP).
+    adaptive_down_pct : float
+        Percentile for DOWN threshold (e.g. 35 = bottom 35% of returns → DOWN).
 
     Returns
     -------
@@ -105,11 +120,31 @@ def compute_labels(
     # Drop rows where the forward return is undefined (end of series)
     df = df.dropna(subset=["forward_return_5d"])
 
-    # Bin into direction classes
-    conditions = [
-        df["forward_return_5d"] > up_threshold,
-        df["forward_return_5d"] < down_threshold,
-    ]
+    if adaptive_thresholds and len(df) >= adaptive_window:
+        # Volatility-adaptive thresholds: rolling percentiles of forward returns.
+        # In low-vol periods, thresholds tighten; in high-vol, they widen.
+        rolling_up = df["forward_return_5d"].rolling(
+            window=adaptive_window, min_periods=adaptive_window // 2
+        ).quantile(adaptive_up_pct / 100.0)
+        rolling_down = df["forward_return_5d"].rolling(
+            window=adaptive_window, min_periods=adaptive_window // 2
+        ).quantile(adaptive_down_pct / 100.0)
+
+        # Fall back to fixed thresholds where rolling data is insufficient
+        rolling_up = rolling_up.fillna(up_threshold)
+        rolling_down = rolling_down.fillna(down_threshold)
+
+        conditions = [
+            df["forward_return_5d"] > rolling_up,
+            df["forward_return_5d"] < rolling_down,
+        ]
+    else:
+        # Fixed thresholds (original behavior)
+        conditions = [
+            df["forward_return_5d"] > up_threshold,
+            df["forward_return_5d"] < down_threshold,
+        ]
+
     choices_str = ["UP", "DOWN"]
     df["direction"] = np.select(conditions, choices_str, default="FLAT")
 

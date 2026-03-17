@@ -24,9 +24,13 @@ training:
 # ── Label thresholds ──────────────────────────────────────────────────────────
 labeling:
   forward_days: 5                  # prediction horizon (trading days)
-  up_threshold: 0.02               # forward return > this → UP label
-  down_threshold: -0.02            # forward return < this → DOWN label
+  up_threshold: 0.02               # forward return > this → UP label (fixed mode)
+  down_threshold: -0.02            # forward return < this → DOWN label (fixed mode)
   label_clip: 0.20                 # clip extreme returns (±20%), null to disable
+  adaptive_thresholds: false       # use rolling percentile thresholds instead of fixed
+  adaptive_window: 63              # rolling window for adaptive percentiles (~3 months)
+  adaptive_up_pct: 65              # percentile for UP threshold (top 35% → UP)
+  adaptive_down_pct: 35            # percentile for DOWN threshold (bottom 35% → DOWN)
 
 # ── GBM hyperparameters ──────────────────────────────────────────────────────
 gbm:
