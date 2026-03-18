@@ -26,7 +26,7 @@ labeling:
   forward_days: 5                  # prediction horizon (trading days)
   up_threshold: 0.001              # predicted alpha > 0.10% → UP (~1 std of GBM output)
   down_threshold: -0.001           # predicted alpha < -0.10% → DOWN
-  label_clip: 0.20                 # clip extreme returns (±20%), null to disable
+  label_clip: 0.25                 # clip extreme returns (±25%), null to disable
   adaptive_thresholds: false       # use rolling percentile thresholds instead of fixed
   adaptive_window: 63              # rolling window for adaptive percentiles (~3 months)
   adaptive_up_pct: 65              # percentile for UP threshold (top 35% → UP)
@@ -41,14 +41,14 @@ gbm:
   tuned_params:
     objective: regression
     metric: mse
-    num_leaves: 63                 # tree complexity
-    min_child_samples: 200         # min samples per leaf
-    max_depth: -1                  # no depth limit (-1)
-    learning_rate: 0.05            # boosting learning rate
+    num_leaves: 127                # more leaf nodes for non-linear interactions
+    min_child_samples: 50          # finer-grained leaf predictions
+    max_depth: 5                   # allows deeper feature interactions
+    learning_rate: 0.05            # slower learning compensates for increased capacity
     feature_fraction: 0.8          # fraction of features per tree
     bagging_fraction: 0.8          # fraction of rows per tree
-    lambda_l1: 0.1                 # L1 regularization
-    lambda_l2: 0.1                 # L2 regularization
+    lambda_l1: 0.10                # mild L1 regularization
+    lambda_l2: 0.05                # mild L2 regularization
     num_threads: 4
     verbosity: -1
     seed: 42
@@ -79,11 +79,13 @@ data:
 # ── Walk-forward validation ──────────────────────────────────────────────────
 walk_forward:
   enabled: true
-  test_window_days: 126          # ~6 months per fold
-  min_train_days: 504            # ~2 years minimum training
+  test_window_trading_days: 126  # ~6 calendar months of trading days per fold
+  min_train_days: 504            # ~2 years minimum training (trading days)
   purge_days: 5                  # matches forward_days (prevent label leakage)
   min_folds_positive: 0.60       # 60% of folds must have IC > 0
   median_ic_gate: 0.01           # median IC across folds (lower bar — includes black swan periods)
+  wf_n_estimators: 500           # faster GBM for fold validation (not production)
+  wf_early_stopping: 20          # faster early stopping for fold validation
 
 # ── Feature engineering parameters ────────────────────────────────────────────
 features:
@@ -121,3 +123,8 @@ alternative_data:
   earnings_features_enabled: true    # O10: PEAD earnings surprise + recency
   revision_features_enabled: true    # O11: EPS revision momentum + streak
   options_features_enabled: true     # O12: put/call ratio, IV rank, IV vs RV
+
+# ── Feature selection / noise detection ──────────────────────────────────────
+feature_selection:
+  shap_noise_threshold_pct: 1.0    # SHAP below this % of top feature → noise candidate
+  ic_noise_threshold: 0.005        # |feature IC| below this → noise candidate

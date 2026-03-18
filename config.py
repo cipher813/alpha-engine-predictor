@@ -181,11 +181,21 @@ SPLIT_RETURN_THRESHOLD = _data_cfg["split_return_threshold"]
 # ── Walk-forward validation ────────────────────────────────────────────────
 _wf_cfg = _cfg.get("walk_forward", {})
 WF_ENABLED = _wf_cfg.get("enabled", False)
-WF_TEST_WINDOW_DAYS = _wf_cfg.get("test_window_days", 126)
+# Renamed from test_window_days → test_window_trading_days; fallback to old key
+WF_TEST_WINDOW_DAYS = _wf_cfg.get(
+    "test_window_trading_days", _wf_cfg.get("test_window_days", 126)
+)
 WF_MIN_TRAIN_DAYS = _wf_cfg.get("min_train_days", 504)
 WF_PURGE_DAYS = _wf_cfg.get("purge_days", 5)
 WF_MIN_FOLDS_POSITIVE = _wf_cfg.get("min_folds_positive", 0.60)
 WF_MEDIAN_IC_GATE = _wf_cfg.get("median_ic_gate", 0.02)
+WF_N_ESTIMATORS = _wf_cfg.get("wf_n_estimators", None)  # None → use GBM_N_ESTIMATORS
+WF_EARLY_STOPPING = _wf_cfg.get("wf_early_stopping", None)  # None → use GBM_EARLY_STOPPING_ROUNDS
+
+# ── Feature selection / noise detection ─────────────────────────────────────
+_fs_cfg = _cfg.get("feature_selection", {})
+SHAP_NOISE_THRESHOLD_PCT = _fs_cfg.get("shap_noise_threshold_pct", 1.0)
+IC_NOISE_THRESHOLD = _fs_cfg.get("ic_noise_threshold", 0.005)
 
 # ── Feature engineering parameters ───────────────────────────────────────────
 FEATURE_CFG: dict = _cfg["features"]

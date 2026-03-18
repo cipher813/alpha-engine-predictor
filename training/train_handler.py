@@ -46,6 +46,7 @@ import logging
 import os
 import smtplib
 import tempfile
+import time
 from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -452,9 +453,14 @@ def run_walk_forward(
                 "fallback": True}
 
     tuned_params = getattr(cfg, "GBM_TUNED_PARAMS", None)
+    # Walk-forward fast mode: use lighter estimators/early-stopping for fold training
+    wf_n_est = getattr(cfg, "WF_N_ESTIMATORS", None) or cfg.GBM_N_ESTIMATORS
+    wf_early_stop = getattr(cfg, "WF_EARLY_STOPPING", None) or cfg.GBM_EARLY_STOPPING_ROUNDS
+    log.info("Walk-forward training params: n_estimators=%d, early_stopping=%d", wf_n_est, wf_early_stop)
     fold_results: list[dict] = []
 
     for i, fold in enumerate(folds):
+        fold_start = time.time()
         train_idx = fold["train_indices"]
         test_idx = fold["test_indices"]
         X_train_fold = X_all[train_idx]
@@ -471,8 +477,8 @@ def run_walk_forward(
 
         scorer = GBMScorer(
             params=tuned_params,
-            n_estimators=cfg.GBM_N_ESTIMATORS,
-            early_stopping_rounds=cfg.GBM_EARLY_STOPPING_ROUNDS,
+            n_estimators=wf_n_est,
+            early_stopping_rounds=wf_early_stop,
         )
         scorer.fit(X_sub_train, y_sub_train, X_sub_val, y_sub_val,
                     feature_names=cfg.GBM_FEATURES)
@@ -485,6 +491,7 @@ def run_walk_forward(
         else:
             fold_ic = 0.0
 
+        fold_elapsed = time.time() - fold_start
         fold_result = {
             "fold": i + 1,
             "train_end": fold["train_end_date"],
@@ -494,12 +501,13 @@ def run_walk_forward(
             "n_test": len(y_test_fold),
             "ic": round(fold_ic, 6),
             "best_iteration": scorer._best_iteration,
+            "elapsed_s": round(fold_elapsed, 1),
         }
         fold_results.append(fold_result)
         log.info(
-            "  Fold %d/%d: train=%d test=%d  [%s → %s]  IC=%.4f",
+            "  Fold %d/%d: train=%d test=%d  [%s → %s]  IC=%.4f  (%.1fs)",
             i + 1, len(folds), len(y_train_fold), len(y_test_fold),
-            fold["test_start_date"], fold["test_end_date"], fold_ic,
+            fold["test_start_date"], fold["test_end_date"], fold_ic, fold_elapsed,
         )
 
     fold_ics = np.array([f["ic"] for f in fold_results])
@@ -746,6 +754,39 @@ def run_gbm_training(
     except Exception as e:
         log.warning("SHAP computation failed (non-blocking): %s", e)
 
+    # ── Per-feature IC tracking ────────────────────────────────────────────────
+    feature_ics = {}
+    for i, fname in enumerate(cfg.GBM_FEATURES):
+        feat_vals = X_test[:, i]
+        if np.std(feat_vals) > 1e-10:
+            fic = float(np.corrcoef(feat_vals, y_test)[0, 1])
+        else:
+            fic = 0.0
+        feature_ics[fname] = round(fic, 6)
+
+    sorted_by_abs_ic = sorted(feature_ics.items(), key=lambda x: abs(x[1]), reverse=True)
+    log.info("Per-feature IC — top 5: %s", sorted_by_abs_ic[:5])
+    log.info("Per-feature IC — bottom 5: %s", sorted_by_abs_ic[-5:])
+
+    # ── SHAP-based noise feature detection ─────────────────────────────────────
+    noise_candidates = []
+    if shap_importance:
+        max_shap = max(shap_importance.values()) if shap_importance else 0.0
+        shap_noise_thresh = max_shap * (cfg.SHAP_NOISE_THRESHOLD_PCT / 100.0)
+        ic_noise_thresh = cfg.IC_NOISE_THRESHOLD
+        for fname in cfg.GBM_FEATURES:
+            shap_val = shap_importance.get(fname, 0.0)
+            ic_val = abs(feature_ics.get(fname, 0.0))
+            if shap_val < shap_noise_thresh and ic_val < ic_noise_thresh:
+                noise_candidates.append(fname)
+        if noise_candidates:
+            log.info(
+                "Noise feature candidates (%d): %s (SHAP < %.4f AND |IC| < %.4f)",
+                len(noise_candidates), noise_candidates, shap_noise_thresh, ic_noise_thresh,
+            )
+        else:
+            log.info("No noise feature candidates detected")
+
     # ── Promotion decision ────────────────────────────────────────────────────
     # If walk-forward enabled and passed: use WF gate for promotion.
     # If walk-forward enabled but failed: do NOT promote regardless of single-split IC.
@@ -756,7 +797,15 @@ def run_gbm_training(
     if wf_result and not wf_result.get("fallback"):
         passes_ic = wf_result["passes_wf"]
     else:
-        passes_ic = passes_single_ic
+        # Single-split fallback: also require chunk-level consistency
+        pct_chunks_positive = float((chunk_ics > 0).mean())
+        if passes_single_ic and pct_chunks_positive < 0.50:
+            log.warning(
+                "Single-split IC passes (%.4f) but chunk consistency fails "
+                "(%.0f%% positive < 50%%) — NOT promoting",
+                float(test_ic), pct_chunks_positive * 100,
+            )
+        passes_ic = passes_single_ic and (pct_chunks_positive >= 0.50)
 
     elapsed_s = (datetime.now(timezone.utc) - start_ts).total_seconds()
     model_version = f"GBM-v{scorer._best_iteration}"
@@ -839,6 +888,8 @@ def run_gbm_training(
                     "n_features":     len(cfg.GBM_FEATURES),
                     "gain_importance": dict(importance),
                     "shap_importance": shap_importance,
+                    "feature_ics": feature_ics,
+                    "noise_candidates": noise_candidates,
                     "ensemble_enabled": rank_scorer is not None,
                     "promoted_mode":  best_mode,
                 }
@@ -893,6 +944,8 @@ def run_gbm_training(
             {"feature": f, "shap": round(s, 4)} for f, s in
             sorted(shap_importance.items(), key=lambda x: -x[1])[:10]
         ] if shap_importance else [],
+        "feature_ics": feature_ics,
+        "noise_candidates": noise_candidates,
     }
 
     # Attach walk-forward detail for email reporting
@@ -1122,6 +1175,43 @@ def send_training_email(result: dict, date_str: str) -> bool:
             + "\n  (*** = rank divergence > 3)\n"
         )
 
+    # ── Feature Health section (per-feature IC + noise detection) ──────────
+    feat_ics = result.get("feature_ics", {})
+    noise_cands = result.get("noise_candidates", [])
+    feat_health_html = ""
+    feat_health_plain = ""
+    if feat_ics:
+        sorted_ics = sorted(feat_ics.items(), key=lambda x: abs(x[1]), reverse=True)
+        ic_rows = "".join(
+            f'<tr style="background:{"#f9f9f9" if i % 2 == 0 else "#fff"};">'
+            f'<td style="padding:2px 8px; font-family:monospace; font-size:11px;">{fname}</td>'
+            f'<td style="padding:2px 8px; font-family:monospace; font-size:11px; '
+            f'color:{"#2e7d32" if fic > 0 else "#c62828"};">{fic:.4f}</td>'
+            f'</tr>'
+            for i, (fname, fic) in enumerate(sorted_ics[:10])
+        )
+        noise_note = ""
+        if noise_cands:
+            noise_note = (
+                f'<p style="font-size:11px; color:#c62828; margin:4px 0;">'
+                f'Noise candidates ({len(noise_cands)}): {", ".join(noise_cands)}</p>'
+            )
+        feat_health_html = (
+            f'<h3 style="margin-top:16px; margin-bottom:4px;">Feature Health</h3>'
+            f'<table style="border-collapse:collapse; font-size:11px;">'
+            f'<tr style="background:#e0e0e0;">'
+            f'<th style="padding:3px 8px;">Feature</th>'
+            f'<th style="padding:3px 8px;">IC vs Forward</th></tr>'
+            f'{ic_rows}</table>'
+            f'{noise_note}'
+        )
+        feat_health_plain = (
+            "\n--- Feature Health (top 10 by |IC|) ---\n"
+            + "\n".join(f"  {fname:<22} IC={fic:.4f}" for fname, fic in sorted_ics[:10])
+            + (f"\nNoise candidates: {', '.join(noise_cands)}" if noise_cands else "")
+            + "\n"
+        )
+
     html_body = (
         f'<html><body style="font-family:sans-serif; font-size:13px; color:#222; max-width:600px;">'
         f'<h2 style="margin-bottom:4px;">GBM Weekly Retrain — {date_str}</h2>'
@@ -1180,6 +1270,8 @@ def send_training_email(result: dict, date_str: str) -> bool:
 
         f'{shap_html}'
 
+        f'{feat_health_html}'
+
         f'<p style="font-size:11px; color:#aaa; margin-top:20px;">'
         f'IC gate: ≥{cfg.MIN_IC:.2f} to promote &nbsp;|&nbsp; IC IR gate: ≥{cfg.GBM_IC_IR_GATE:.2f}</p>'
         f'</body></html>'
@@ -1205,7 +1297,8 @@ def send_training_email(result: dict, date_str: str) -> bool:
         f"\nPromotion:          {promo_label}\n"
         f"{wf_plain}"
         f"\nTop features: " + ", ".join(r["feature"] for r in top10[:5])
-        + f"\n{shap_plain}\n"
+        + f"\n{shap_plain}"
+        + f"{feat_health_plain}\n"
     )
 
     app_password = os.environ.get("GMAIL_APP_PASSWORD", "").strip()
