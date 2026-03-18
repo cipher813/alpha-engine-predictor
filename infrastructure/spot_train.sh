@@ -227,7 +227,8 @@ else
 fi
 
 $PIP install --upgrade pip
-$PIP install -r requirements.txt
+# Filter out private packages (flow-doctor) that aren't on PyPI
+grep -v '^flow-doctor' requirements.txt | $PIP install -r /dev/stdin
 echo "Dependencies installed."
 DEPS
 
