@@ -186,8 +186,8 @@ run_remote bash -s <<'BOOTSTRAP'
 set -euo pipefail
 
 # Amazon Linux 2023: install Python 3.12, git, gcc, and pip
-sudo dnf install -y python3.12 python3.12-pip python3.12-devel git gcc 2>/dev/null || \
-  sudo dnf install -y python3 python3-pip python3-devel git gcc
+sudo dnf install -y -q python3.12 python3.12-pip python3.12-devel git gcc 2>/dev/null || \
+  sudo dnf install -y -q python3 python3-pip python3-devel git gcc
 
 # Determine python binary
 if command -v python3.12 &>/dev/null; then
@@ -226,10 +226,11 @@ else
   PIP="python3 -m pip"
 fi
 
-$PIP install --upgrade pip
+$PIP install --upgrade pip -q
 # Filter out private packages (flow-doctor) that aren't on PyPI
-grep -v '^flow-doctor' requirements.txt | $PIP install -r /dev/stdin
+grep -v '^flow-doctor' requirements.txt | $PIP install -q -r /dev/stdin
 echo "Dependencies installed."
+$PIP list --format=columns | grep -iE 'numpy|pandas|lightgbm|scipy|shap|pyyaml' || true
 DEPS
 
 # ── Copy local config + .env to EC2 ──────────────────────────────────────────
