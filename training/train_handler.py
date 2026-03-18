@@ -1227,19 +1227,25 @@ def send_training_email(result: dict, date_str: str) -> bool:
         f'</tr>'
         f'<tr>'
         f'  <td style="padding:5px 10px; color:#555;">MSE Model IC</td>'
-        f'  <td style="padding:5px 10px; font-family:monospace; font-weight:bold;">{mse_ic:.4f}'
+        f'  <td style="padding:5px 10px; font-family:monospace; font-weight:bold;'
+        f'{f" color:{ic_color};" if promoted_mode == "mse" else ""}">'
+        f'{mse_ic:.4f}{f" — {ic_label}" if promoted_mode == "mse" else ""}'
         f'{"  ✓" if promoted_mode == "mse" else ""}</td>'
         f'</tr>'
         + (
             f'<tr style="background:#f9f9f9;">'
             f'  <td style="padding:5px 10px; color:#555;">Lambdarank Model IC</td>'
-            f'  <td style="padding:5px 10px; font-family:monospace; font-weight:bold;">{rank_ic:.4f}'
+            f'  <td style="padding:5px 10px; font-family:monospace; font-weight:bold;'
+            f'{f" color:{ic_color};" if promoted_mode == "rank" else ""}">'
+            f'{rank_ic:.4f}{f" — {ic_label}" if promoted_mode == "rank" else ""}'
             f'{"  ✓" if promoted_mode == "rank" else ""}</td>'
             f'</tr>'
             f'<tr>'
             f'  <td style="padding:5px 10px; color:#555;">Ensemble IC</td>'
-            f'  <td style="padding:5px 10px; font-family:monospace; font-weight:bold; color:{ic_color};">'
-            f'  {ensemble_ic:.4f} — {ic_label}{"  ✓" if promoted_mode == "ensemble" else ""}</td>'
+            f'  <td style="padding:5px 10px; font-family:monospace; font-weight:bold;'
+            f'{f" color:{ic_color};" if promoted_mode == "ensemble" else ""}">'
+            f'{ensemble_ic:.4f}{f" — {ic_label}" if promoted_mode == "ensemble" else ""}'
+            f'{"  ✓" if promoted_mode == "ensemble" else ""}</td>'
             f'</tr>'
             if ensemble_on and rank_ic is not None and ensemble_ic is not None else
             f'<tr>'
@@ -1250,12 +1256,8 @@ def send_training_email(result: dict, date_str: str) -> bool:
         ) +
         f'<tr style="background:#f9f9f9;">'
         f'  <td style="padding:5px 10px; color:#555;">IC IR</td>'
-        f'  <td style="padding:5px 10px; font-family:monospace;">'
-        f'  {ic_ir:.3f} {"✓" if ic_ir >= cfg.GBM_IC_IR_GATE else "✗"}</td>'
-        f'</tr>'
-        f'<tr>'
-        f'  <td style="padding:5px 10px; color:#555;">IC positive periods</td>'
-        f'  <td style="padding:5px 10px; font-family:monospace;">{ic_pos}/20</td>'
+        f'  <td style="padding:5px 10px; font-family:monospace; color:#555;">'
+        f'  {ic_ir:.3f} ({ic_pos}/20 positive)</td>'
         f'</tr>'
         f'<tr style="background:#f9f9f9;">'
         f'  <td style="padding:5px 10px; color:#555; font-weight:bold;">Promotion</td>'
@@ -1273,7 +1275,7 @@ def send_training_email(result: dict, date_str: str) -> bool:
         f'{feat_health_html}'
 
         f'<p style="font-size:11px; color:#aaa; margin-top:20px;">'
-        f'IC gate: ≥{cfg.MIN_IC:.2f} to promote &nbsp;|&nbsp; IC IR gate: ≥{cfg.GBM_IC_IR_GATE:.2f}</p>'
+        f'IC gate: ≥{cfg.MIN_IC:.2f} to promote &nbsp;|&nbsp; Walk-forward: median IC ≥{cfg.WF_MEDIAN_IC_GATE:.2f}, {cfg.WF_MIN_FOLDS_POSITIVE*100:.0f}%+ positive folds</p>'
         f'</body></html>'
     )
 
@@ -1284,16 +1286,15 @@ def send_training_email(result: dict, date_str: str) -> bool:
         f"GBM Weekly Retrain — {date_str}\n"
         f"Model: {version}  Samples: {n_train:,}  Elapsed: {elapsed_s:.0f}s\n"
         f"\nVal IC:             {val_ic:.4f}"
-        f"\nMSE Model IC:       {mse_ic:.4f}{_mse_mark}"
+        f"\nMSE Model IC:       {mse_ic:.4f}{' — ' + ic_label if promoted_mode == 'mse' else ''}{_mse_mark}"
         + (
-            f"\nLambdarank Model IC: {rank_ic:.4f}{_rank_mark}"
-            f"\nEnsemble IC:        {ensemble_ic:.4f} — {ic_label}{_ens_mark}"
+            f"\nLambdarank Model IC: {rank_ic:.4f}{' — ' + ic_label if promoted_mode == 'rank' else ''}{_rank_mark}"
+            f"\nEnsemble IC:        {ensemble_ic:.4f}{' — ' + ic_label if promoted_mode == 'ensemble' else ''}{_ens_mark}"
             if ensemble_on and rank_ic is not None and ensemble_ic is not None else
             f"\nTest IC:            {test_ic:.4f} — {ic_label}"
         ) +
         f"\nPromoted:           {promoted_mode if promoted else 'none'}"
-        f"\nIC IR:              {ic_ir:.3f}"
-        f"\nIC pos:             {ic_pos}/20"
+        f"\nIC IR:              {ic_ir:.3f} ({ic_pos}/20 positive)"
         f"\nPromotion:          {promo_label}\n"
         f"{wf_plain}"
         f"\nTop features: " + ", ".join(r["feature"] for r in top10[:5])
