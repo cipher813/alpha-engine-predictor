@@ -53,7 +53,7 @@ AWS_REGION="${AWS_REGION:-us-east-1}"
 S3_BUCKET="${S3_BUCKET:-alpha-engine-research}"
 BRANCH="${BRANCH:-main}"
 INSTANCE_TYPE="c5.xlarge"
-AMI_ID="ami-05024c2628f651b80"  # Amazon Linux 2 x86_64
+AMI_ID="ami-0c421724a94bba6d6"  # Amazon Linux 2023 x86_64 (Python 3.12)
 KEY_NAME="alpha-engine-key"
 KEY_FILE="$HOME/.ssh/alpha-engine-key.pem"
 SECURITY_GROUP="sg-03cd3c4bd91e610b0"
@@ -185,12 +185,9 @@ echo "==> Bootstrapping EC2 environment..."
 run_remote bash -s <<'BOOTSTRAP'
 set -euo pipefail
 
-# Install Python 3.12, git, and build tools
-sudo yum install -y python3.12 python3.12-pip git gcc python3.12-devel 2>/dev/null || {
-  # Amazon Linux 2 might need amazon-linux-extras
-  sudo amazon-linux-extras install python3.8 -y 2>/dev/null || true
-  sudo yum install -y python3 python3-pip git gcc python3-devel 2>/dev/null
-}
+# Amazon Linux 2023: install Python 3.12, git, gcc, and pip
+sudo dnf install -y python3.12 python3.12-pip python3.12-devel git gcc 2>/dev/null || \
+  sudo dnf install -y python3 python3-pip python3-devel git gcc
 
 # Determine python binary
 if command -v python3.12 &>/dev/null; then
