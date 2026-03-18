@@ -123,6 +123,23 @@ class GBMScorer:
         }
 
     # ------------------------------------------------------------------
+    # Label conversion for lambdarank
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _to_relevance_grades(y: np.ndarray, n_grades: int = 5) -> np.ndarray:
+        """
+        Convert continuous returns to integer relevance grades (0 to n_grades-1)
+        using percentile bucketing. LightGBM's lambdarank requires int labels.
+
+        Grade 0 = worst returns (bottom quintile), grade 4 = best (top quintile).
+        """
+        percentiles = np.linspace(0, 100, n_grades + 1)[1:-1]  # e.g. [20, 40, 60, 80]
+        thresholds = np.percentile(y, percentiles)
+        grades = np.digitize(y, thresholds).astype(np.int32)
+        return grades
+
+    # ------------------------------------------------------------------
     # Training
     # ------------------------------------------------------------------
 
@@ -193,12 +210,21 @@ class GBMScorer:
                 len(train_group), len(val_group),
             )
 
+        # For lambdarank, convert continuous returns to integer relevance grades.
+        # LightGBM requires int labels for ranking. We use quintile bucketing
+        # (0-4) so the ranker learns relative ordering within each date group.
+        train_labels = y_train
+        val_labels = y_val
+        if self.ranking_objective:
+            train_labels = self._to_relevance_grades(y_train)
+            val_labels = self._to_relevance_grades(y_val)
+
         train_data = lgb.Dataset(
-            X_train, label=y_train, feature_name=self._feature_names,
+            X_train, label=train_labels, feature_name=self._feature_names,
             group=train_group, free_raw_data=False,
         )
         val_data = lgb.Dataset(
-            X_val, label=y_val, feature_name=self._feature_names,
+            X_val, label=val_labels, feature_name=self._feature_names,
             group=val_group, reference=train_data, free_raw_data=False,
         )
 
