@@ -37,6 +37,7 @@ config/predictor.yaml
 # Secrets and environment
 .env
 .env.*
+!.env.example
 *.pem
 *.key
 

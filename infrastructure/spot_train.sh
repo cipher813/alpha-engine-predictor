@@ -15,26 +15,38 @@
 #   - AWS CLI configured (uses alpha-engine-executor-profile for S3/email access)
 #   - SSH key at ~/.ssh/alpha-engine-key.pem
 #   - Code committed and pushed to origin (the instance clones from GitHub)
-#   - config/predictor.yaml on S3 or SCP'd separately (see below)
+#   - .env file with EMAIL_SENDER, EMAIL_RECIPIENTS, GMAIL_APP_PASSWORD
+#   - config/predictor.yaml (gitignored — SCP'd to EC2 by this script)
 #
 # The script will:
 #   1. Request a spot instance (c5.xlarge, ~$0.06/hr)
 #   2. Wait for SSH to become available
 #   3. Clone the repo and install dependencies
-#   4. Copy config/predictor.yaml from local machine → EC2
+#   4. Copy config/predictor.yaml and .env from local machine → EC2
 #   5. Run smoke test (dry_run=True) to verify config + code
 #   6. Prompt to continue with full training (dry_run=False)
 #   7. Terminate the spot instance
-#
-# Environment variables:
-#   AWS_REGION           — default: us-east-1
-#   S3_BUCKET            — default: alpha-engine-research
-#   BRANCH               — git branch to checkout (default: main)
-#   EMAIL_SENDER         — forwarded to training email
-#   EMAIL_RECIPIENTS     — forwarded to training email
-#   GMAIL_APP_PASSWORD   — forwarded to training email
 
 set -euo pipefail
+
+# ── Load .env ────────────────────────────────────────────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+ENV_FILE="$REPO_ROOT/.env"
+if [ -f "$ENV_FILE" ]; then
+  # Export all non-comment, non-empty lines from .env
+  set -a
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+  set +a
+  echo "Loaded .env from $ENV_FILE"
+else
+  echo "WARNING: No .env file found at $ENV_FILE"
+  echo "         Email notifications will be skipped."
+  echo "         Copy .env.example to .env and fill in values."
+  echo ""
+fi
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 AWS_REGION="${AWS_REGION:-us-east-1}"
@@ -48,9 +60,6 @@ SECURITY_GROUP="sg-03cd3c4bd91e610b0"
 SUBNET_ID="subnet-e07166ec"
 IAM_PROFILE="alpha-engine-executor-profile"
 REPO_URL="git@github.com:cipher813/alpha-engine-predictor.git"
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Parse flags
 MODE="both"  # both | full-only | smoke-only
@@ -74,6 +83,7 @@ echo "  Region        : $AWS_REGION"
 echo "  Branch        : $BRANCH"
 echo "  Mode          : $MODE"
 echo "  S3 bucket     : $S3_BUCKET"
+echo "  Email sender  : ${EMAIL_SENDER:-<not set>}"
 echo ""
 
 # ── Preflight checks ──────────────────────────────────────────────────────────
@@ -194,14 +204,13 @@ fi
 
 echo "Using: $($PYTHON --version)"
 
-# Set up SSH for GitHub (deploy key or HTTPS fallback handled below)
+# Set up SSH for GitHub
 mkdir -p ~/.ssh
 ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
 BOOTSTRAP
 
 echo "==> Cloning repository (branch: $BRANCH)..."
-# Try SSH clone first, fall back to HTTPS
-# Forward SSH agent for GitHub access
+# Try SSH clone first (via agent forwarding), fall back to HTTPS
 ssh -A $SSH_OPTS -i "$KEY_FILE" ec2-user@"$PUBLIC_IP" \
   "git clone --depth 1 --branch $BRANCH $REPO_URL /home/ec2-user/predictor" 2>/dev/null || {
   echo "  SSH clone failed — trying HTTPS..."
@@ -214,12 +223,9 @@ run_remote bash -s <<'DEPS'
 set -euo pipefail
 cd /home/ec2-user/predictor
 
-# Use whichever python is available
 if command -v python3.12 &>/dev/null; then
-  PYTHON=python3.12
   PIP="python3.12 -m pip"
 else
-  PYTHON=python3
   PIP="python3 -m pip"
 fi
 
@@ -228,23 +234,21 @@ $PIP install -r requirements.txt
 echo "Dependencies installed."
 DEPS
 
-# ── Copy local config to EC2 ──────────────────────────────────────────────────
-echo "==> Uploading config/predictor.yaml..."
+# ── Copy local config + .env to EC2 ──────────────────────────────────────────
+echo "==> Uploading config/predictor.yaml and .env..."
 scp $SSH_OPTS -i "$KEY_FILE" \
   "$REPO_ROOT/config/predictor.yaml" \
   ec2-user@"$PUBLIC_IP":/home/ec2-user/predictor/config/predictor.yaml
 
-# ── Forward email env vars ────────────────────────────────────────────────────
-# Build env var export string from local environment
-ENV_EXPORTS=""
-for var in EMAIL_SENDER EMAIL_RECIPIENTS GMAIL_APP_PASSWORD AWS_REGION S3_BUCKET; do
-  val="${!var:-}"
-  if [ -n "$val" ]; then
-    ENV_EXPORTS+="export ${var}='${val}'; "
-  fi
-done
-ENV_EXPORTS+="export S3_BUCKET='${S3_BUCKET}'; "
-ENV_EXPORTS+="export XDG_CACHE_HOME=/tmp; "
+if [ -f "$ENV_FILE" ]; then
+  scp $SSH_OPTS -i "$KEY_FILE" \
+    "$ENV_FILE" \
+    ec2-user@"$PUBLIC_IP":/home/ec2-user/predictor/.env
+fi
+
+# ── Build env export command for remote shells ────────────────────────────────
+# Source .env on the remote side so all training/email code sees the vars
+ENV_SOURCE='set -a; [ -f /home/ec2-user/predictor/.env ] && source /home/ec2-user/predictor/.env; set +a; export XDG_CACHE_HOME=/tmp;'
 
 # ── Determine python binary on remote ─────────────────────────────────────────
 REMOTE_PYTHON=$(run_remote "command -v python3.12 || command -v python3")
@@ -260,18 +264,18 @@ if [ "$MODE" != "full-only" ]; then
   run_remote bash -s <<SMOKE
 set -euo pipefail
 cd /home/ec2-user/predictor
-${ENV_EXPORTS}
+${ENV_SOURCE}
 
 $REMOTE_PYTHON -c "
 import sys, os
 sys.path.insert(0, '.')
-os.environ.setdefault('S3_BUCKET', '${S3_BUCKET}')
+os.environ.setdefault('S3_BUCKET', os.environ.get('S3_BUCKET', 'alpha-engine-research'))
 
 import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s  %(levelname)-8s  %(message)s')
 
 from training.train_handler import main as train_main
-result = train_main(bucket='${S3_BUCKET}', dry_run=True)
+result = train_main(bucket=os.environ.get('S3_BUCKET', 'alpha-engine-research'), dry_run=True)
 
 print()
 print('=' * 60)
@@ -287,7 +291,6 @@ print(f'  Promoted:       {result.get(\"promoted\", \"n/a\")}')
 print(f'  Walk-forward:   {\"PASS\" if result.get(\"walk_forward\", {}).get(\"passes_wf\") else \"FAIL/skipped\"}')
 print(f'  Elapsed:        {result.get(\"elapsed_s\", \"n/a\")}s')
 print(f'  Noise features: {result.get(\"noise_candidates\", [])}')
-# Feature ICs
 fics = result.get('feature_ics', {})
 if fics:
     sorted_fics = sorted(fics.items(), key=lambda x: abs(x[1]), reverse=True)
@@ -325,18 +328,18 @@ echo ""
 run_remote bash -s <<TRAIN
 set -euo pipefail
 cd /home/ec2-user/predictor
-${ENV_EXPORTS}
+${ENV_SOURCE}
 
 $REMOTE_PYTHON -c "
 import sys, os
 sys.path.insert(0, '.')
-os.environ.setdefault('S3_BUCKET', '${S3_BUCKET}')
+os.environ.setdefault('S3_BUCKET', os.environ.get('S3_BUCKET', 'alpha-engine-research'))
 
 import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s  %(levelname)-8s  %(message)s')
 
 from training.train_handler import main as train_main
-result = train_main(bucket='${S3_BUCKET}', dry_run=False)
+result = train_main(bucket=os.environ.get('S3_BUCKET', 'alpha-engine-research'), dry_run=False)
 
 print()
 print('=' * 60)
