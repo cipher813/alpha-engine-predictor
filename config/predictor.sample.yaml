@@ -37,6 +37,7 @@ gbm:
   n_estimators: 1000               # max boosting rounds
   early_stopping_rounds: 30        # stop if no improvement for N rounds
   ic_ir_gate: 0.20                 # IC IR threshold for model promotion
+  ensemble_lambdarank: true      # train both MSE + lambdarank and ensemble predictions
   tuned_params:
     objective: regression
     metric: mse
@@ -111,3 +112,12 @@ features:
   obv_fast: 5                      # OBV fast rolling window
   obv_slow: 20                     # OBV slow rolling window
   rsi_slope_window: 5              # RSI slope lookback
+
+# ── Alternative data features (O10-O12) ────────────────────────────────────
+# These features are fetched from external APIs (FMP, yfinance) at inference
+# time. For historical training, they default to neutral values.
+# The GBM's regularization naturally downweights them if not predictive.
+alternative_data:
+  earnings_features_enabled: true    # O10: PEAD earnings surprise + recency
+  revision_features_enabled: true    # O11: EPS revision momentum + streak
+  options_features_enabled: true     # O12: put/call ratio, IV rank, IV vs RV

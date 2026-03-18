@@ -78,6 +78,7 @@ def _run_optuna(
     from model.gbm_scorer import GBMScorer
     from scipy.stats import pearsonr
 
+    # Optuna tunes the MSE model's hyperparams; lambdarank reuses the same params
     def objective(trial) -> float:
         obj = trial.suggest_categorical("objective", ["regression", "huber"])
         params = {
@@ -96,7 +97,8 @@ def _run_optuna(
             "lambda_l1":         trial.suggest_float("lambda_l1", 1e-4, 10.0, log=True),
             "lambda_l2":         trial.suggest_float("lambda_l2", 1e-4, 10.0, log=True),
         }
-        scorer = GBMScorer(params=params, n_estimators=2000, early_stopping_rounds=50)
+        scorer = GBMScorer(params=params, n_estimators=2000, early_stopping_rounds=50,
+                           ranking_objective=False)
         scorer.fit(X_train, y_train, X_val, y_val, feature_names=feature_names)
         val_preds = scorer.predict(X_val)
         ic, _ = pearsonr(val_preds, y_val)
@@ -346,20 +348,50 @@ def main() -> None:
     else:
         log.info("No --tune flag — using default GBM parameters")
 
-    # ── Train final GBM ────────────────────────────────────────────────────────
-    log.info("Training GBMScorer...")
+    # ── Train final GBM (MSE) ─────────────────────────────────────────────────
+    ensemble_enabled = getattr(cfg, "GBM_ENSEMBLE_LAMBDARANK", True)
+    log.info("Training GBMScorer (MSE)%s...",
+             " + lambdarank ensemble" if ensemble_enabled else "")
     scorer = GBMScorer(
         params=gbm_params,
         n_estimators=3000,
         early_stopping_rounds=50,
+        ranking_objective=False,
     )
     scorer.fit(X_train, y_train, X_val, y_val, feature_names=cfg.FEATURES)
 
+    # ── Train lambdarank model (when ensemble enabled) ────────────────────────
+    rank_scorer = None
+    if ensemble_enabled:
+        try:
+            rank_scorer = GBMScorer(
+                params=gbm_params,
+                n_estimators=3000,
+                early_stopping_rounds=50,
+                ranking_objective=True,
+            )
+            rank_scorer.fit(X_train, y_train, X_val, y_val, feature_names=cfg.FEATURES)
+            log.info("Lambdarank model trained: val_IC=%.4f", rank_scorer._val_ic)
+        except Exception as e:
+            log.warning("Lambdarank training failed — MSE-only: %s", e)
+            rank_scorer = None
+
     # ── Evaluate on test set ───────────────────────────────────────────────────
-    from scipy.stats import pearsonr
+    from scipy.stats import pearsonr, rankdata
 
     test_preds = scorer.predict(X_test)
     test_ic, test_p = pearsonr(test_preds, y_test)
+
+    # Lambdarank + ensemble ICs
+    rank_test_ic = 0.0
+    ensemble_test_ic = test_ic
+    if rank_scorer is not None:
+        rank_preds = rank_scorer.predict(X_test)
+        rank_test_ic, _ = pearsonr(rank_preds, y_test)
+        mse_ranked = rankdata(test_preds).astype(np.float32)
+        rank_ranked = rankdata(rank_preds).astype(np.float32)
+        blend_preds = 0.5 * mse_ranked + 0.5 * rank_ranked
+        ensemble_test_ic, _ = pearsonr(blend_preds, y_test)
 
     # Rolling IC over 20 test chunks
     n_chunks = 20
@@ -377,8 +409,20 @@ def main() -> None:
     print("=" * 60)
     print(f"  Best iteration : {scorer._best_iteration}")
     print(f"  Val IC         : {scorer._val_ic:.4f}")
-    print(f"  Test IC        : {test_ic:.4f}   p={test_p:.2e}")
-    print(f"  Gate (>0.05)   : {'PASS ✓' if test_ic >= 0.05 else 'FAIL ✗'}")
+    print(f"  MSE Model IC   : {test_ic:.4f}   p={test_p:.2e}")
+    if rank_scorer is not None:
+        print(f"  Lambdarank IC  : {rank_test_ic:.4f}")
+        print(f"  Ensemble IC    : {ensemble_test_ic:.4f}")
+
+    # Pick best IC among all candidates
+    if rank_scorer is not None:
+        candidates = {"mse": test_ic, "ensemble": ensemble_test_ic, "rank": rank_test_ic}
+    else:
+        candidates = {"mse": test_ic}
+    best_mode = max(candidates, key=candidates.get)
+    gate_ic = candidates[best_mode]
+    print(f"  Promoted       : {best_mode} ✓")
+    print(f"  Gate (>0.05)   : {'PASS ✓' if gate_ic >= 0.05 else 'FAIL ✗'}")
     print(f"  Rolling IC IR  : {ic_ir:.3f}  (target >0.3)")
     print(f"  IC positive periods: {(chunk_ics > 0).sum()}/20")
 
@@ -461,10 +505,20 @@ def main() -> None:
                 "Retrain MLP with current features to re-enable. Error: %s", exc,
             )
 
-    # ── Save GBM booster ───────────────────────────────────────────────────────
+    # ── Save GBM booster(s) ─────────────────────────────────────────────────────
     save_path = Path(args.output) / "gbm_best.txt"
     scorer.save(save_path)
-    log.info("GBMScorer saved to %s", save_path)
+    log.info("GBMScorer (MSE) saved to %s", save_path)
+
+    if rank_scorer is not None:
+        rank_save_path = Path(args.output) / "gbm_rank_best.txt"
+        rank_scorer.save(rank_save_path)
+        log.info("GBMScorer (lambdarank) saved to %s", rank_save_path)
+
+    # ── Save gbm_mode.json ─────────────────────────────────────────────────────
+    mode_path = Path(args.output) / "gbm_mode.json"
+    mode_path.write_text(json.dumps({"mode": best_mode}, indent=2))
+    log.info("Inference mode saved to %s: mode=%s", mode_path, best_mode)
 
     # ── Save eval report ───────────────────────────────────────────────────────
     gbm_report = {

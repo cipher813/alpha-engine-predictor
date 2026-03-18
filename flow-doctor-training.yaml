@@ -1,0 +1,18 @@
+flow_name: predictor-training
+repo: cipher813/alpha-engine-predictor
+owner: "@brianmcmahon"
+notify:
+  - type: email
+    sender: ${EMAIL_SENDER}
+    recipients: ${EMAIL_RECIPIENTS}
+    smtp_host: smtp.gmail.com
+    smtp_port: 587
+    smtp_password: ${GMAIL_APP_PASSWORD}
+store:
+  type: sqlite
+  path: /tmp/flow_doctor.db
+dedup_cooldown_minutes: 60
+dependencies:
+  - research-lambda
+rate_limits:
+  max_alerts_per_day: 10

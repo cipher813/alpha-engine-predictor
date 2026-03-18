@@ -48,6 +48,15 @@ def handler(event: dict, context) -> dict:
         format="%(asctime)s  %(levelname)-8s  %(message)s",
     )
 
+    fd = None
+    try:
+        import flow_doctor
+        cfg_name = "flow-doctor-training.yaml" if event.get("action", "predict") == "train" else "flow-doctor.yaml"
+        fd = flow_doctor.init(config_path=os.path.join(
+            os.path.dirname(os.path.dirname(__file__)), cfg_name))
+    except Exception:
+        pass
+
     action  = event.get("action", "predict")
     date_str = event.get("date", None)
     dry_run  = bool(event.get("dry_run", False))
@@ -82,6 +91,12 @@ def handler(event: dict, context) -> dict:
             }
         except Exception as exc:
             log.exception("Training Lambda failed: %s", exc)
+            if fd:
+                fd.report(exc, severity="critical", context={
+                    "site": "training_lambda_toplevel",
+                    "bucket": bucket,
+                    "date": date_str,
+                })
             return {
                 "statusCode": 500,
                 "body": f"Training Lambda failed: {exc}",
@@ -105,6 +120,12 @@ def handler(event: dict, context) -> dict:
 
     except Exception as exc:
         log.exception("Predictor Lambda failed: %s", exc)
+        if fd:
+            fd.report(exc, severity="critical", context={
+                "site": "predictor_lambda_toplevel",
+                "bucket": bucket,
+                "date": date_str,
+            })
         return {
             "statusCode": 500,
             "body": f"Predictor Lambda failed: {exc}",

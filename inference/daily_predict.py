@@ -1774,10 +1774,65 @@ def main(
     checkpoint = {}    # MLP path
 
     if model_type == "gbm":
-        if local:
-            scorer = load_gbm_local("checkpoints/gbm_best.txt")
+        # Determine inference mode from gbm_mode.json
+        inference_mode = "mse"  # default (backwards compat)
+        if getattr(cfg, "GBM_ENSEMBLE_LAMBDARANK", True):
+            if local:
+                mode_path = Path("checkpoints/gbm_mode.json")
+                if mode_path.exists():
+                    try:
+                        inference_mode = json.loads(mode_path.read_text()).get("mode", "mse")
+                    except Exception as exc:
+                        log.warning("Could not read local gbm_mode.json: %s — defaulting to mse", exc)
+            else:
+                try:
+                    import boto3 as _boto3_mode
+                    _s3_mode = _boto3_mode.client("s3")
+                    _mode_obj = _s3_mode.get_object(Bucket=bucket, Key=cfg.GBM_MODE_KEY)
+                    inference_mode = json.loads(_mode_obj["Body"].read()).get("mode", "mse")
+                except Exception as exc:
+                    log.info(
+                        "gbm_mode.json not found on S3 — defaulting to mse: %s", exc
+                    )
+        log.info("Inference mode: %s", inference_mode)
+
+        # Load models based on inference mode
+        rank_scorer = None
+        if inference_mode == "mse":
+            if local:
+                scorer = load_gbm_local("checkpoints/gbm_best.txt")
+            else:
+                scorer = load_gbm_s3(bucket, cfg.GBM_WEIGHTS_KEY)
+        elif inference_mode == "rank":
+            if local:
+                scorer = load_gbm_local("checkpoints/gbm_rank_best.txt")
+            else:
+                scorer = load_gbm_s3(bucket, cfg.GBM_WEIGHTS_KEY)
+        elif inference_mode == "ensemble":
+            if local:
+                scorer = load_gbm_local("checkpoints/gbm_best.txt")
+            else:
+                scorer = load_gbm_s3(bucket, cfg.GBM_MSE_WEIGHTS_KEY)
+            # Load lambdarank model for ensemble
+            try:
+                if local:
+                    rank_scorer = load_gbm_local("checkpoints/gbm_rank_best.txt")
+                else:
+                    rank_scorer = load_gbm_s3(bucket, cfg.GBM_RANK_WEIGHTS_KEY)
+                log.info("Lambdarank model loaded for ensemble inference")
+            except Exception as exc:
+                log.warning(
+                    "Lambdarank model not available — falling back to MSE-only: %s", exc
+                )
+                inference_mode = "mse"
         else:
-            scorer = load_gbm_s3(bucket, cfg.GBM_WEIGHTS_KEY)
+            log.warning("Unknown inference mode '%s' — defaulting to mse", inference_mode)
+            inference_mode = "mse"
+            if local:
+                scorer = load_gbm_local("checkpoints/gbm_best.txt")
+            else:
+                scorer = load_gbm_s3(bucket, cfg.GBM_WEIGHTS_KEY)
+
         model_version = f"GBM-v{scorer._best_iteration}"
         val_loss = scorer._val_ic   # IC is the GBM analogue of val_loss
     else:
@@ -1861,6 +1916,32 @@ def main(
     # captures the dividend factor and helps detect splits via sudden price jumps.
     save_daily_closes(tickers, date_str, bucket, dry_run=dry_run)
 
+    # ── Step 3d: Fetch alternative data for O10-O12 features ─────────────────
+    _earnings_all: dict[str, dict] = {}
+    _revision_all: dict[str, dict] = {}
+    _options_all: dict[str, dict] = {}
+    try:
+        from data.earnings_fetcher import fetch_earnings_data, cache_earnings_to_s3
+        _earnings_all = fetch_earnings_data(tickers, reference_date=date_str)
+        cache_earnings_to_s3(_earnings_all, date_str, bucket)
+        log.info("O10: Fetched earnings data for %d tickers", len(_earnings_all))
+    except Exception as exc:
+        log.warning("O10: Earnings data fetch failed (features will use defaults): %s", exc)
+
+    try:
+        from data.earnings_fetcher import fetch_revision_history
+        _revision_all = fetch_revision_history(tickers, bucket=bucket, reference_date=date_str)
+        log.info("O11: Loaded revision data for %d tickers", len(_revision_all))
+    except Exception as exc:
+        log.warning("O11: Revision data fetch failed (features will use defaults): %s", exc)
+
+    try:
+        from data.options_fetcher import fetch_options_features
+        _options_all = fetch_options_features(tickers, reference_date=date_str)
+        log.info("O12: Fetched options features for %d tickers", len(_options_all))
+    except Exception as exc:
+        log.warning("O12: Options features fetch failed (features will use defaults): %s", exc)
+
     # ── Step 4: Run inference ─────────────────────────────────────────────────
     predictions: list[dict] = []
     n_skipped = 0
@@ -1890,6 +1971,9 @@ def main(
                     irx_series=macro.get("IRX") if macro else None,
                     gld_series=macro.get("GLD") if macro else None,
                     uso_series=macro.get("USO") if macro else None,
+                    earnings_data=_earnings_all.get(ticker),
+                    revision_data=_revision_all.get(ticker),
+                    options_data=_options_all.get(ticker),
                 )
             except Exception as exc:
                 log.warning("Feature computation failed for %s: %s", ticker, exc)
@@ -1930,7 +2014,27 @@ def main(
 
             # Run batch inference and build prediction dicts
             try:
-                scores = scorer.predict(X_batch)  # (N_tickers,)
+                mse_scores = scorer.predict(X_batch)  # (N_tickers,)
+                # Ensemble with lambdarank model only if inference_mode is "ensemble"
+                if inference_mode == "ensemble" and rank_scorer is not None:
+                    try:
+                        from scipy.stats import rankdata as _rankdata
+                        rank_scores = rank_scorer.predict(X_batch)
+                        # Rank-normalize each model's predictions, then average
+                        mse_ranked = _rankdata(mse_scores).astype(np.float32)
+                        rank_ranked = _rankdata(rank_scores).astype(np.float32)
+                        ensemble_ranks = 0.5 * mse_ranked + 0.5 * rank_ranked
+                        # Map ensemble ranks back to return-like scale so
+                        # p_up/p_down conversion works: percentile in [-LABEL_CLIP, +LABEL_CLIP]
+                        _clip = getattr(cfg, "LABEL_CLIP", 0.15)
+                        pctile = (ensemble_ranks - ensemble_ranks.min()) / max(ensemble_ranks.max() - ensemble_ranks.min(), 1e-8)
+                        scores = (pctile - 0.5) * 2.0 * _clip  # map [0,1] → [-clip, +clip]
+                        log.info("Ensemble inference: MSE + lambdarank (rank-normalized average)")
+                    except Exception as exc_rank:
+                        log.warning("Lambdarank inference failed — using MSE-only: %s", exc_rank)
+                        scores = mse_scores
+                else:
+                    scores = mse_scores
             except Exception as exc:
                 log.error("Batch GBM inference failed: %s", exc)
                 if fd:
@@ -1969,6 +2073,10 @@ def main(
                 }
                 if ticker_sources:
                     result["watchlist_source"] = ticker_sources.get(ticker, "unknown")
+                # O10: earnings proximity for executor warning
+                earnings_info = _earnings_all.get(ticker, {})
+                if earnings_info.get("next_earnings_days") is not None:
+                    result["next_earnings_days"] = earnings_info["next_earnings_days"]
                 predictions.append(result)
     else:
         # NN path — per-ticker inference (unchanged)

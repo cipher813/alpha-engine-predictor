@@ -67,8 +67,15 @@ class GBMScorer:
         n_estimators: int = 2000,
         early_stopping_rounds: int = 50,
         verbose: int = -1,
+        ranking_objective: bool = False,
     ) -> None:
         self.params = params or self._default_params()
+        self.ranking_objective = ranking_objective
+        if ranking_objective:
+            self.params = dict(self.params)  # avoid mutating caller's dict
+            self.params["objective"] = "lambdarank"
+            self.params["metric"] = "ndcg"
+            self.params["eval_at"] = [5, 10]
         self.n_estimators = n_estimators
         self.early_stopping_rounds = early_stopping_rounds
         self.verbose = verbose
@@ -126,9 +133,12 @@ class GBMScorer:
         X_val: np.ndarray,
         y_val: np.ndarray,
         feature_names: list[str] | None = None,
+        train_dates: list | None = None,
+        val_dates: list | None = None,
     ) -> "GBMScorer":
         """
-        Train the LightGBM booster with early stopping on validation MSE.
+        Train the LightGBM booster with early stopping on validation MSE
+        (or NDCG when ranking_objective=True).
 
         Parameters
         ----------
@@ -137,6 +147,10 @@ class GBMScorer:
         X_val   : np.ndarray, shape (N_val, n_features)
         y_val   : np.ndarray, shape (N_val,) — forward_return_5d (alpha vs SPY)
         feature_names : list of str, optional — stored for feature importance.
+        train_dates : list, optional — one date per training sample (required for
+                      ranking_objective=True to compute group sizes).
+        val_dates : list, optional — one date per validation sample (required for
+                    ranking_objective=True to compute group sizes).
         """
         try:
             import lightgbm as lgb
@@ -148,12 +162,44 @@ class GBMScorer:
 
         self._feature_names = feature_names or [f"f{i}" for i in range(X_train.shape[1])]
 
+        # Compute group sizes for lambdarank (number of tickers per date)
+        train_group = None
+        val_group = None
+        if self.ranking_objective:
+            if train_dates is None or val_dates is None:
+                raise ValueError(
+                    "ranking_objective=True requires train_dates and val_dates "
+                    "to compute group sizes for lambdarank."
+                )
+            # Count consecutive rows with the same date (data must be sorted by date)
+            from collections import Counter
+            train_counts = Counter(train_dates)
+            val_counts = Counter(val_dates)
+            # Preserve date order (sorted by first occurrence)
+            seen = {}
+            train_group = []
+            for d in train_dates:
+                if d not in seen:
+                    seen[d] = True
+                    train_group.append(train_counts[d])
+            seen = {}
+            val_group = []
+            for d in val_dates:
+                if d not in seen:
+                    seen[d] = True
+                    val_group.append(val_counts[d])
+            log.info(
+                "Lambdarank groups: train=%d groups, val=%d groups",
+                len(train_group), len(val_group),
+            )
+
         train_data = lgb.Dataset(
-            X_train, label=y_train, feature_name=self._feature_names, free_raw_data=False
+            X_train, label=y_train, feature_name=self._feature_names,
+            group=train_group, free_raw_data=False,
         )
         val_data = lgb.Dataset(
             X_val, label=y_val, feature_name=self._feature_names,
-            reference=train_data, free_raw_data=False
+            group=val_group, reference=train_data, free_raw_data=False,
         )
 
         callbacks = [

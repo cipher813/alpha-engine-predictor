@@ -99,6 +99,7 @@ def refresh_price_cache(
     local_dir: Path,
     fetch_period: str | None = None,
     staleness_threshold_days: int | None = None,
+    fd=None,
 ) -> int:
     """
     Fully rewrite stale .parquet files in local_dir with fresh yfinance data and
@@ -204,6 +205,11 @@ def refresh_price_cache(
                 "yfinance batch download failed for %s...: %s",
                 ticker_names[:3], exc,
             )
+            if fd:
+                fd.report(exc, severity="error", context={
+                    "site": "batch_yfinance_refresh",
+                    "batch_tickers": ticker_names[:5],
+                })
             continue
 
         for ticker, parquet_path in batch:
@@ -261,6 +267,7 @@ def write_slim_cache(
     full_cache_dir: Path,
     slim_prefix: str = "predictor/price_cache_slim/",
     lookback_days: int | None = None,
+    fd=None,
 ) -> int:
     """
     After weekly training, write a 2-year slice of each ticker parquet to S3 at
@@ -331,6 +338,11 @@ def write_slim_cache(
 
         except Exception as exc:
             log.warning("Slim cache write failed for %s: %s", parquet_path.stem, exc)
+            if fd:
+                fd.report(exc, severity="error", context={
+                    "site": "slim_cache_write",
+                    "ticker": parquet_path.stem,
+                })
 
     log.info(
         "Slim cache written: %d / %d tickers uploaded to s3://%s/%s",
@@ -617,21 +629,93 @@ def run_gbm_training(
 
     # ── Train with Optuna-tuned hyperparameters ───────────────────────────────
     tuned_params = getattr(cfg, "GBM_TUNED_PARAMS", None)
+    ensemble_enabled = getattr(cfg, "GBM_ENSEMBLE_LAMBDARANK", True)
+    train_dates_slice = all_dates[:n_train]
+    val_dates_slice = all_dates[val_start:val_end]
+
     log.info(
-        "Training GBMScorer (n_estimators=%d, early_stopping=%d, %s) ...",
+        "Training GBMScorer (n_estimators=%d, early_stopping=%d, %s%s) ...",
         cfg.GBM_N_ESTIMATORS, cfg.GBM_EARLY_STOPPING_ROUNDS,
         "Optuna-tuned params" if tuned_params else "default params",
+        " + lambdarank ensemble" if ensemble_enabled else "",
     )
+
+    # ── MSE model (always trained) ────────────────────────────────────────────
     scorer = GBMScorer(
         params=tuned_params,
         n_estimators=cfg.GBM_N_ESTIMATORS,
         early_stopping_rounds=cfg.GBM_EARLY_STOPPING_ROUNDS,
+        ranking_objective=False,
     )
     scorer.fit(X_train, y_train, X_val, y_val, feature_names=cfg.GBM_FEATURES)
 
-    # ── Evaluate (numpy-only, no scipy dependency) ──────────────────────────
-    test_preds = scorer.predict(X_test)
-    test_ic = float(np.corrcoef(test_preds, y_test)[0, 1])
+    # ── Lambdarank model (when ensemble enabled) ──────────────────────────────
+    rank_scorer = None
+    if ensemble_enabled:
+        try:
+            rank_scorer = GBMScorer(
+                params=tuned_params,
+                n_estimators=cfg.GBM_N_ESTIMATORS,
+                early_stopping_rounds=cfg.GBM_EARLY_STOPPING_ROUNDS,
+                ranking_objective=True,
+            )
+            rank_scorer.fit(
+                X_train, y_train, X_val, y_val,
+                feature_names=cfg.GBM_FEATURES,
+                train_dates=train_dates_slice,
+                val_dates=val_dates_slice,
+            )
+            log.info("Lambdarank model trained: val_IC=%.4f", rank_scorer._val_ic)
+        except Exception as e:
+            log.warning("Lambdarank training failed — falling back to MSE-only: %s", e)
+            rank_scorer = None
+
+    # ── Evaluate ─────────────────────────────────────────────────────────────
+    try:
+        from scipy.stats import rankdata
+    except ImportError:
+        # Numpy-only fallback for rankdata
+        def rankdata(a):
+            arr = np.asarray(a)
+            order = arr.argsort()
+            ranks = np.empty_like(order, dtype=np.float64)
+            ranks[order] = np.arange(1, len(arr) + 1, dtype=np.float64)
+            return ranks
+
+    test_preds_mse = scorer.predict(X_test)
+    mse_ic = float(np.corrcoef(test_preds_mse, y_test)[0, 1])
+
+    # Lambdarank IC + ensemble IC
+    rank_ic = 0.0
+    ensemble_ic = mse_ic  # default to MSE if no rank model
+    if rank_scorer is not None:
+        test_preds_rank = rank_scorer.predict(X_test)
+        rank_ic = float(np.corrcoef(test_preds_rank, y_test)[0, 1])
+        # Ensemble: rank-normalize each model's predictions, then average
+        mse_ranked = rankdata(test_preds_mse).astype(np.float32)
+        rank_ranked = rankdata(test_preds_rank).astype(np.float32)
+        ensemble_preds = 0.5 * mse_ranked + 0.5 * rank_ranked
+        ensemble_ic = float(np.corrcoef(ensemble_preds, y_test)[0, 1])
+        log.info(
+            "Ensemble ICs: MSE=%.4f  Lambdarank=%.4f  Ensemble=%.4f",
+            mse_ic, rank_ic, ensemble_ic,
+        )
+
+    # Pick the best IC among all candidates for the gate
+    if rank_scorer is not None:
+        candidates = {"mse": mse_ic, "ensemble": ensemble_ic}
+        candidates["rank"] = rank_ic
+    else:
+        candidates = {"mse": mse_ic}
+    best_mode = max(candidates, key=candidates.get)
+    best_ic = candidates[best_mode]
+    test_ic = best_ic
+    test_preds = test_preds_mse  # for chunk IC and backwards compat
+    log.info(
+        "Best IC selection: %s (%.4f) from candidates %s",
+        best_mode, best_ic,
+        {k: round(v, 4) for k, v in candidates.items()},
+    )
 
     n_chunks   = 20
     chunk_size = len(test_preds) // n_chunks
@@ -646,6 +730,21 @@ def run_gbm_training(
 
     importance = scorer.feature_importance(importance_type="gain")
     top10      = sorted(importance.items(), key=lambda x: -x[1])[:10]
+
+    # SHAP feature importance (more reliable than gain-based) — computed on MSE model
+    shap_importance = None
+    try:
+        import shap
+        explainer = shap.TreeExplainer(scorer._booster)
+        shap_values = explainer.shap_values(X_test[:500])  # cap at 500 rows for speed
+        shap_importance = dict(zip(
+            cfg.GBM_FEATURES,
+            [round(float(v), 4) for v in np.abs(shap_values).mean(axis=0)]
+        ))
+        shap_top10 = sorted(shap_importance.items(), key=lambda x: -x[1])[:10]
+        log.info("SHAP top 5: %s", shap_top10[:5])
+    except Exception as e:
+        log.warning("SHAP computation failed (non-blocking): %s", e)
 
     # ── Promotion decision ────────────────────────────────────────────────────
     # If walk-forward enabled and passed: use WF gate for promotion.
@@ -678,18 +777,59 @@ def run_gbm_training(
             import boto3
             s3 = boto3.client("s3")
 
-            # Always save a dated backup
+            # Always save dated backups
             dated_key = f"predictor/weights/gbm_{date_str}.txt"
             s3.upload_file(str(booster_path), bucket, dated_key)
-            log.info("Uploaded dated backup: s3://%s/%s", bucket, dated_key)
+            log.info("Uploaded dated backup (MSE): s3://%s/%s", bucket, dated_key)
+
+            # Also save as gbm_mse_{date}.txt
+            dated_mse_key = f"predictor/weights/gbm_mse_{date_str}.txt"
+            s3.upload_file(str(booster_path), bucket, dated_mse_key)
+
+            # Save lambdarank model if trained
+            rank_booster_path = None
+            if rank_scorer is not None:
+                rank_booster_path = Path(tmp) / "gbm_rank_model.txt"
+                rank_scorer.save(rank_booster_path)
+                dated_rank_key = f"predictor/weights/gbm_rank_{date_str}.txt"
+                s3.upload_file(str(rank_booster_path), bucket, dated_rank_key)
+                log.info("Uploaded dated backup (lambdarank): s3://%s/%s", bucket, dated_rank_key)
 
             if passes_ic:
-                # Promote to active weights
-                s3.upload_file(str(booster_path), bucket, cfg.GBM_WEIGHTS_KEY)
+                # Promote based on best_mode
+                if best_mode == "mse":
+                    # MSE only: upload MSE weights as gbm_latest + gbm_mse_latest
+                    s3.upload_file(str(booster_path), bucket, cfg.GBM_WEIGHTS_KEY)
+                    s3.upload_file(str(booster_path), bucket, cfg.GBM_MSE_WEIGHTS_KEY)
+                    log.info("Promoted MSE to active weights: s3://%s/%s", bucket, cfg.GBM_WEIGHTS_KEY)
+                elif best_mode == "rank" and rank_booster_path is not None:
+                    # Rank only: upload rank weights as gbm_latest + gbm_rank_latest
+                    s3.upload_file(str(rank_booster_path), bucket, cfg.GBM_WEIGHTS_KEY)
+                    s3.upload_file(str(rank_booster_path), bucket, cfg.GBM_RANK_WEIGHTS_KEY)
+                    log.info("Promoted lambdarank to active weights: s3://%s/%s", bucket, cfg.GBM_WEIGHTS_KEY)
+                elif best_mode == "ensemble":
+                    # Ensemble: upload both MSE and rank weights
+                    s3.upload_file(str(booster_path), bucket, cfg.GBM_WEIGHTS_KEY)
+                    s3.upload_file(str(booster_path), bucket, cfg.GBM_MSE_WEIGHTS_KEY)
+                    if rank_booster_path is not None:
+                        s3.upload_file(str(rank_booster_path), bucket, cfg.GBM_RANK_WEIGHTS_KEY)
+                    log.info("Promoted ensemble to active weights: s3://%s/%s", bucket, cfg.GBM_WEIGHTS_KEY)
+
+                # Write gbm_mode.json to S3
+                mode_payload = json.dumps({"mode": best_mode}, indent=2).encode()
+                s3.put_object(
+                    Bucket=bucket,
+                    Key=cfg.GBM_MODE_KEY,
+                    Body=mode_payload,
+                    ContentType="application/json",
+                )
+                log.info("Wrote gbm_mode.json: mode=%s", best_mode)
+
                 meta = {
                     "model_version":  model_version,
                     "val_ic":         round(float(scorer._val_ic), 6),
                     "test_ic":        round(float(test_ic), 6),
+                    "mse_ic":         round(float(mse_ic), 6),
                     "ic_ir":          round(ic_ir, 4),
                     "trained_date":   date_str,
                     "best_iteration": scorer._best_iteration,
@@ -697,7 +837,14 @@ def run_gbm_training(
                     "rank_normalized": True,
                     "feature_list":   cfg.GBM_FEATURES,
                     "n_features":     len(cfg.GBM_FEATURES),
+                    "gain_importance": dict(importance),
+                    "shap_importance": shap_importance,
+                    "ensemble_enabled": rank_scorer is not None,
+                    "promoted_mode":  best_mode,
                 }
+                if rank_scorer is not None:
+                    meta["rank_ic"] = round(float(rank_ic), 6)
+                    meta["ensemble_ic"] = round(float(ensemble_ic), 6)
                 if wf_result and not wf_result.get("fallback"):
                     meta["walk_forward"] = {
                         "median_ic": wf_result["median_ic"],
@@ -710,7 +857,7 @@ def run_gbm_training(
                     Body=json.dumps(meta, indent=2).encode(),
                     ContentType="application/json",
                 )
-                log.info("Promoted to active weights: s3://%s/%s", bucket, cfg.GBM_WEIGHTS_KEY)
+
                 promoted = True
             else:
                 reason = "walk-forward" if (wf_result and not wf_result.get("fallback")) else "single-split IC"
@@ -724,6 +871,11 @@ def run_gbm_training(
         "best_iteration":        scorer._best_iteration,
         "val_ic":                round(float(scorer._val_ic), 6),
         "test_ic":               round(float(test_ic), 6),
+        "mse_ic":                round(float(mse_ic), 6),
+        "rank_ic":               round(float(rank_ic), 6) if rank_scorer is not None else None,
+        "ensemble_ic":           round(float(ensemble_ic), 6) if rank_scorer is not None else None,
+        "ensemble_enabled":      rank_scorer is not None,
+        "promoted_mode":         best_mode if promoted else None,
         "test_ic_p":             0.0,  # p-value omitted (numpy-only path)
         "ic_ir":                 round(ic_ir, 4),
         "ic_positive_20":        int((chunk_ics > 0).sum()),
@@ -737,11 +889,64 @@ def run_gbm_training(
         "feature_importance_top10": [
             {"feature": f, "gain": round(s, 2)} for f, s in top10
         ],
+        "feature_importance_shap_top10": [
+            {"feature": f, "shap": round(s, 4)} for f, s in
+            sorted(shap_importance.items(), key=lambda x: -x[1])[:10]
+        ] if shap_importance else [],
     }
 
     # Attach walk-forward detail for email reporting
     if wf_result and not wf_result.get("fallback"):
         result["walk_forward"] = wf_result
+
+    # ── SHAP history: store dated SHAP and compute drift ──────────────────
+    if shap_importance and not dry_run:
+        try:
+            import boto3
+            s3_shap = boto3.client("s3")
+
+            # Write current SHAP to dated S3 key
+            shap_key = f"predictor/metrics/shap_{date_str}.json"
+            s3_shap.put_object(
+                Bucket=bucket,
+                Key=shap_key,
+                Body=json.dumps(shap_importance, indent=2).encode(),
+                ContentType="application/json",
+            )
+            log.info("SHAP importance saved to s3://%s/%s", bucket, shap_key)
+
+            # Load previous week's SHAP for drift detection
+            from datetime import timedelta
+            prev_date = datetime.strptime(date_str, "%Y-%m-%d") - timedelta(days=7)
+            prev_key = f"predictor/metrics/shap_{prev_date.strftime('%Y-%m-%d')}.json"
+            try:
+                prev_obj = s3_shap.get_object(Bucket=bucket, Key=prev_key)
+                prev_shap = json.loads(prev_obj["Body"].read().decode())
+
+                # Compute Spearman rank correlation between current and previous SHAP
+                common_features = [f for f in cfg.GBM_FEATURES
+                                   if f in shap_importance and f in prev_shap]
+                if len(common_features) >= 5:
+                    from scipy.stats import spearmanr
+                    curr_vals = [shap_importance[f] for f in common_features]
+                    prev_vals = [prev_shap[f] for f in common_features]
+                    rho, _ = spearmanr(curr_vals, prev_vals)
+                    rho = round(float(rho), 4)
+                    result["shap_rank_stability"] = rho
+                    log.info("SHAP rank stability (Spearman): %.4f", rho)
+                    if rho < 0.80:
+                        log.warning(
+                            "SHAP feature drift detected: rank correlation %.4f < 0.80",
+                            rho,
+                        )
+                else:
+                    log.info("Not enough common features for SHAP drift (%d)", len(common_features))
+            except s3_shap.exceptions.NoSuchKey:
+                log.info("No previous SHAP found at %s — skipping drift check", prev_key)
+            except Exception as e:
+                log.warning("SHAP drift check failed (non-blocking): %s", e)
+        except Exception as e:
+            log.warning("SHAP history storage failed (non-blocking): %s", e)
 
     return result
 
@@ -763,9 +968,14 @@ def send_training_email(result: dict, date_str: str) -> bool:
         return False
 
     promoted     = result.get("promoted", False)
+    promoted_mode = result.get("promoted_mode")
     passes_ic    = result.get("passes_ic_gate", False)
     val_ic       = result.get("val_ic", 0.0)
     test_ic      = result.get("test_ic", 0.0)
+    mse_ic       = result.get("mse_ic", test_ic)
+    rank_ic      = result.get("rank_ic")
+    ensemble_ic  = result.get("ensemble_ic")
+    ensemble_on  = result.get("ensemble_enabled", False)
     ic_ir        = result.get("ic_ir", 0.0)
     version      = result.get("model_version", "unknown")
     elapsed_s    = result.get("elapsed_s", 0)
@@ -776,7 +986,10 @@ def send_training_email(result: dict, date_str: str) -> bool:
     ic_color    = "#2e7d32" if passes_ic else "#c62828"
     ic_label    = "PASS ✓" if passes_ic else "FAIL ✗"
     promo_color = "#2e7d32" if promoted else "#c62828"
-    promo_label = "Promoted → gbm_latest ✓" if promoted else "NOT promoted (IC gate failed ✗)"
+    promo_label = (
+        f"Promoted → gbm_latest ({promoted_mode}) ✓"
+        if promoted else "NOT promoted (IC gate failed ✗)"
+    )
     status_str  = "PASS" if passes_ic else "FAIL"
 
     subject = (
@@ -845,6 +1058,70 @@ def send_training_email(result: dict, date_str: str) -> bool:
             + "\n"
         )
 
+    # ── SHAP vs Gain comparison section ──────────────────────────────────────
+    shap_top10    = result.get("feature_importance_shap_top10", [])
+    shap_stability = result.get("shap_rank_stability")
+
+    shap_html = ""
+    shap_plain = ""
+    if shap_top10 and top10:
+        # Build rank lookup: feature → rank (1-based)
+        gain_rank = {r["feature"]: i + 1 for i, r in enumerate(top10)}
+        shap_rank = {r["feature"]: i + 1 for i, r in enumerate(shap_top10)}
+        all_features = list(dict.fromkeys(
+            [r["feature"] for r in top10] + [r["feature"] for r in shap_top10]
+        ))
+
+        comparison_rows = ""
+        comparison_plain_lines = []
+        for feat in all_features[:10]:
+            g_rank = gain_rank.get(feat, "-")
+            s_rank = shap_rank.get(feat, "-")
+            divergence = ""
+            if isinstance(g_rank, int) and isinstance(s_rank, int):
+                diff = abs(g_rank - s_rank)
+                if diff > 3:
+                    divergence = f' style="color:#c62828; font-weight:bold;"'
+            comparison_rows += (
+                f'<tr>'
+                f'<td style="padding:2px 8px; font-family:monospace; font-size:12px;">{feat}</td>'
+                f'<td style="padding:2px 8px; font-family:monospace; font-size:12px; text-align:center;">{g_rank}</td>'
+                f'<td style="padding:2px 8px; font-family:monospace; font-size:12px; text-align:center;"'
+                f'{divergence}>{s_rank}</td>'
+                f'</tr>'
+            )
+            flag = " ***" if isinstance(g_rank, int) and isinstance(s_rank, int) and abs(g_rank - s_rank) > 3 else ""
+            comparison_plain_lines.append(f"  {feat:<22} Gain:{g_rank}  SHAP:{s_rank}{flag}")
+
+        stability_note = ""
+        stability_plain = ""
+        if shap_stability is not None:
+            stab_color = "#2e7d32" if shap_stability >= 0.80 else "#c62828"
+            stab_label = "stable" if shap_stability >= 0.80 else "DRIFT WARNING"
+            stability_note = (
+                f'<p style="font-size:12px; margin:4px 0;">SHAP rank stability (vs last week): '
+                f'<b style="color:{stab_color};">rho={shap_stability:.4f} — {stab_label}</b></p>'
+            )
+            stability_plain = f"\nSHAP rank stability: rho={shap_stability:.4f} — {stab_label}"
+
+        shap_html = (
+            f'<h3 style="margin-top:16px; margin-bottom:4px;">Feature Importance: Gain vs SHAP</h3>'
+            f'{stability_note}'
+            f'<table style="border-collapse:collapse; font-size:11px;">'
+            f'<tr style="background:#e0e0e0;">'
+            f'<th style="padding:3px 8px;">Feature</th>'
+            f'<th style="padding:3px 8px;">Gain Rank</th>'
+            f'<th style="padding:3px 8px;">SHAP Rank</th></tr>'
+            f'{comparison_rows}</table>'
+            f'<p style="font-size:10px; color:#888;">Features with rank divergence &gt;3 highlighted in red.</p>'
+        )
+        shap_plain = (
+            "\n--- Gain vs SHAP Rank ---"
+            + stability_plain
+            + "\n" + "\n".join(comparison_plain_lines)
+            + "\n  (*** = rank divergence > 3)\n"
+        )
+
     html_body = (
         f'<html><body style="font-family:sans-serif; font-size:13px; color:#222; max-width:600px;">'
         f'<h2 style="margin-bottom:4px;">GBM Weekly Retrain — {date_str}</h2>'
@@ -859,10 +1136,28 @@ def send_training_email(result: dict, date_str: str) -> bool:
         f'  <td style="padding:5px 10px; font-family:monospace; font-weight:bold;">{val_ic:.4f}</td>'
         f'</tr>'
         f'<tr>'
-        f'  <td style="padding:5px 10px; color:#555;">Test IC</td>'
-        f'  <td style="padding:5px 10px; font-family:monospace; font-weight:bold; color:{ic_color};">'
-        f'  {test_ic:.4f} — {ic_label}</td>'
+        f'  <td style="padding:5px 10px; color:#555;">MSE Model IC</td>'
+        f'  <td style="padding:5px 10px; font-family:monospace; font-weight:bold;">{mse_ic:.4f}'
+        f'{"  ✓" if promoted_mode == "mse" else ""}</td>'
         f'</tr>'
+        + (
+            f'<tr style="background:#f9f9f9;">'
+            f'  <td style="padding:5px 10px; color:#555;">Lambdarank Model IC</td>'
+            f'  <td style="padding:5px 10px; font-family:monospace; font-weight:bold;">{rank_ic:.4f}'
+            f'{"  ✓" if promoted_mode == "rank" else ""}</td>'
+            f'</tr>'
+            f'<tr>'
+            f'  <td style="padding:5px 10px; color:#555;">Ensemble IC</td>'
+            f'  <td style="padding:5px 10px; font-family:monospace; font-weight:bold; color:{ic_color};">'
+            f'  {ensemble_ic:.4f} — {ic_label}{"  ✓" if promoted_mode == "ensemble" else ""}</td>'
+            f'</tr>'
+            if ensemble_on and rank_ic is not None and ensemble_ic is not None else
+            f'<tr>'
+            f'  <td style="padding:5px 10px; color:#555;">Test IC</td>'
+            f'  <td style="padding:5px 10px; font-family:monospace; font-weight:bold; color:{ic_color};">'
+            f'  {test_ic:.4f} — {ic_label}</td>'
+            f'</tr>'
+        ) +
         f'<tr style="background:#f9f9f9;">'
         f'  <td style="padding:5px 10px; color:#555;">IC IR</td>'
         f'  <td style="padding:5px 10px; font-family:monospace;">'
@@ -883,21 +1178,34 @@ def send_training_email(result: dict, date_str: str) -> bool:
         f'<h3 style="margin-bottom:4px;">Top 5 Features by Gain</h3>'
         f'<table>{feat_rows}</table>'
 
+        f'{shap_html}'
+
         f'<p style="font-size:11px; color:#aaa; margin-top:20px;">'
         f'IC gate: ≥{cfg.MIN_IC:.2f} to promote &nbsp;|&nbsp; IC IR gate: ≥{cfg.GBM_IC_IR_GATE:.2f}</p>'
         f'</body></html>'
     )
 
+    _mse_mark  = " ✓" if promoted_mode == "mse" else ""
+    _rank_mark = " ✓" if promoted_mode == "rank" else ""
+    _ens_mark  = " ✓" if promoted_mode == "ensemble" else ""
     plain_body = (
         f"GBM Weekly Retrain — {date_str}\n"
         f"Model: {version}  Samples: {n_train:,}  Elapsed: {elapsed_s:.0f}s\n"
-        f"\nVal IC:    {val_ic:.4f}"
-        f"\nTest IC:   {test_ic:.4f} — {ic_label}"
-        f"\nIC IR:     {ic_ir:.3f}"
-        f"\nIC pos:    {ic_pos}/20"
-        f"\nPromotion: {promo_label}\n"
+        f"\nVal IC:             {val_ic:.4f}"
+        f"\nMSE Model IC:       {mse_ic:.4f}{_mse_mark}"
+        + (
+            f"\nLambdarank Model IC: {rank_ic:.4f}{_rank_mark}"
+            f"\nEnsemble IC:        {ensemble_ic:.4f} — {ic_label}{_ens_mark}"
+            if ensemble_on and rank_ic is not None and ensemble_ic is not None else
+            f"\nTest IC:            {test_ic:.4f} — {ic_label}"
+        ) +
+        f"\nPromoted:           {promoted_mode if promoted else 'none'}"
+        f"\nIC IR:              {ic_ir:.3f}"
+        f"\nIC pos:             {ic_pos}/20"
+        f"\nPromotion:          {promo_label}\n"
         f"{wf_plain}"
-        f"\nTop features: " + ", ".join(r["feature"] for r in top10[:5]) + "\n"
+        f"\nTop features: " + ", ".join(r["feature"] for r in top10[:5])
+        + f"\n{shap_plain}\n"
     )
 
     app_password = os.environ.get("GMAIL_APP_PASSWORD", "").strip()
@@ -967,6 +1275,14 @@ def main(
     if date_str is None:
         date_str = datetime.now().strftime("%Y-%m-%d")
 
+    fd = None
+    try:
+        import flow_doctor
+        fd = flow_doctor.init(config_path=os.path.join(
+            str(Path(__file__).resolve().parent.parent), "flow-doctor-training.yaml"))
+    except Exception:
+        pass
+
     log.info("GBM training run: date=%s  bucket=%s  dry_run=%s", date_str, bucket, dry_run)
 
     # Step 1: Download price cache (Parquets + sector_map.json)
@@ -988,6 +1304,7 @@ def main(
         bucket=bucket,
         prefix="predictor/price_cache/",
         local_dir=tmp_cache,
+        fd=fd,
     )
     log.info("Price cache refresh: %d tickers updated", n_refreshed)
 
@@ -1007,6 +1324,7 @@ def main(
         n_slim = write_slim_cache(
             bucket=bucket,
             full_cache_dir=tmp_cache,
+            fd=fd,
         )
         log.info("Slim cache written: %d tickers", n_slim)
         result["slim_cache_tickers"] = n_slim

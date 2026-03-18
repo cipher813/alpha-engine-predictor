@@ -39,6 +39,13 @@ MODEL_WEIGHTS_DATED_KEY = "predictor/weights/{date}.pt"
 GBM_WEIGHTS_KEY      = "predictor/weights/gbm_latest.txt"
 GBM_WEIGHTS_META_KEY = "predictor/weights/gbm_latest.txt.meta.json"
 
+# Ensemble model weights (MSE + lambdarank)
+GBM_MSE_WEIGHTS_KEY       = "predictor/weights/gbm_mse_latest.txt"
+GBM_MSE_WEIGHTS_META_KEY  = "predictor/weights/gbm_mse_latest.txt.meta.json"
+GBM_RANK_WEIGHTS_KEY      = "predictor/weights/gbm_rank_latest.txt"
+GBM_RANK_WEIGHTS_META_KEY = "predictor/weights/gbm_rank_latest.txt.meta.json"
+GBM_MODE_KEY              = "predictor/weights/gbm_mode.json"
+
 PREDICTIONS_KEY = "predictor/predictions/{date}.json"
 PREDICTIONS_LATEST_KEY = "predictor/predictions/latest.json"
 
@@ -88,8 +95,16 @@ FEATURES = [
     "sector_x_trend",
     "atr_x_vix",
     "vol_trend_x_vix",
+    # v2.0 additions — alternative data signals (O10-O12)
+    "earnings_surprise_pct",    # O10: PEAD — magnitude of most recent quarterly surprise
+    "days_since_earnings",      # O10: PEAD — recency of last earnings (0-1, capped at 90d)
+    "eps_revision_4w",          # O11: 4-week cumulative EPS revision percentage
+    "revision_streak",          # O11: consecutive weeks of same-direction revisions
+    "put_call_ratio",           # O12: log-transformed put/call OI ratio
+    "iv_rank",                  # O12: IV percentile rank (0-1)
+    "iv_vs_rv",                 # O12: implied vol / realized vol ratio
 ]
-N_FEATURES = 34
+N_FEATURES = 41
 N_CLASSES = 3  # UP, FLAT, DOWN
 
 # Macro features — identical across all tickers on a given day, cannot predict
@@ -97,7 +112,7 @@ N_CLASSES = 3  # UP, FLAT, DOWN
 # FEATURES for other callers (Research module, backtester technical scoring).
 MACRO_FEATURES = {"vix_level", "yield_10y", "yield_curve_slope", "gold_mom_5d", "oil_mom_5d"}
 GBM_FEATURES = [f for f in FEATURES if f not in MACRO_FEATURES]
-N_GBM_FEATURES = len(GBM_FEATURES)  # 24
+N_GBM_FEATURES = len(GBM_FEATURES)  # 36 (29 original + 7 alternative data)
 
 # Class labels — index matches model output neuron order
 CLASS_LABELS = ["DOWN", "FLAT", "UP"]  # index 0, 1, 2
@@ -138,6 +153,7 @@ GBM_N_ESTIMATORS = _gbm_cfg["n_estimators"]
 GBM_EARLY_STOPPING_ROUNDS = _gbm_cfg["early_stopping_rounds"]
 GBM_IC_IR_GATE = _gbm_cfg["ic_ir_gate"]
 GBM_TUNED_PARAMS = _gbm_cfg["tuned_params"]
+GBM_ENSEMBLE_LAMBDARANK = _gbm_cfg.get("ensemble_lambdarank", True)
 
 # ── Production gates ─────────────────────────────────────────────────────────
 _gates_cfg = _cfg["gates"]

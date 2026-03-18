@@ -208,11 +208,11 @@ Tests cover feature engineering, model forward pass, checkpoint loading, and pre
 
 ### Model Architecture
 
-1. **3-model stacking ensemble** — the single LightGBM model leaves 10-15% IC improvement on the table. Literature shows LightGBM + XGBoost + CatBoost with a linear meta-learner consistently outperforms any single model on tabular financial data. Implementation: train all three on the same features/labels, combine with a ridge regression meta-learner optimized on IC.
+1. **3-model stacking ensemble** — add XGBoost and CatBoost alongside LightGBM, combined with a ridge regression meta-learner optimized on IC. Literature shows +10-15% accuracy on tabular financial data, but that estimate assumes a single-model baseline. With the current MSE + lambdarank ensemble already capturing objective-level diversity, the marginal gain from additional tree libraries is uncertain. Additionally, training 4 models + SHAP may approach Lambda's 15-minute timeout. **Deferred** — revisit if the temporal ensemble (item 2) doesn't close the accuracy gap, or if training moves to EC2 where compute budget is less constrained. Implementation would follow the same `GBMScorer` interface pattern with `XGBScorer` and `CatBoostScorer` wrappers feeding into an `EnsembleScorer` ridge meta-learner.
 
-2. **Temporal ensemble** — currently only predicts 5-day returns. Training on 3, 5, 7, and 10-day horizons and blending predictions captures multi-horizon alpha and reduces label noise sensitivity. Implementation: train separate GBM models per horizon, blend with learned weights.
+2. **Temporal ensemble** — currently only predicts 5-day returns. Training on 3, 5, 7, and 10-day horizons and blending predictions captures multi-horizon alpha and reduces label noise sensitivity. Implementation: train separate GBM models per horizon, blend with learned weights. This likely adds more value than model-library diversity (item 1) because different horizons capture genuinely different market dynamics.
 
-3. **Ranking loss (lambdarank)** — the current MSE objective + IC promotion gate design is sound, but directly optimizing ranking via `objective='lambdarank'` could improve IC by 5-10%. Low-risk experiment: train both and compare IC on the same walk-forward folds.
+3. ~~**Ranking loss (lambdarank)**~~ — **Implemented 2026-03-17.** Both MSE and lambdarank LightGBM models train weekly. The system evaluates MSE IC, lambdarank IC, and ensemble IC (rank-normalized average), then promotes whichever achieves the highest IC. Inference reads `gbm_mode.json` from S3 to determine which mode to load. Config: `ensemble_lambdarank: true` (default).
 
 4. **Inactive MLP alternative** — `model/predictor.py` contains a DirectionPredictor MLP (v1.2.0) that could be activated as an ensemble member. Requires minimal integration work since the interface already exists.
 
@@ -239,7 +239,7 @@ Key cross-asset opportunities:
 
 2. **No automated feature selection** — features are manually curated across 5 generations. Automated pruning based on incremental IC contribution (e.g., forward feature selection or SHAP-based importance with a minimum threshold) would identify dead features.
 
-3. **SHAP feature importance monitoring** — top 10 features are logged in training emails but there's no week-over-week comparison or alerting when feature rankings shift dramatically. Adding TreeExplainer to the weekly retrain would provide stable, unbiased importance scores.
+3. ~~**SHAP feature importance monitoring**~~ — **Implemented 2026-03-17.** Weekly training computes SHAP TreeExplainer values (capped at 500 test rows), writes `shap_{date}.json` to S3, and includes a gain-vs-SHAP rank comparison table in the training email. Week-over-week Spearman rank correlation detects feature drift (warning threshold: 0.80).
 
 ### Label Construction
 

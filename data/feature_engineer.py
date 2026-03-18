@@ -4,8 +4,12 @@ data/feature_engineer.py — Rolling technical feature computation.
 Mirrors compute_technical_indicators() from alpha-engine-research exactly,
 but operates on a full OHLCV DataFrame (rolling window per row) rather than
 returning a single snapshot dict. Every row in the output has a complete
-29-feature vector. Rows lacking sufficient price history for any indicator
+feature vector. Rows lacking sufficient price history for any indicator
 are dropped after all features are computed.
+
+Feature groups:
+  v1.0-v1.5: 34 price/volume/macro features (29 core + 5 regime interactions)
+  v2.0 (O10-O12): 7 alternative data features (earnings, revisions, options)
 
 Feature list (must stay in sync with config.FEATURES):
     rsi_14              RSI(14), range 0–100
@@ -37,6 +41,15 @@ Feature list (must stay in sync with config.FEATURES):
     obv_slope_10d       (OBV_fast - OBV_slow) / SMA(vol,20) (accumulation) [v1.4]
     rsi_slope_5d        (RSI - RSI.shift(5)) / 5 (RSI momentum)            [v1.4]
     volume_price_div    sign(volume_trend-1) * sign(momentum_5d)            [v1.4]
+
+  v2.0 — Alternative data features (O10-O12):
+    earnings_surprise_pct  most recent quarterly EPS surprise %               [O10]
+    days_since_earnings    days since last earnings (0-1, capped 90d)         [O10]
+    eps_revision_4w        4-week cumulative EPS revision %                   [O11]
+    revision_streak        consecutive weeks same-direction revisions         [O11]
+    put_call_ratio         log-transformed put/call OI ratio                  [O12]
+    iv_rank                IV percentile rank (0-1)                           [O12]
+    iv_vs_rv               implied vol / realized vol ratio                   [O12]
 
 RSI uses EWM with com=13 (equiv. to Wilder's 14-period smoothing), identical
 to the research pipeline.
@@ -141,6 +154,9 @@ def compute_features(
     irx_series: pd.Series | None = None,
     gld_series: pd.Series | None = None,
     uso_series: pd.Series | None = None,
+    earnings_data: dict | None = None,
+    revision_data: dict | None = None,
+    options_data: dict | None = None,
 ) -> pd.DataFrame:
     """
     Compute all 29 technical and macro features for a full OHLCV DataFrame.
@@ -172,11 +188,20 @@ def compute_features(
     uso_series : pd.Series or None
         USO (Oil ETF) Close prices with a DatetimeIndex. Used for
         oil_mom_5d. Defaults to 0.0 when None.
+    earnings_data : dict or None
+        Per-ticker earnings data with keys: surprise_pct, days_since_earnings.
+        Used for O10 PEAD features. Defaults to neutral when None.
+    revision_data : dict or None
+        Per-ticker revision data with keys: eps_revision_4w, revision_streak.
+        Used for O11 revision features. Defaults to neutral when None.
+    options_data : dict or None
+        Per-ticker options data with keys: put_call_ratio, iv_rank, atm_iv.
+        Used for O12 options features. Defaults to neutral when None.
 
     Returns
     -------
     pd.DataFrame
-        Original columns plus the 29 feature columns. Rows without
+        Original columns plus the 34+7=41 feature columns. Rows without
         sufficient history for any feature are dropped.
 
     Notes
@@ -473,6 +498,44 @@ def compute_features(
     # volume surge × VIX: distinguishes institutional accumulation in calm
     # markets from panic liquidation in fearful markets.
     df["vol_trend_x_vix"] = (df["volume_trend"] - 1.0) * vix_regime
+
+    # ── v2.0 features — alternative data signals (O10-O12) ────────────────────
+    # These features come from external data sources (FMP, yfinance options)
+    # rather than price/volume data. They are passed in as scalar values per
+    # ticker and broadcast across all rows (constant within a ticker's series).
+
+    # O10: PEAD — earnings surprise magnitude and recency
+    if earnings_data:
+        df["earnings_surprise_pct"] = float(earnings_data.get("surprise_pct", 0.0))
+        days_since = float(earnings_data.get("days_since_earnings", 90))
+        df["days_since_earnings"] = days_since / 90.0  # normalize to [0, 1]
+    else:
+        df["earnings_surprise_pct"] = 0.0
+        df["days_since_earnings"] = 1.0  # 90/90 = no recent earnings
+
+    # O11: EPS revision momentum
+    if revision_data:
+        df["eps_revision_4w"] = float(revision_data.get("eps_revision_4w", 0.0))
+        df["revision_streak"] = float(revision_data.get("revision_streak", 0))
+    else:
+        df["eps_revision_4w"] = 0.0
+        df["revision_streak"] = 0.0
+
+    # O12: Options-derived signals
+    if options_data:
+        df["put_call_ratio"] = float(options_data.get("put_call_ratio", 0.0))
+        df["iv_rank"] = float(options_data.get("iv_rank", 0.5))
+        # IV vs realized vol ratio
+        atm_iv = float(options_data.get("atm_iv", 0.0))
+        realized_vol = df["realized_vol_20d"].iloc[-1] if "realized_vol_20d" in df.columns else 0.0
+        if realized_vol > 0 and atm_iv > 0:
+            df["iv_vs_rv"] = atm_iv / realized_vol
+        else:
+            df["iv_vs_rv"] = 1.0  # neutral
+    else:
+        df["put_call_ratio"] = 0.0   # log(1.0) = 0
+        df["iv_rank"] = 0.5          # 50th percentile
+        df["iv_vs_rv"] = 1.0         # neutral
 
     # ── Drop rows with any NaN in the feature columns ─────────────────────────
     from config import FEATURES as feature_cols
