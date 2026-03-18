@@ -1238,7 +1238,11 @@ def predict_ticker_gbm(
         confidence = p_down
     else:
         predicted_direction = "FLAT"
-        confidence = 1.0 - abs(p_up - p_down)
+        # How far from the nearest threshold (0 at boundary, 1 at dead center)
+        up_t = cfg.UP_THRESHOLD if cfg.UP_THRESHOLD else 0.01
+        dist_from_boundary = min(abs(s - up_t), abs(s - cfg.DOWN_THRESHOLD))
+        max_dist = abs(up_t)  # max possible distance from boundary within FLAT zone
+        confidence = float(np.clip(dist_from_boundary / max_dist, 0.0, 1.0)) if max_dist > 0 else 0.5
 
     return {
         "ticker":                ticker,
@@ -2061,7 +2065,10 @@ def main(
                     confidence = p_down
                 else:
                     predicted_direction = "FLAT"
-                    confidence = 1.0 - abs(p_up - p_down)
+                    up_t = cfg.UP_THRESHOLD if cfg.UP_THRESHOLD else 0.01
+                    dist_from_boundary = min(abs(s - up_t), abs(s - cfg.DOWN_THRESHOLD))
+                    max_dist = abs(up_t)
+                    confidence = float(np.clip(dist_from_boundary / max_dist, 0.0, 1.0)) if max_dist > 0 else 0.5
                 result = {
                     "ticker":                ticker,
                     "predicted_direction":   predicted_direction,
