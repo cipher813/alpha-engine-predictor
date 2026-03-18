@@ -1,0 +1,15 @@
+# Local price cache (fetched from S3 at runtime)
+data/cache/
+
+# Dev/build artifacts
+.venv/
+.git/
+.claude/
+__pycache__/
+*.pyc
+*.egg-info/
+analysis/
+checkpoints/
+*.md
+.env
+.env.*

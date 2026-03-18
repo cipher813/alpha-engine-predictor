@@ -16,6 +16,9 @@
 
 FROM public.ecr.aws/lambda/python:3.12
 
+# Install libgomp (OpenMP runtime required by LightGBM).
+RUN dnf install -y libgomp && dnf clean all
+
 # Copy and install Python requirements first for better layer caching.
 COPY requirements-lambda.txt .
 
