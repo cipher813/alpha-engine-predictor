@@ -1940,9 +1940,14 @@ def main(
         log.warning("O11: Revision data fetch failed (features will use defaults): %s", exc)
 
     try:
-        from data.options_fetcher import fetch_options_features
-        _options_all = fetch_options_features(tickers, reference_date=date_str)
-        log.info("O12: Fetched options features for %d tickers", len(_options_all))
+        from data.options_fetcher import load_historical_options, fetch_options_features
+        # Try Research S3 cache first (saves ~50s of yfinance calls)
+        _options_all = load_historical_options(date_str, bucket) or {}
+        if _options_all:
+            log.info("O12: Loaded cached options for %d tickers from S3", len(_options_all))
+        else:
+            _options_all = fetch_options_features(tickers, reference_date=date_str)
+            log.info("O12: Fetched options features for %d tickers via yfinance", len(_options_all))
     except Exception as exc:
         log.warning("O12: Options features fetch failed (features will use defaults): %s", exc)
 

@@ -874,6 +874,46 @@ def run_gbm_training(
                 )
                 log.info("Wrote gbm_mode.json: mode=%s", best_mode)
 
+                # ── Append to mode_history.json on S3 ────────────────────
+                try:
+                    MODE_HISTORY_KEY = "predictor/metrics/mode_history.json"
+                    try:
+                        hist_obj = s3.get_object(Bucket=bucket, Key=MODE_HISTORY_KEY)
+                        mode_history = json.loads(hist_obj["Body"].read())
+                        if not isinstance(mode_history, list):
+                            mode_history = []
+                    except Exception:
+                        mode_history = []
+
+                    mode_history_entry = {
+                        "date": date_str,
+                        "mse_ic": round(float(mse_ic), 6),
+                        "rank_ic": round(float(rank_ic), 6) if rank_scorer is not None else None,
+                        "ensemble_ic": round(float(ensemble_ic), 6) if rank_scorer is not None else None,
+                        "best_mode": best_mode,
+                        "promoted": True,
+                        "ic_delta_rank_vs_mse": round(float(rank_ic - mse_ic), 6) if rank_scorer is not None else None,
+                        "ic_delta_ens_vs_mse": round(float(ensemble_ic - mse_ic), 6) if rank_scorer is not None else None,
+                        "n_train": int(len(y_train)),
+                        "ic_ir": round(ic_ir, 4),
+                    }
+
+                    # Deduplicate by date (replace if same date already exists)
+                    mode_history = [e for e in mode_history if e.get("date") != date_str]
+                    mode_history.append(mode_history_entry)
+                    # Cap at 52 entries (1 year of weekly runs)
+                    mode_history = mode_history[-52:]
+
+                    s3.put_object(
+                        Bucket=bucket,
+                        Key=MODE_HISTORY_KEY,
+                        Body=json.dumps(mode_history, indent=2).encode(),
+                        ContentType="application/json",
+                    )
+                    log.info("Appended mode history entry for %s (mode=%s)", date_str, best_mode)
+                except Exception as e:
+                    log.warning("Failed to update mode_history.json: %s", e)
+
                 meta = {
                     "model_version":  model_version,
                     "val_ic":         round(float(scorer._val_ic), 6),
