@@ -101,29 +101,97 @@ All tests run without network access or AWS credentials.
 
 ## How Training Works
 
-1. **Data**: Multi-year OHLCV parquets (one per ticker, plus SPY, VIX, sector ETFs)
-2. **Features**: Rolling technical + macro indicators per row (warmup period required for long-window features)
-3. **Labels (sector-neutral)**: Forward return relative to the ticker's sector ETF, isolating stock-specific alpha as the training target
-4. **Objective**: LightGBM regression (MSE), evaluated on Pearson IC
-5. **Split**: Time-based (configurable ratios); test set = most recent dates
-6. **Early stopping**: Validation IC monitored; feature importance logged
-7. **Production gate**: Minimum IC required before uploading weights to S3
+Training runs **weekly on Monday** via Lambda. The GBM learns to predict 5-day sector-relative returns from historical price data.
 
-An MLP (PyTorch) model is also available but not running in production. Activate by setting `model_type="mlp"` in `handler.py`.
+1. **Data**: Multi-year OHLCV parquets (one per ticker, plus SPY, VIX, sector ETFs, treasuries, gold, oil)
+2. **Features**: 36 rolling technical, macro-interaction, and alternative data indicators computed per row (252-row warmup for 52-week rolling windows)
+3. **Labels (sector-neutral)**: `alpha = stock_5d_return - sector_ETF_5d_return`, isolating stock-specific alpha from sector/market moves
+4. **Objective**: LightGBM regression (MSE) on continuous alpha, evaluated on Pearson IC. An ensemble mode also trains a lambdarank model and promotes whichever achieves higher IC.
+5. **Walk-forward validation**: Expanding window with 5-day purge gap to prevent label leakage; model promoted only if median IC > 0.01 across 60%+ of folds
+6. **Production gate**: Minimum IC required before uploading weights to S3
+
+The trained model weights are frozen until the next Monday retrain. Inference between retrains uses the same weights but with fresh daily price data (see below).
+
+An MLP (PyTorch) model is also available but not active. Activate by setting `model_type="mlp"` in `handler.py`.
 
 ---
 
 ## How Inference Works
 
+Inference runs **daily on weekdays** at 6:15 AM PT. Although the GBM weights are frozen (weekly retrain), predictions change every day because the input features are recomputed from fresh price data.
+
 1. EventBridge fires daily at 6:15 AM PT on weekdays
-2. GBM weights loaded from S3
-3. Watchlist read from latest `signals.json` — only Research-tracked tickers are predicted
-4. OHLCV fetched via yfinance (1-year window per ticker)
-5. Features computed; only the last row (today's snapshot) is used
+2. GBM weights loaded from S3 (same weights all week until Monday retrain)
+3. Watchlist read from latest population or `signals.json` — only Research-tracked tickers are predicted
+4. **Fresh OHLCV fetched via yfinance** (2-year window per ticker) — this is the new data each day
+5. **Features recomputed from scratch** — all 36 indicators (RSI, MACD, momentum, Bollinger bands, relative volume, etc.) shift daily as new price bars are incorporated
 6. GBM predicts continuous alpha → thresholded to UP/FLAT/DOWN + confidence
 7. Results written to `predictor/predictions/{date}.json` and `latest.json`
 
 Tickers with insufficient history for long-window features are skipped. Per-ticker failures do not abort the run.
+
+### Why predictions change daily without retraining
+
+The GBM model is a function: `features_in → alpha_out`. Training freezes the function (the tree structure and leaf values). But the features themselves are rolling calculations over price data, so they produce different values every day. For example:
+
+| Feature | What changes daily |
+|---------|-------------------|
+| `momentum_5d` | Last 5 trading days shift by one day |
+| `rsi_14` | New close changes the 14-day RSI value |
+| `return_vs_spy_5d` | Stock's relative performance vs SPY over the latest 5 days |
+| `bollinger_pct` | Price position within the 20-day Bollinger band |
+| `volume_trend` | 5-day vs 20-day average volume ratio |
+| `obv_slope_10d` | On-Balance Volume trend shifts with each new bar |
+
+A stock predicted UP on Monday could flip to DOWN on Tuesday if it drops sharply — RSI falls, momentum turns negative, it breaks below the Bollinger band. The model sees an entirely new feature vector each day.
+
+Each day's prediction asks: *"will this stock beat its sector ETF over the next 5 trading days starting today?"* — a rolling window that advances by one day per run. These are genuinely daily predictions, not weekly predictions reused.
+
+---
+
+## Direction Labels and the Veto Gate
+
+The GBM outputs a **continuous alpha score** (predicted 5-day sector-relative return). This raw score is the primary output. The UP/FLAT/DOWN labels are derived from it using configurable thresholds:
+
+- **UP**: alpha score > `up_threshold` (default: +0.001)
+- **DOWN**: alpha score < `down_threshold` (default: -0.001)
+- **FLAT**: alpha score between the two thresholds
+
+### How the Executor uses predictions
+
+The Executor treats UP and FLAT identically — both are eligible for entry. Only DOWN triggers the veto gate:
+
+| Direction | Executor behavior |
+|-----------|------------------|
+| **UP** | Eligible for ENTER (no restriction from predictor) |
+| **FLAT** | Eligible for ENTER (no restriction from predictor) |
+| **DOWN** + confidence >= veto threshold | **Vetoed** — ENTER demoted to HOLD |
+| **DOWN** + confidence < veto threshold | Eligible for ENTER (low-confidence DOWN ignored) |
+
+The veto threshold is regime-adaptive (lowered in bear/caution markets, raised in bull markets) and auto-tuned by the backtester.
+
+### Alpha score calibration
+
+The system trains two GBM models weekly and promotes whichever achieves the highest IC (information coefficient):
+
+- **MSE model**: trained with `objective: regression` on actual sector-relative 5-day returns. Its output is a calibrated return prediction (e.g., `+0.015` = "I predict this stock will beat its sector ETF by 1.5% over the next 5 days").
+- **Lambdarank model**: trained with `objective: lambdarank` optimizing NDCG. Produces better cross-sectional rankings but its output scale is arbitrary (not calibrated to returns).
+
+At inference, the MSE model's output is always used as `predicted_alpha` — the reported alpha score in predictions and emails. If the lambdarank or ensemble model wins the IC competition, it's used for ranking/direction decisions, but the alpha magnitude still comes from the MSE model. This ensures `predicted_alpha` always represents a genuine return estimate. Scores are clipped to `±LABEL_CLIP` (±25%) as a bound on extrapolation.
+
+### Direction thresholds
+
+The UP/FLAT/DOWN thresholds define what constitutes a meaningful predicted edge over a 5-day horizon:
+
+- **UP**: predicted sector-relative alpha > +2% (stock expected to meaningfully outperform)
+- **FLAT**: predicted alpha within ±2% (no clear directional edge)
+- **DOWN**: predicted sector-relative alpha < -2% (stock expected to meaningfully underperform)
+
+The ±2% band reflects a practical noise floor — within that range, the model's prediction is not distinguishable from zero with meaningful confidence. The Executor currently treats UP and FLAT identically (both eligible for entry), with only high-confidence DOWN predictions triggering the veto gate.
+
+### Rolling 5-day horizon
+
+Each daily prediction asks: *"will this stock beat its sector ETF over the next 5 trading days starting today?"* The 5-day window is the forecast horizon; the daily cadence is the refresh rate. Monday's prediction covers Mon→Fri. Tuesday's prediction covers Tue→next Mon. Each overlaps the previous by 4 days but incorporates the latest price action into its feature vector. This is analogous to a 5-day weather forecast issued every morning — the horizon stays fixed but the starting point advances daily with updated information.
 
 ---
 

@@ -24,8 +24,8 @@ training:
 # ── Label thresholds ──────────────────────────────────────────────────────────
 labeling:
   forward_days: 5                  # prediction horizon (trading days)
-  up_threshold: 0.001              # predicted alpha > 0.10% → UP (~1 std of GBM output)
-  down_threshold: -0.001           # predicted alpha < -0.10% → DOWN
+  up_threshold: 0.02               # predicted 5d sector-relative alpha > 2% → UP
+  down_threshold: -0.02            # predicted 5d sector-relative alpha < -2% → DOWN (±2% = FLAT)
   label_clip: 0.25                 # clip extreme returns (±25%), null to disable
   adaptive_thresholds: false       # use rolling percentile thresholds instead of fixed
   adaptive_window: 63              # rolling window for adaptive percentiles (~3 months)

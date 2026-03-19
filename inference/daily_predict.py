@@ -1223,9 +1223,14 @@ def predict_ticker_gbm(
         log.warning("GBM inference failed for %s: %s", ticker, exc)
         return None
 
+    # NOTE: This per-ticker path cannot rank-normalize across the cross-section.
+    # The batch path (main() → model_type=="gbm") should always be preferred.
+    # Clip to label range as a fallback bound.
+    max_r = getattr(cfg, "LABEL_CLIP", 0.15)
+    s = float(np.clip(s, -max_r, max_r))
+
     # Convert continuous alpha scalar → pseudo-probabilities for output compatibility.
     # Linear map over [-LABEL_CLIP, +LABEL_CLIP] → p_up ∈ [0, 1]; clamp outside range.
-    max_r = getattr(cfg, "LABEL_CLIP", 0.15)
     p_up   = float(np.clip(0.5 + s / (2.0 * max_r), 0.0, 1.0))
     p_down = float(np.clip(0.5 - s / (2.0 * max_r), 0.0, 1.0))
     p_flat = float(max(0.0, 1.0 - p_up - p_down))
@@ -1383,7 +1388,10 @@ def _build_predictor_email(
     val_ic        = metrics.get("ic_30d")        # 30-day information coefficient
     n_total       = len(predictions)
 
-    # Group by direction (predictions are pre-sorted descending p_up - p_down)
+    # Single list sorted by MSE predicted alpha (highest to lowest)
+    sorted_preds = sorted(predictions, key=lambda p: p.get("predicted_alpha", 0), reverse=True)
+
+    # Counts for subject line
     ups   = [p for p in predictions if p.get("predicted_direction") == "UP"]
     flats = [p for p in predictions if p.get("predicted_direction") == "FLAT"]
     downs = [p for p in predictions if p.get("predicted_direction") == "DOWN"]
@@ -1431,33 +1439,45 @@ def _build_predictor_email(
     TDR = 'style="padding:4px 8px; border:1px solid #ddd; text-align:right;"'
     TABLE = 'style="border-collapse:collapse; width:100%; font-family:monospace; font-size:12px;"'
 
-    def _html_rows(group: list[dict]) -> str:
-        if not group:
-            return '<tr><td colspan="4" style="padding:4px 8px; color:#888; font-style:italic;">none</td></tr>'
+    def _rank_str(p: dict, key: str = "model_rank") -> str:
+        r = p.get(key)
+        return f"{r}" if r is not None else "—"
+
+    def _dir_badge(p: dict) -> str:
+        d = p.get("predicted_direction", "")
+        is_veto = (d == "DOWN" and p.get("prediction_confidence", 0) >= _vt)
+        if is_veto:
+            return '<span style="color:#c62828; font-weight:bold;">⚠ VETO</span>'
+        colors = {"UP": "#2e7d32", "DOWN": "#c62828", "FLAT": "#888"}
+        return f'<span style="color:{colors.get(d, "#888")}; font-weight:bold;">{d}</span>'
+
+    def _html_prediction_table(preds: list[dict]) -> str:
+        if not preds:
+            return '<p style="color:#888; font-style:italic;">No predictions available.</p>'
         rows = []
-        for p in group:
-            is_veto = (
-                p.get("predicted_direction") == "DOWN"
-                and p.get("prediction_confidence", 0) >= _vt
-            )
-            veto_badge = ' <span style="color:#c62828; font-weight:bold;">⚠ VETO</span>' if is_veto else ""
+        for p in preds:
             rows.append(
                 f'<tr>'
-                f'<td {TD}><b>{p["ticker"]}{_source_tag(p)}</b>{veto_badge}</td>'
+                f'<td {TD}><b>{p["ticker"]}{_source_tag(p)}</b></td>'
                 f'<td {TDR}>{_alpha_str(p)}</td>'
-                f'<td {TDR}>{_conf_pct(p)}</td>'
+                f'<td {TDR}>{_rank_str(p, "mse_rank")}</td>'
+                f'<td {TDR}>{_rank_str(p, "model_rank")}</td>'
+                f'<td {TD} style="text-align:center;">{_dir_badge(p)}</td>'
                 f'<td {TD}>{p.get("watchlist_source", "—")}</td>'
                 f'</tr>'
             )
-        return "\n".join(rows)
-
-    def _html_section(title: str, color: str, group: list[dict]) -> str:
         return (
-            f'<h3 style="color:{color}; margin-bottom:4px;">{title} ({len(group)})</h3>'
             f'<table {TABLE}>'
-            f'<tr><th {TH}>Ticker</th><th {TH}>α score</th><th {TH}>Conf</th><th {TH}>Source</th></tr>'
-            f'{_html_rows(group)}'
-            f'</table>'
+            f'<tr>'
+            f'<th {TH}>Ticker</th>'
+            f'<th {TH}>α (MSE)</th>'
+            f'<th {TH}>MSE Rank</th>'
+            f'<th {TH}>LR Rank</th>'
+            f'<th {TH}>Signal</th>'
+            f'<th {TH}>Source</th>'
+            f'</tr>'
+            + "\n".join(rows)
+            + f'</table>'
         )
 
     veto_section_html = ""
@@ -1552,13 +1572,12 @@ def _build_predictor_email(
         f'<p style="color:#555; font-size:12px; margin-top:0;">'
         f'Model: <b>{model_version}</b> &nbsp;|&nbsp;'
         f'IC (val): <b>{ic_str}</b> &nbsp;|&nbsp;'
+        f'Mode: <b>{metrics.get("inference_mode", "mse")}</b> &nbsp;|&nbsp;'
         f'Universe: <b>{n_total}</b> tickers &nbsp;|&nbsp;'
         f'Run at <b>{run_time}</b></p>'
         f'{research_html}'
         f'<h3 style="font-size:13px; color:#333; margin-bottom:4px;">GBM Predictions</h3>'
-        f'{_html_section("↑ BULLISH", "#2e7d32", ups)}'
-        f'{_html_section("→ NEUTRAL", "#888888", flats)}'
-        f'{_html_section("↓ BEARISH", "#c62828", downs)}'
+        f'{_html_prediction_table(sorted_preds)}'
         f'{veto_section_html}'
         f'<p style="font-size:11px; color:#aaa; margin-top:24px;">'
         f'★ = buy_candidate from research signals.json &nbsp;|&nbsp;'
@@ -1567,18 +1586,20 @@ def _build_predictor_email(
     )
 
     # ── Plain text ────────────────────────────────────────────────────────────
-    def _plain_rows(group: list[dict]) -> str:
-        if not group:
+    def _plain_prediction_list(preds: list[dict]) -> str:
+        if not preds:
             return "  (none)\n"
         lines = []
-        for p in group:
+        for p in preds:
             veto = " [VETO]" if (
                 p.get("predicted_direction") == "DOWN"
                 and p.get("prediction_confidence", 0) >= _vt
             ) else ""
+            mse_r = _rank_str(p, "mse_rank")
+            lr_r = _rank_str(p, "model_rank")
             lines.append(
-                f"  {p['ticker']:<6}  α={_alpha_str(p):>7}  conf={_conf_pct(p)}"
-                f"  {p.get('watchlist_source', '—')}{_source_tag(p)}{veto}"
+                f"  {p['ticker']:<6}  α={_alpha_str(p):>7}  MSE#{mse_r:<3} LR#{lr_r:<3}"
+                f"  {p.get('predicted_direction','—'):<4}  {p.get('watchlist_source', '—')}{_source_tag(p)}{veto}"
             )
         return "\n".join(lines) + "\n"
 
@@ -1613,14 +1634,13 @@ def _build_predictor_email(
 
     plain_body = (
         f"Alpha Engine Brief — {date_str}\n"
-        f"Model: {model_version}  IC(val): {ic_str}  Universe: {n_total}  Run: {run_time}\n"
+        f"Model: {model_version}  IC(val): {ic_str}  Mode: {metrics.get('inference_mode', 'mse')}  Universe: {n_total}  Run: {run_time}\n"
         f"{research_plain}"
         f"\n{'='*60}\n"
         f"GBM PREDICTIONS\n"
         f"{'='*60}\n"
-        f"\nBULLISH ({len(ups)})\n{_plain_rows(ups)}"
-        f"\nNEUTRAL ({len(flats)})\n{_plain_rows(flats)}"
-        f"\nBEARISH ({len(downs)})\n{_plain_rows(downs)}"
+        f"\nPredictions (sorted by MSE α, {len(ups)} UP / {len(flats)} FLAT / {len(downs)} DOWN)\n"
+        f"{_plain_prediction_list(sorted_preds)}"
     )
     if vetoes:
         veto_tickers = ", ".join(p["ticker"] for p in vetoes)
@@ -1752,6 +1772,18 @@ def main(
         datefmt="%H:%M:%S",
     )
 
+    # Soft timeout: flush partial predictions if nearing Lambda hard limit
+    import time as _time
+    _start_ts = _time.monotonic()
+    _SOFT_TIMEOUT_S = int(os.environ.get("PREDICTOR_SOFT_TIMEOUT_S", "780"))  # 13 min default
+
+    def _near_timeout() -> bool:
+        elapsed = _time.monotonic() - _start_ts
+        if elapsed > _SOFT_TIMEOUT_S:
+            log.warning("Soft timeout reached (%.0fs / %ds)", elapsed, _SOFT_TIMEOUT_S)
+            return True
+        return False
+
     fd = None
     try:
         import flow_doctor
@@ -1800,42 +1832,46 @@ def main(
                     )
         log.info("Inference mode: %s", inference_mode)
 
-        # Load models based on inference mode
+        # Always load BOTH MSE and lambdarank models.
+        # - MSE model: calibrated 5d return prediction → predicted_alpha, direction, veto
+        # - Lambdarank model: cross-sectional ranking → model_rank column
+        # The promoted model (inference_mode) determines which one the executor
+        # relies on for the veto gate, but both outputs are shown side by side
+        # so we can compare their views over time.
+        mse_scorer = None
         rank_scorer = None
-        if inference_mode == "mse":
+
+        # Load MSE model
+        try:
             if local:
-                scorer = load_gbm_local("checkpoints/gbm_best.txt")
+                mse_scorer = load_gbm_local("checkpoints/gbm_best.txt")
             else:
-                scorer = load_gbm_s3(bucket, cfg.GBM_WEIGHTS_KEY)
-        elif inference_mode == "rank":
+                mse_scorer = load_gbm_s3(bucket, cfg.GBM_MSE_WEIGHTS_KEY)
+            log.info("MSE model loaded for alpha estimation")
+        except Exception as exc:
+            log.warning("MSE model not available: %s", exc)
+
+        # Load lambdarank model
+        try:
             if local:
-                scorer = load_gbm_local("checkpoints/gbm_rank_best.txt")
+                rank_scorer = load_gbm_local("checkpoints/gbm_rank_best.txt")
             else:
-                scorer = load_gbm_s3(bucket, cfg.GBM_WEIGHTS_KEY)
-        elif inference_mode == "ensemble":
-            if local:
-                scorer = load_gbm_local("checkpoints/gbm_best.txt")
-            else:
-                scorer = load_gbm_s3(bucket, cfg.GBM_MSE_WEIGHTS_KEY)
-            # Load lambdarank model for ensemble
-            try:
-                if local:
-                    rank_scorer = load_gbm_local("checkpoints/gbm_rank_best.txt")
-                else:
-                    rank_scorer = load_gbm_s3(bucket, cfg.GBM_RANK_WEIGHTS_KEY)
-                log.info("Lambdarank model loaded for ensemble inference")
-            except Exception as exc:
-                log.warning(
-                    "Lambdarank model not available — falling back to MSE-only: %s", exc
-                )
-                inference_mode = "mse"
+                rank_scorer = load_gbm_s3(bucket, cfg.GBM_RANK_WEIGHTS_KEY)
+            log.info("Lambdarank model loaded for ranking")
+        except Exception as exc:
+            log.warning("Lambdarank model not available: %s", exc)
+
+        # Primary scorer for model_version display — use the promoted model
+        if inference_mode == "rank" and rank_scorer is not None:
+            scorer = rank_scorer
+        elif inference_mode == "ensemble" and mse_scorer is not None:
+            scorer = mse_scorer
+        elif mse_scorer is not None:
+            scorer = mse_scorer
+        elif rank_scorer is not None:
+            scorer = rank_scorer
         else:
-            log.warning("Unknown inference mode '%s' — defaulting to mse", inference_mode)
-            inference_mode = "mse"
-            if local:
-                scorer = load_gbm_local("checkpoints/gbm_best.txt")
-            else:
-                scorer = load_gbm_s3(bucket, cfg.GBM_WEIGHTS_KEY)
+            raise RuntimeError("No GBM model available — both MSE and rank failed to load")
 
         model_version = f"GBM-v{scorer._best_iteration}"
         val_loss = scorer._val_ic   # IC is the GBM analogue of val_loss
@@ -1903,6 +1939,12 @@ def main(
         sector_etfs_needed = sorted({sector_map[t] for t in tickers if t in sector_map})
         macro = fetch_macro_series(extra_tickers=sector_etfs_needed)
 
+    # Soft timeout gate: if nearing limit, write whatever we have and exit
+    if _near_timeout():
+        log.warning("Soft timeout before sector ETF fetch — writing partial predictions")
+        write_predictions(predictions, date_str, bucket, {"model_version": "timeout"}, dry_run=dry_run, fd=fd)
+        return
+
     # Ensure all sector ETFs needed are present in macro (may be missing from
     # slim cache if a ticker's sector changed since the last bootstrap)
     sector_etfs_needed = sorted({sector_map[t] for t in tickers if t in sector_map})
@@ -1919,6 +1961,12 @@ def main(
     # adj_close = full (split + dividend) adjusted close; the ratio adj_close/close
     # captures the dividend factor and helps detect splits via sudden price jumps.
     save_daily_closes(tickers, date_str, bucket, dry_run=dry_run)
+
+    # Soft timeout gate
+    if _near_timeout():
+        log.warning("Soft timeout before alternative data fetch — writing partial predictions")
+        write_predictions(predictions, date_str, bucket, {"model_version": "timeout"}, dry_run=dry_run, fd=fd)
+        return
 
     # ── Step 3d: Fetch alternative data for O10-O12 features ─────────────────
     _earnings_all: dict[str, dict] = {}
@@ -1951,6 +1999,12 @@ def main(
     except Exception as exc:
         log.warning("O12: Options features fetch failed (features will use defaults): %s", exc)
 
+    # Soft timeout gate
+    if _near_timeout():
+        log.warning("Soft timeout before inference — writing partial predictions")
+        write_predictions(predictions, date_str, bucket, {"model_version": "timeout"}, dry_run=dry_run, fd=fd)
+        return
+
     # ── Step 4: Run inference ─────────────────────────────────────────────────
     predictions: list[dict] = []
     n_skipped = 0
@@ -1962,6 +2016,22 @@ def main(
         from data.feature_engineer import compute_features as _compute_features
 
         gbm_feature_cols = cfg.GBM_FEATURES
+
+        # Validate feature alignment between config and trained model
+        if hasattr(scorer, '_feature_names') and scorer._feature_names:
+            model_features = scorer._feature_names
+            if len(model_features) != len(gbm_feature_cols):
+                msg = (f"Feature count mismatch: config has {len(gbm_feature_cols)} "
+                       f"but model expects {len(model_features)}")
+                log.error(msg)
+                raise ValueError(msg)
+            if list(model_features) != list(gbm_feature_cols):
+                log.warning(
+                    "Feature ORDER mismatch between config and model — "
+                    "predictions may be unreliable. Config: %s, Model: %s",
+                    gbm_feature_cols[:3], model_features[:3],
+                )
+
         raw_vectors: dict[str, np.ndarray] = {}   # ticker → raw feature vector
         for ticker in tickers:
             df = price_data.get(ticker, pd.DataFrame())
@@ -2021,67 +2091,85 @@ def main(
             else:
                 X_batch[:, :] = 0.5  # single ticker defaults to median percentile
 
-            # Run batch inference and build prediction dicts
-            try:
-                mse_scores = scorer.predict(X_batch)  # (N_tickers,)
-                # Ensemble with lambdarank model only if inference_mode is "ensemble"
-                if inference_mode == "ensemble" and rank_scorer is not None:
-                    try:
-                        from scipy.stats import rankdata as _rankdata
-                        rank_scores = rank_scorer.predict(X_batch)
-                        # Rank-normalize each model's predictions, then average
-                        mse_ranked = _rankdata(mse_scores).astype(np.float32)
-                        rank_ranked = _rankdata(rank_scores).astype(np.float32)
-                        ensemble_ranks = 0.5 * mse_ranked + 0.5 * rank_ranked
-                        # Map ensemble ranks back to return-like scale so
-                        # p_up/p_down conversion works: percentile in [-LABEL_CLIP, +LABEL_CLIP]
-                        _clip = getattr(cfg, "LABEL_CLIP", 0.15)
-                        pctile = (ensemble_ranks - ensemble_ranks.min()) / max(ensemble_ranks.max() - ensemble_ranks.min(), 1e-8)
-                        scores = (pctile - 0.5) * 2.0 * _clip  # map [0,1] → [-clip, +clip]
-                        log.info("Ensemble inference: MSE + lambdarank (rank-normalized average)")
-                    except Exception as exc_rank:
-                        log.warning("Lambdarank inference failed — using MSE-only: %s", exc_rank)
-                        scores = mse_scores
-                else:
-                    scores = mse_scores
-            except Exception as exc:
-                log.error("Batch GBM inference failed: %s", exc)
-                if fd:
-                    fd.report(exc, severity="critical", context={
-                        "site": "batch_gbm_inference",
-                        "n_tickers": len(ordered_tickers),
-                    })
-                scores = np.full(n_tickers, np.nan)
+            # Run BOTH models on the same rank-normalized features.
+            # MSE → predicted_alpha (calibrated 5d return), direction, veto
+            # Lambdarank → cross-sectional ranking (model_rank)
+            from scipy.stats import rankdata as _rankdata_inf
+
+            alpha_scores = np.full(n_tickers, np.nan)
+            rank_model_ranks = np.full(n_tickers, np.nan)
+
+            # MSE model inference
+            if mse_scorer is not None:
+                try:
+                    alpha_scores = mse_scorer.predict(X_batch)
+                    log.info("MSE inference complete: %d tickers", n_tickers)
+                except Exception as exc:
+                    log.error("MSE inference failed: %s", exc)
+                    if fd:
+                        fd.report(exc, severity="critical", context={
+                            "site": "mse_inference", "n_tickers": n_tickers})
+
+            # Lambdarank model inference → cross-sectional rank
+            if rank_scorer is not None:
+                try:
+                    rank_raw = rank_scorer.predict(X_batch)
+                    # Convert to rank: 1 = best (highest score), N = worst
+                    valid_r = ~np.isnan(rank_raw)
+                    if valid_r.sum() > 0:
+                        ranks = _rankdata_inf(-rank_raw[valid_r], method="average")
+                        rank_model_ranks[valid_r] = ranks
+                    log.info("Lambdarank inference complete: %d tickers", n_tickers)
+                except Exception as exc:
+                    log.warning("Lambdarank inference failed: %s", exc)
+
+            # If MSE failed but rank succeeded, derive alpha from MSE rank
+            # as fallback (won't be calibrated but better than nothing)
+            if np.all(np.isnan(alpha_scores)) and not np.all(np.isnan(rank_model_ranks)):
+                log.warning("MSE unavailable — no calibrated alpha scores this run")
 
             max_r = getattr(cfg, "LABEL_CLIP", 0.15)
+            alpha_scores = np.clip(alpha_scores, -max_r, max_r)
+
+            # MSE rank (for comparison — how MSE orders stocks vs lambdarank)
+            mse_ranks = np.full(n_tickers, np.nan)
+            valid_a = ~np.isnan(alpha_scores)
+            if valid_a.sum() > 0:
+                mse_ranks[valid_a] = _rankdata_inf(-alpha_scores[valid_a], method="average")
+
             for i, ticker in enumerate(ordered_tickers):
-                s = float(scores[i])
-                if np.isnan(s):
+                alpha = float(alpha_scores[i])
+                if np.isnan(alpha):
                     n_skipped += 1
                     continue
-                p_up   = float(np.clip(0.5 + s / (2.0 * max_r), 0.0, 1.0))
-                p_down = float(np.clip(0.5 - s / (2.0 * max_r), 0.0, 1.0))
+
+                # Direction from MSE alpha thresholds (calibrated scale)
+                p_up   = float(np.clip(0.5 + alpha / (2.0 * max_r), 0.0, 1.0))
+                p_down = float(np.clip(0.5 - alpha / (2.0 * max_r), 0.0, 1.0))
                 p_flat = float(max(0.0, 1.0 - p_up - p_down))
-                if s > cfg.UP_THRESHOLD:
+                if alpha > cfg.UP_THRESHOLD:
                     predicted_direction = "UP"
                     confidence = p_up
-                elif s < cfg.DOWN_THRESHOLD:
+                elif alpha < cfg.DOWN_THRESHOLD:
                     predicted_direction = "DOWN"
                     confidence = p_down
                 else:
                     predicted_direction = "FLAT"
                     up_t = cfg.UP_THRESHOLD if cfg.UP_THRESHOLD else 0.01
-                    dist_from_boundary = min(abs(s - up_t), abs(s - cfg.DOWN_THRESHOLD))
+                    dist_from_boundary = min(abs(alpha - up_t), abs(alpha - cfg.DOWN_THRESHOLD))
                     max_dist = abs(up_t)
                     confidence = float(np.clip(dist_from_boundary / max_dist, 0.0, 1.0)) if max_dist > 0 else 0.5
+
                 result = {
                     "ticker":                ticker,
                     "predicted_direction":   predicted_direction,
                     "prediction_confidence": round(confidence, 4),
-                    "predicted_alpha":       round(s, 6),
+                    "predicted_alpha":       round(alpha, 6),
                     "p_up":                  round(p_up, 4),
-                    "p_flat":                round(p_flat, 4),
+                    "p_flat":               round(p_flat, 4),
                     "p_down":                round(p_down, 4),
+                    "mse_rank":              int(mse_ranks[i]) if not np.isnan(mse_ranks[i]) else None,
+                    "model_rank":            int(rank_model_ranks[i]) if not np.isnan(rank_model_ranks[i]) else None,
                 }
                 if ticker_sources:
                     result["watchlist_source"] = ticker_sources.get(ticker, "unknown")
@@ -2141,6 +2229,7 @@ def main(
     metrics = {
         "model_version": model_version,
         "model_type": model_type,
+        "inference_mode": inference_mode if model_type == "gbm" else "mlp",
         "last_trained": last_trained,
         "training_samples": gbm_meta.get("n_train") if model_type == "gbm" else None,
         "val_loss": round(float(val_loss), 6) if isinstance(val_loss, (int, float)) else None,

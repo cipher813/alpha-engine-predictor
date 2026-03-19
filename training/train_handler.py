@@ -845,24 +845,23 @@ def run_gbm_training(
                 log.info("Uploaded dated backup (lambdarank): s3://%s/%s", bucket, dated_rank_key)
 
             if passes_ic:
-                # Promote based on best_mode
-                if best_mode == "mse":
-                    # MSE only: upload MSE weights as gbm_latest + gbm_mse_latest
-                    s3.upload_file(str(booster_path), bucket, cfg.GBM_WEIGHTS_KEY)
-                    s3.upload_file(str(booster_path), bucket, cfg.GBM_MSE_WEIGHTS_KEY)
-                    log.info("Promoted MSE to active weights: s3://%s/%s", bucket, cfg.GBM_WEIGHTS_KEY)
-                elif best_mode == "rank" and rank_booster_path is not None:
-                    # Rank only: upload rank weights as gbm_latest + gbm_rank_latest
-                    s3.upload_file(str(rank_booster_path), bucket, cfg.GBM_WEIGHTS_KEY)
+                # Always upload BOTH models — inference runs both side by side.
+                # MSE → predicted_alpha (calibrated returns)
+                # Lambdarank → model_rank (cross-sectional ranking)
+                s3.upload_file(str(booster_path), bucket, cfg.GBM_MSE_WEIGHTS_KEY)
+                log.info("Uploaded MSE model: s3://%s/%s", bucket, cfg.GBM_MSE_WEIGHTS_KEY)
+                if rank_booster_path is not None:
                     s3.upload_file(str(rank_booster_path), bucket, cfg.GBM_RANK_WEIGHTS_KEY)
-                    log.info("Promoted lambdarank to active weights: s3://%s/%s", bucket, cfg.GBM_WEIGHTS_KEY)
-                elif best_mode == "ensemble":
-                    # Ensemble: upload both MSE and rank weights
+                    log.info("Uploaded lambdarank model: s3://%s/%s", bucket, cfg.GBM_RANK_WEIGHTS_KEY)
+
+                # Promote best_mode to gbm_latest (for model_version tracking)
+                if best_mode == "mse":
                     s3.upload_file(str(booster_path), bucket, cfg.GBM_WEIGHTS_KEY)
-                    s3.upload_file(str(booster_path), bucket, cfg.GBM_MSE_WEIGHTS_KEY)
-                    if rank_booster_path is not None:
-                        s3.upload_file(str(rank_booster_path), bucket, cfg.GBM_RANK_WEIGHTS_KEY)
-                    log.info("Promoted ensemble to active weights: s3://%s/%s", bucket, cfg.GBM_WEIGHTS_KEY)
+                elif best_mode == "rank" and rank_booster_path is not None:
+                    s3.upload_file(str(rank_booster_path), bucket, cfg.GBM_WEIGHTS_KEY)
+                elif best_mode == "ensemble":
+                    s3.upload_file(str(booster_path), bucket, cfg.GBM_WEIGHTS_KEY)
+                log.info("Promoted %s to active weights: s3://%s/%s", best_mode, bucket, cfg.GBM_WEIGHTS_KEY)
 
                 # Write gbm_mode.json to S3
                 mode_payload = json.dumps({"mode": best_mode}, indent=2).encode()
