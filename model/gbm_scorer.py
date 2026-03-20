@@ -278,6 +278,13 @@ class GBMScorer:
         """
         if self._booster is None:
             raise RuntimeError("GBMScorer has not been fitted. Call fit() first.")
+        expected_features = self._booster.num_feature()
+        if X.shape[1] != expected_features:
+            raise ValueError(
+                f"Feature count mismatch at inference: input has {X.shape[1]} features "
+                f"but model expects {expected_features}. Check that feature engineering "
+                f"and GBM_FEATURES config match the trained model."
+            )
         return self._booster.predict(X, num_iteration=self._best_iteration)
 
     # ------------------------------------------------------------------

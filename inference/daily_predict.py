@@ -1939,6 +1939,25 @@ def main(
         sector_etfs_needed = sorted({sector_map[t] for t in tickers if t in sector_map})
         macro = fetch_macro_series(extra_tickers=sector_etfs_needed)
 
+    # ── Compute per-ticker price data age ────────────────────────────────────
+    ticker_data_age: dict[str, int] = {}
+    if price_data:
+        _today_ts = pd.Timestamp(date_str).normalize()
+        for _tk, _df in price_data.items():
+            if _df is not None and not _df.empty:
+                try:
+                    _last_date = pd.Timestamp(_df.index.max()).normalize()
+                    ticker_data_age[_tk] = (_today_ts - _last_date).days
+                except Exception:
+                    pass  # skip tickers with unparseable index
+    if ticker_data_age:
+        log.info(
+            "Price data age: max=%d days, n_stale(>1d)=%d / %d tickers",
+            max(ticker_data_age.values()),
+            sum(1 for d in ticker_data_age.values() if d > 1),
+            len(ticker_data_age),
+        )
+
     # Soft timeout gate: if nearing limit, write whatever we have and exit
     if _near_timeout():
         log.warning("Soft timeout before sector ETF fetch — writing partial predictions")
@@ -2017,19 +2036,23 @@ def main(
 
         gbm_feature_cols = cfg.GBM_FEATURES
 
-        # Validate feature alignment between config and trained model
-        if hasattr(scorer, '_feature_names') and scorer._feature_names:
-            model_features = scorer._feature_names
-            if len(model_features) != len(gbm_feature_cols):
-                msg = (f"Feature count mismatch: config has {len(gbm_feature_cols)} "
-                       f"but model expects {len(model_features)}")
+        # Validate feature alignment between config and trained model.
+        # Use booster.num_feature() as the authoritative check — meta.json
+        # feature names can be empty if the file is missing.
+        for label, sc in [("MSE", mse_scorer), ("Rank", rank_scorer)]:
+            if sc is None or sc._booster is None:
+                continue
+            expected = sc._booster.num_feature()
+            if len(gbm_feature_cols) != expected:
+                msg = (f"Feature count mismatch ({label} model): config has "
+                       f"{len(gbm_feature_cols)} features but model expects {expected}")
                 log.error(msg)
                 raise ValueError(msg)
-            if list(model_features) != list(gbm_feature_cols):
+            if sc._feature_names and list(sc._feature_names) != list(gbm_feature_cols):
                 log.warning(
-                    "Feature ORDER mismatch between config and model — "
+                    "Feature ORDER mismatch between config and %s model — "
                     "predictions may be unreliable. Config: %s, Model: %s",
-                    gbm_feature_cols[:3], model_features[:3],
+                    label, gbm_feature_cols[:3], sc._feature_names[:3],
                 )
 
         raw_vectors: dict[str, np.ndarray] = {}   # ticker → raw feature vector
@@ -2171,6 +2194,8 @@ def main(
                     "mse_rank":              int(mse_ranks[i]) if not np.isnan(mse_ranks[i]) else None,
                     "model_rank":            int(rank_model_ranks[i]) if not np.isnan(rank_model_ranks[i]) else None,
                 }
+                if ticker in ticker_data_age:
+                    result["price_data_age_days"] = ticker_data_age[ticker]
                 if ticker_sources:
                     result["watchlist_source"] = ticker_sources.get(ticker, "unknown")
                 # O10: earnings proximity for executor warning
@@ -2190,6 +2215,8 @@ def main(
                 sector_etf_series=sector_etf_series,
             )
             if result is not None:
+                if ticker in ticker_data_age:
+                    result["price_data_age_days"] = ticker_data_age[ticker]
                 if ticker_sources:
                     result["watchlist_source"] = ticker_sources.get(ticker, "unknown")
                 predictions.append(result)
@@ -2239,6 +2266,10 @@ def main(
         "ic_ir_30d": gbm_meta.get("ic_ir") if model_type == "gbm" else None,
         # Rolling hit rate requires 30 days of resolved outcomes (populated by backtester)
         "hit_rate_30d_rolling": None,
+        "price_freshness": {
+            "max_age_days": max(ticker_data_age.values()) if ticker_data_age else -1,
+            "n_stale": sum(1 for d in ticker_data_age.values() if d > 1),
+        },
     }
 
     # ── Step 6: Resolve veto threshold (S3 override, regime-adjusted) ───────
