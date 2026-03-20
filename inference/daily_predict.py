@@ -62,6 +62,7 @@ import numpy as np
 import pandas as pd
 
 import config as cfg
+from retry import retry
 
 log = logging.getLogger(__name__)
 
@@ -469,6 +470,13 @@ def load_watchlist(
 
 # ── Price fetch ───────────────────────────────────────────────────────────────
 
+@retry(max_attempts=2, retryable=(Exception,), label="yfinance")
+def _yf_download_batch(tickers, **kwargs):
+    """Download a batch of tickers from yfinance with retry."""
+    import yfinance as yf
+    return yf.download(tickers=tickers, **kwargs)
+
+
 def fetch_today_prices(tickers: list[str], fd=None) -> dict[str, pd.DataFrame]:
     """
     Fetch 1-year OHLCV history for each ticker via yfinance.
@@ -490,7 +498,7 @@ def fetch_today_prices(tickers: list[str], fd=None) -> dict[str, pd.DataFrame]:
     for batch in batches:
         try:
             if len(batch) == 1:
-                raw = yf.download(
+                raw = _yf_download_batch(
                     batch[0],
                     period=cfg.INFERENCE_PERIOD,
                     interval="1d",
@@ -501,7 +509,7 @@ def fetch_today_prices(tickers: list[str], fd=None) -> dict[str, pd.DataFrame]:
                 raw = raw.dropna(subset=["Close"])
                 result[batch[0]] = raw
             else:
-                raw = yf.download(
+                raw = _yf_download_batch(
                     tickers=batch,
                     period=cfg.INFERENCE_PERIOD,
                     interval="1d",
@@ -769,12 +777,7 @@ def save_daily_closes(
         closes_df.to_parquet(buf, engine="pyarrow", compression="snappy", index=True)
         buf.seek(0)
         key = f"predictor/daily_closes/{date_str}.parquet"
-        s3.put_object(
-            Bucket=s3_bucket,
-            Key=key,
-            Body=buf.getvalue(),
-            ContentType="application/octet-stream",
-        )
+        _s3_put_bytes(s3, s3_bucket, key, buf.getvalue())
         log.info(
             "Daily closes written to s3://%s/%s  (%d tickers)",
             s3_bucket, key, len(closes_df),
@@ -1262,6 +1265,18 @@ def predict_ticker_gbm(
 
 # ── Output writing ────────────────────────────────────────────────────────────
 
+@retry(max_attempts=3, retryable=(Exception,), label="s3_put_json")
+def _s3_put_json(s3, bucket: str, key: str, body: str) -> None:
+    """Write a JSON string to S3 with retry."""
+    s3.put_object(Bucket=bucket, Key=key, Body=body.encode("utf-8"), ContentType="application/json")
+
+
+@retry(max_attempts=3, retryable=(Exception,), label="s3_put_bytes")
+def _s3_put_bytes(s3, bucket: str, key: str, body: bytes) -> None:
+    """Write bytes to S3 with retry."""
+    s3.put_object(Bucket=bucket, Key=key, Body=body, ContentType="application/octet-stream")
+
+
 def write_predictions(
     predictions: list[dict],
     date_str: str,
@@ -1326,28 +1341,13 @@ def write_predictions(
         import boto3
         s3 = boto3.client("s3")
 
-        s3.put_object(
-            Bucket=s3_bucket,
-            Key=dated_key,
-            Body=predictions_json.encode("utf-8"),
-            ContentType="application/json",
-        )
+        _s3_put_json(s3, s3_bucket, dated_key, predictions_json)
         log.info("Written s3://%s/%s", s3_bucket, dated_key)
 
-        s3.put_object(
-            Bucket=s3_bucket,
-            Key=latest_key,
-            Body=predictions_json.encode("utf-8"),
-            ContentType="application/json",
-        )
+        _s3_put_json(s3, s3_bucket, latest_key, predictions_json)
         log.info("Written s3://%s/%s", s3_bucket, latest_key)
 
-        s3.put_object(
-            Bucket=s3_bucket,
-            Key=metrics_key,
-            Body=metrics_json.encode("utf-8"),
-            ContentType="application/json",
-        )
+        _s3_put_json(s3, s3_bucket, metrics_key, metrics_json)
         log.info("Written s3://%s/%s", s3_bucket, metrics_key)
 
     except Exception as exc:
@@ -2284,6 +2284,28 @@ def main(
     if not dry_run:
         send_predictor_email(predictions, metrics, date_str, signals_data=signals_data,
                              veto_threshold=veto_thresh)
+
+    # ── Write health status ──────────────────────────────────────────────────
+    try:
+        from health_status import write_health
+        n_up = sum(1 for p in predictions if p.get("predicted_direction") == "UP")
+        n_down = sum(1 for p in predictions if p.get("predicted_direction") == "DOWN")
+        n_flat = sum(1 for p in predictions if p.get("predicted_direction") == "FLAT")
+        write_health(
+            bucket=bucket,
+            module_name="predictor_inference",
+            status="ok",
+            run_date=date_str,
+            duration_seconds=_time.monotonic() - _start_ts,
+            summary={
+                "n_predictions": len(predictions),
+                "n_up": n_up,
+                "n_down": n_down,
+                "n_flat": n_flat,
+            },
+        )
+    except Exception as _he:
+        log.warning("Health status write failed: %s", _he)
 
     log.info("Predictor run complete for %s", date_str)
 
