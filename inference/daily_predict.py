@@ -443,27 +443,19 @@ def load_watchlist(
                 log.info("Watchlist: %d tickers from population file", len(tickers))
                 return tickers, sources, data
 
-    # ── Extract and annotate tickers from signals.json ─────────────────────
+    # ── Extract tickers from signals.json ───────────────────────────────────
     universe_tickers = {
         e["ticker"].upper() for e in data.get("universe", []) if "ticker" in e
-    }
-    buy_cand_tickers = {
-        e["ticker"].upper() for e in data.get("buy_candidates", []) if "ticker" in e
     }
 
     sources: dict[str, str] = {}
     for t in universe_tickers:
-        sources[t] = "both" if t in buy_cand_tickers else "tracked"
-    for t in buy_cand_tickers:
-        if t not in sources:
-            sources[t] = "buy_candidate"
+        sources[t] = "tracked"
 
     tickers = sorted(sources.keys())
-    n_overlap = len(universe_tickers & buy_cand_tickers)
     log.info(
-        "Watchlist: %d universe (tracked) + %d buy_candidates "
-        "= %d unique tickers (%d overlap)",
-        len(universe_tickers), len(buy_cand_tickers), len(tickers), n_overlap,
+        "Watchlist: %d universe tickers",
+        len(tickers),
     )
     return tickers, sources, data
 
@@ -1403,14 +1395,14 @@ def _build_predictor_email(
     # ── Research data extraction ───────────────────────────────────────────────
     sd = signals_data or {}
     market_regime    = sd.get("market_regime", "")
-    buy_candidates   = sd.get("buy_candidates", [])
+    population       = sd.get("universe", [])
     sector_ratings   = sd.get("sector_ratings", {})
     sorted_sectors: list = []
 
     # ── Subject ───────────────────────────────────────────────────────────────
     veto_str    = f" | {n_vetoed} veto{'es' if n_vetoed != 1 else ''}" if n_vetoed else ""
     regime_str  = f" | {market_regime.upper()}" if market_regime else ""
-    cand_str    = f" | {len(buy_candidates)} candidates" if buy_candidates else ""
+    cand_str    = f" | {len(population)} stocks" if population else ""
     subject = (
         f"Alpha Engine Brief | {date_str}{regime_str}{cand_str} | "
         f"{len(ups)} UP / {len(flats)} FLAT / {len(downs)} DOWN"
@@ -1422,7 +1414,7 @@ def _build_predictor_email(
     ic_str   = f"{val_ic:.4f}" if isinstance(val_ic, (int, float)) else "—"
 
     def _source_tag(p: dict) -> str:
-        return " ★" if p.get("watchlist_source") in ("buy_candidate", "both") else ""
+        return ""  # buy_candidates merged into universe — no separate source tag
 
     def _alpha_str(p: dict) -> str:
         a = p.get("predicted_alpha")
@@ -1505,9 +1497,9 @@ def _build_predictor_email(
             f'{market_regime.upper() if market_regime else "NEUTRAL"}</span>'
         )
 
-        # Buy candidates table
+        # Population table
         cand_rows = ""
-        for c in buy_candidates:
+        for c in population:
             score      = c.get("score") or "—"
             conviction = c.get("conviction", "—")
             signal     = c.get("signal", "—")
@@ -1560,7 +1552,7 @@ def _build_predictor_email(
             f'<div style="background:#f8f9fa; border-left:3px solid #555; padding:12px 16px; margin-bottom:16px;">'
             f'<h3 style="margin:0 0 8px 0; font-size:14px; color:#333;">Research Brief</h3>'
             f'<p style="margin:0 0 8px 0;">Market Regime: {regime_pill}</p>'
-            f'<h4 style="margin:8px 0 4px 0; font-size:12px; color:#555;">Buy Candidates ({len(buy_candidates)})</h4>'
+            f'<h4 style="margin:8px 0 4px 0; font-size:12px; color:#555;">Population ({len(population)})</h4>'
             f'{cand_table}'
             f'{"<h4 style=margin:8px 0 4px 0; font-size:12px; color:#555;>Sector Ratings</h4>" + sector_table if sector_table else ""}'
             f'</div>'
@@ -1612,9 +1604,9 @@ def _build_predictor_email(
             f"{'='*60}\n"
             f"Market Regime: {market_regime.upper() if market_regime else 'NEUTRAL'}\n"
         )
-        if buy_candidates:
-            research_plain += f"\nBuy Candidates ({len(buy_candidates)}):\n"
-            for c in buy_candidates:
+        if population:
+            research_plain += f"\nPopulation ({len(population)}):\n"
+            for c in population:
                 score = c.get("score")
                 score_str = f"{score:.1f}" if isinstance(score, (int, float)) else "—"
                 veto_str_c = " [GBM VETO]" if c.get("gbm_veto") else ""
@@ -1762,8 +1754,7 @@ def main(
     s3_bucket :      Override S3 bucket. Falls back to S3_BUCKET env var or config default.
     model_type :     Which model to run: 'mlp' (default) or 'gbm'.
     watchlist_path : Path to watchlist.json. When provided, predictions are
-                     restricted to the tickers in 'tracked' + 'buy_candidates'.
-                     Each result gets a 'watchlist_source' annotation.
+                     restricted to the tickers in the universe.
                      When None, the full signals.json universe is used.
     """
     logging.basicConfig(

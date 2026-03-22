@@ -53,6 +53,7 @@ echo ""
 echo "==> Building Docker image..."
 docker build \
   --platform linux/amd64 \
+  --provenance=false \
   --tag "${ECR_REPO}:${IMAGE_TAG}" \
   --file Dockerfile \
   .

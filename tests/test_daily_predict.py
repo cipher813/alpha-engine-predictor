@@ -144,10 +144,11 @@ class TestBuildPredictorEmail:
 
         signals = {
             "market_regime": "bullish",
-            "buy_candidates": [
+            "universe": [
                 {"ticker": "AAPL", "score": 85.5, "conviction": "HIGH",
                  "signal": "BUY", "sector": "Technology"},
             ],
+            "buy_candidates": [],
             "sector_ratings": {
                 "Technology": {"rating": 80, "modifier": 1.15},
                 "Healthcare": {"rating": 65, "modifier": 1.0},
