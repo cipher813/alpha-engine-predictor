@@ -1040,7 +1040,7 @@ def load_price_data_from_cache(
     # Sector ETFs: any XL* symbols in the slim cache
     for stem, df in slim_data.items():
         if stem.startswith("XL") and "Close" in df.columns:
-            source = price_data.get(stem) or df
+            source = price_data.get(stem) if stem in price_data else df
             macro[stem] = source["Close"].dropna()
 
     return price_data, macro
