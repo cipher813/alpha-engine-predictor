@@ -1,6 +1,7 @@
-# Lambda deployment requirements (GBM inference only — no PyTorch, no pyarrow, no scipy)
+# Lambda deployment requirements (GBM inference only — no PyTorch, no scipy)
 numpy>=1.24.0
 pandas>=2.0.0
+pyarrow>=14.0.0
 yfinance>=0.2.30
 boto3>=1.26.0
 tqdm>=4.65.0

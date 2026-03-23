@@ -15,10 +15,9 @@
 #   ./infrastructure/deploy.sh                # full deploy
 #   ./infrastructure/deploy.sh --dry-run      # build image only, skip AWS push
 #
-# Environment variables (required unless --dry-run):
-#   AWS_ACCOUNT_ID   — 12-digit AWS account ID
-#   AWS_REGION       — e.g. us-east-1
-#   S3_BUCKET        — override default S3 bucket (optional)
+# Environment variables (auto-detected if not set):
+#   AWS_ACCOUNT_ID   — 12-digit AWS account ID (auto-detected via aws sts)
+#   AWS_REGION       — defaults to us-east-1
 
 set -euo pipefail
 
@@ -36,10 +35,12 @@ for arg in "$@"; do
   esac
 done
 
-# ── Validate environment ──────────────────────────────────────────────────────
-if [ "$DRY_RUN" = false ]; then
-  : "${AWS_ACCOUNT_ID:?ERROR: AWS_ACCOUNT_ID env var is required (e.g. export AWS_ACCOUNT_ID=123456789012)}"
-  : "${AWS_REGION:?ERROR: AWS_REGION env var is required (e.g. export AWS_REGION=us-east-1)}"
+# ── Resolve AWS identity ─────────────────────────────────────────────────────
+AWS_REGION="${AWS_REGION:-us-east-1}"
+if [ -z "${AWS_ACCOUNT_ID:-}" ] && [ "$DRY_RUN" = false ]; then
+  AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text --region "$AWS_REGION" 2>/dev/null) \
+    || { echo "ERROR: Could not auto-detect AWS_ACCOUNT_ID. Set it manually or configure AWS CLI."; exit 1; }
+  echo "Auto-detected AWS_ACCOUNT_ID: $AWS_ACCOUNT_ID"
 fi
 
 # Move to repo root (script may be called from any directory)
