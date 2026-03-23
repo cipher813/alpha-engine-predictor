@@ -1031,7 +1031,7 @@ def load_price_data_from_cache(
     macro: dict[str, pd.Series] = {}
     for key, stem in _MACRO_SLIM_KEYS.items():
         # Prefer combined price_data (includes delta) over raw slim_data
-        source = price_data.get(stem) or slim_data.get(stem)
+        source = price_data.get(stem) if stem in price_data else slim_data.get(stem)
         if source is not None and "Close" in source.columns:
             macro[key] = source["Close"].dropna()
         else:
