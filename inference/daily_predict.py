@@ -1380,16 +1380,22 @@ def _build_predictor_email(
     val_ic        = metrics.get("ic_30d")        # 30-day information coefficient
     n_total       = len(predictions)
 
-    # Single list sorted by MSE predicted alpha (highest to lowest)
-    sorted_preds = sorted(predictions, key=lambda p: p.get("predicted_alpha", 0), reverse=True)
+    # Single list sorted by combined_rank (best first)
+    sorted_preds = sorted(predictions, key=lambda p: p.get("combined_rank") or p.get("mse_rank") or 999)
 
     # Counts for subject line
     ups   = [p for p in predictions if p.get("predicted_direction") == "UP"]
     flats = [p for p in predictions if p.get("predicted_direction") == "FLAT"]
     downs = [p for p in predictions if p.get("predicted_direction") == "DOWN"]
 
-    # Option A vetoes: high-confidence DOWN signals that will trigger HOLD overrides
-    vetoes   = [p for p in downs if p.get("prediction_confidence", 0) >= _vt]
+    # Vetoes: negative predicted alpha AND combined_rank in bottom half
+    n_preds = len(predictions)
+    vetoes = [
+        p for p in predictions
+        if (p.get("predicted_alpha", 0) or 0) < 0
+        and p.get("combined_rank") is not None
+        and p["combined_rank"] > n_preds / 2
+    ]
     n_vetoed = len(vetoes)
 
     # ── Research data extraction ───────────────────────────────────────────────
@@ -1446,15 +1452,24 @@ def _build_predictor_email(
     def _html_prediction_table(preds: list[dict]) -> str:
         if not preds:
             return '<p style="color:#888; font-style:italic;">No predictions available.</p>'
+        n_preds = len(preds)
         rows = []
         for p in preds:
+            cr = p.get("combined_rank")
+            cr_str = f'{cr:.1f}' if cr is not None else "—"
+            is_vetoed = (
+                p.get("predicted_alpha", 0) is not None
+                and (p.get("predicted_alpha", 0) or 0) < 0
+                and cr is not None
+                and cr > n_preds / 2
+            )
+            veto_tag = ' <span style="color:#d32f2f;">⚠ VETO</span>' if is_vetoed else ""
             rows.append(
                 f'<tr>'
                 f'<td {TD}><b>{p["ticker"]}{_source_tag(p)}</b></td>'
                 f'<td {TDR}>{_alpha_str(p)}</td>'
-                f'<td {TDR}>{_rank_str(p, "mse_rank")}</td>'
-                f'<td {TDR}>{_rank_str(p, "model_rank")}</td>'
-                f'<td {TD} style="text-align:center;">{_dir_badge(p)}</td>'
+                f'<td {TDR}>{cr_str}</td>'
+                f'<td {TD} style="text-align:center;">{_dir_badge(p)}{veto_tag}</td>'
                 f'<td {TD}>{p.get("watchlist_source", "—")}</td>'
                 f'</tr>'
             )
@@ -1463,8 +1478,7 @@ def _build_predictor_email(
             f'<tr>'
             f'<th {TH}>Ticker</th>'
             f'<th {TH}>α (MSE)</th>'
-            f'<th {TH}>MSE Rank</th>'
-            f'<th {TH}>LR Rank</th>'
+            f'<th {TH}>Rank</th>'
             f'<th {TH}>Signal</th>'
             f'<th {TH}>Source</th>'
             f'</tr>'
@@ -1475,12 +1489,11 @@ def _build_predictor_email(
     veto_section_html = ""
     if vetoes:
         veto_tickers = ", ".join(p["ticker"] for p in vetoes)
-        pct = int(_vt * 100)
         veto_section_html = (
             f'<hr style="border:1px solid #eee; margin:16px 0;">'
-            f'<h3 style="color:#c62828;">⚠ Option A Vetoes ({n_vetoed})</h3>'
+            f'<h3 style="color:#c62828;">⚠ Vetoes ({n_vetoed})</h3>'
             f'<p style="font-size:12px; margin:4px 0;">'
-            f'DOWN predictions with confidence ≥{pct}% — executor will override ENTER → HOLD:</p>'
+            f'Negative predicted α + bottom-half combined rank — executor will override ENTER → HOLD:</p>'
             f'<p style="font-family:monospace; font-size:13px;"><b>{veto_tickers}</b></p>'
         )
 
@@ -1573,7 +1586,7 @@ def _build_predictor_email(
         f'{veto_section_html}'
         f'<p style="font-size:11px; color:#aaa; margin-top:24px;">'
         f'★ = buy_candidate from research signals.json &nbsp;|&nbsp;'
-        f'⚠ VETO = Option A gate trigger (conf ≥{int(_vt * 100)}%)</p>'
+        f'⚠ VETO = negative α + bottom-half rank</p>'
         f'</body></html>'
     )
 
@@ -1581,16 +1594,19 @@ def _build_predictor_email(
     def _plain_prediction_list(preds: list[dict]) -> str:
         if not preds:
             return "  (none)\n"
+        _n = len(preds)
         lines = []
         for p in preds:
-            veto = " [VETO]" if (
-                p.get("predicted_direction") == "DOWN"
-                and p.get("prediction_confidence", 0) >= _vt
-            ) else ""
-            mse_r = _rank_str(p, "mse_rank")
-            lr_r = _rank_str(p, "model_rank")
+            cr = p.get("combined_rank")
+            cr_str = f"{cr:.1f}" if cr is not None else "—"
+            is_vetoed = (
+                (p.get("predicted_alpha", 0) or 0) < 0
+                and cr is not None
+                and cr > _n / 2
+            )
+            veto = " [VETO]" if is_vetoed else ""
             lines.append(
-                f"  {p['ticker']:<6}  α={_alpha_str(p):>7}  MSE#{mse_r:<3} LR#{lr_r:<3}"
+                f"  {p['ticker']:<6}  α={_alpha_str(p):>7}  Rank {cr_str:<5}"
                 f"  {p.get('predicted_direction','—'):<4}  {p.get('watchlist_source', '—')}{_source_tag(p)}{veto}"
             )
         return "\n".join(lines) + "\n"
@@ -2184,6 +2200,7 @@ def main(
                     "p_down":                round(p_down, 4),
                     "mse_rank":              int(mse_ranks[i]) if not np.isnan(mse_ranks[i]) else None,
                     "model_rank":            int(rank_model_ranks[i]) if not np.isnan(rank_model_ranks[i]) else None,
+                    "combined_rank":         None,  # computed after all predictions built
                 }
                 if ticker in ticker_data_age:
                     result["price_data_age_days"] = ticker_data_age[ticker]
@@ -2220,8 +2237,15 @@ def main(
         n_skipped,
     )
 
-    # Sort by descending (p_up - p_down) for readability
-    predictions.sort(key=lambda p: p["p_up"] - p["p_down"], reverse=True)
+    # Compute combined_rank = average of mse_rank and model_rank (LR rank)
+    for p in predictions:
+        mse_r = p.get("mse_rank")
+        lr_r = p.get("model_rank")
+        if mse_r is not None and lr_r is not None:
+            p["combined_rank"] = round((mse_r + lr_r) / 2, 1)
+
+    # Sort by combined_rank (ascending = best first), fall back to mse_rank
+    predictions.sort(key=lambda p: p.get("combined_rank") or p.get("mse_rank") or 999)
 
     # ── Step 5: Build metrics ─────────────────────────────────────────────────
     # For GBM: read training-time meta from S3 to populate training_samples,
@@ -2263,9 +2287,16 @@ def main(
         },
     }
 
-    # ── Step 6: Resolve veto threshold (S3 override, regime-adjusted) ───────
+    # ── Step 6: Resolve veto threshold and mark vetoed predictions ──────────
     market_regime = signals_data.get("market_regime", "") if signals_data else ""
     veto_thresh = get_veto_threshold(bucket, market_regime=market_regime)
+
+    # Mark vetoed predictions: negative alpha + bottom-half combined rank
+    n_preds = len(predictions)
+    for p in predictions:
+        cr = p.get("combined_rank")
+        alpha = p.get("predicted_alpha", 0) or 0
+        p["gbm_veto"] = (alpha < 0 and cr is not None and cr > n_preds / 2)
 
     # ── Step 7: Write output ──────────────────────────────────────────────────
     write_predictions(predictions, date_str, bucket, metrics, dry_run=dry_run,
