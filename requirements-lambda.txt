@@ -1,5 +1,5 @@
 # Lambda deployment requirements (GBM inference only — no PyTorch, no scipy)
-numpy>=1.24.0
+numpy>=1.24.0,<2
 pandas>=2.0.0
 pyarrow>=14.0.0
 yfinance>=0.2.30
