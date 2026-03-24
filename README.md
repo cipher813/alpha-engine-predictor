@@ -270,6 +270,25 @@ pytest tests/ -v
 
 Tests cover feature engineering, model forward pass, checkpoint loading, and prediction pipeline. All tests run without network access or AWS credentials.
 
+### Local Inference Runs
+
+```bash
+# Offline mode: synthetic prices, dummy GBM scorers, no S3/API calls
+# Tests full feature computation, ranking, combined rank, veto logic
+python inference/daily_predict.py --offline
+
+# Dry run: real S3 data, real models, but skip S3 writes
+python inference/daily_predict.py --model-type gbm --watchlist auto --dry-run
+
+# Full local run: reads from and writes to S3, sends email
+python inference/daily_predict.py --model-type gbm --watchlist auto
+```
+
+**Preprod workflow:**
+1. `--offline` — verify code changes don't crash (no API calls needed)
+2. `--dry-run` — verify with real models and prices
+3. Deploy to Lambda: `./infrastructure/deploy.sh main`
+
 ---
 
 ## Opportunities for Improvement
