@@ -2385,13 +2385,110 @@ if __name__ == "__main__":
             "Example: --watchlist auto   or   --watchlist /tmp/signals.json"
         ),
     )
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="Full offline mode: synthetic prices, dummy GBM models, no S3/API calls. "
+             "Tests feature computation, ranking, veto logic, and email formatting.",
+    )
     args = parser.parse_args()
 
-    main(
-        date_str=args.date,
-        dry_run=args.dry_run,
-        local=args.local,
-        s3_bucket=args.s3_bucket,
-        model_type=args.model_type,
-        watchlist_path=args.watchlist,
-    )
+    if args.offline:
+        # Monkey-patch THIS module's globals so main() uses stubs
+        _this = sys.modules[__name__]
+
+        # Dummy GBM scorer: returns small random alpha scores
+        class _DummyScorer:
+            _best_iteration = 0
+            _val_ic = 0.05
+            _booster = None  # skip feature validation
+            _feature_names = None
+            def predict(self, X):
+                rng = np.random.RandomState(42)
+                return rng.uniform(-0.02, 0.02, size=X.shape[0])
+
+        # Stub model loaders
+        _this.load_gbm_s3 = lambda *a, **k: _DummyScorer()
+        _this.load_gbm_local = lambda *a, **k: _DummyScorer()
+
+        # Stub watchlist: 10 sample tickers
+        _OFFLINE_TICKERS = ["AAPL", "MSFT", "GOOGL", "AMZN", "META",
+                            "JPM", "JNJ", "XOM", "PFE", "HD"]
+        _this.get_universe_tickers = lambda *a, **k: _OFFLINE_TICKERS
+        _this.load_watchlist = lambda *a, **k: (
+            _OFFLINE_TICKERS,
+            {t: "population" for t in _OFFLINE_TICKERS},
+            {"market_regime": "neutral"},
+        )
+
+        # Stub price data: synthetic 252-day OHLCV DataFrames
+        _MACRO_SYMBOLS = ["SPY", "VIX", "TNX", "IRX", "GLD", "USO",
+                          "XLK", "XLV", "XLF", "XLE", "XLY", "XLC"]
+        def _make_synthetic_df(ticker, base, n=300):
+            dates = pd.bdate_range(end=pd.Timestamp.now(), periods=n)
+            rng = np.random.RandomState(hash(ticker) % 2**31)
+            returns = rng.normal(0.0005, 0.015, n)
+            close = base * np.cumprod(1 + returns)
+            return pd.DataFrame({
+                "Open": close * 0.999, "High": close * 1.01,
+                "Low": close * 0.99, "Close": close,
+                "Volume": rng.randint(1_000_000, 10_000_000, n),
+            }, index=dates)
+
+        def _make_synthetic_prices(tickers, *a, **k):
+            price_data = {}
+            for i, t in enumerate(tickers):
+                price_data[t] = _make_synthetic_df(t, 50 + i * 20)
+            # Include macro symbols so feature computation has SPY, VIX, etc.
+            macro = {}
+            for sym in _MACRO_SYMBOLS:
+                df = _make_synthetic_df(sym, 100)
+                macro[sym] = df["Close"]
+                if sym not in price_data:
+                    price_data[sym] = df
+            return price_data, macro
+
+        _this.load_price_data_from_cache = lambda tickers, *a, **k: _make_synthetic_prices(tickers)
+        _this.fetch_today_prices = lambda tickers, **k: _make_synthetic_prices(tickers)[0]
+
+        # Stub S3 writes, email, veto threshold, daily closes, macro
+        _this.write_predictions = lambda *a, **k: log.info("[OFFLINE] Skipped S3 write")
+        _this.send_predictor_email = lambda *a, **k: log.info("[OFFLINE] Skipped email")
+        _this.get_veto_threshold = lambda *a, **k: 0.65
+        _this.save_daily_closes = lambda *a, **k: None
+        _this.fetch_macro_series = lambda *a, **k: {}
+        _this.fetch_today_prices = lambda tickers, **k: _make_synthetic_prices(tickers)[0]
+
+        # Stub data fetchers (imported inside main() from sub-modules)
+        import data.earnings_fetcher as _ef
+        _ef.fetch_earnings_data = lambda *a, **k: {t: {} for t in _OFFLINE_TICKERS}
+        _ef.cache_earnings_to_s3 = lambda *a, **k: None
+        _ef.fetch_revision_history = lambda *a, **k: {t: {} for t in _OFFLINE_TICKERS}
+
+        import data.options_fetcher as _of
+        _of.fetch_options_features = lambda *a, **k: {t: {} for t in _OFFLINE_TICKERS}
+        _of.load_historical_options = lambda *a, **k: {}
+
+        # Stub health write
+        try:
+            import health_status
+            health_status.write_health = lambda *a, **k: None
+        except Exception:
+            pass
+
+        log.info("OFFLINE MODE: synthetic data, dummy GBM, no S3/API calls")
+        main(
+            date_str=args.date or datetime.now().strftime("%Y-%m-%d"),
+            dry_run=True,
+            local=False,  # False so it doesn't try to load local checkpoints
+            model_type="gbm",
+        )
+    else:
+        main(
+            date_str=args.date,
+            dry_run=args.dry_run,
+            local=args.local,
+            s3_bucket=args.s3_bucket,
+            model_type=args.model_type,
+            watchlist_path=args.watchlist,
+        )
