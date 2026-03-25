@@ -103,12 +103,33 @@ aws lambda wait function-updated \
   --function-name "${LAMBDA_FUNCTION}" \
   --region "${AWS_REGION}"
 
+# ── Step 6: Publish version and update 'live' alias ──────────────────────────
+echo ""
+echo "==> Publishing Lambda version..."
+VERSION=$(aws lambda publish-version \
+  --function-name "${LAMBDA_FUNCTION}" \
+  --query "Version" --output text \
+  --region "${AWS_REGION}")
+echo "  Published version: ${VERSION}"
+
+echo "==> Updating 'live' alias → version ${VERSION}"
+aws lambda update-alias \
+  --function-name "${LAMBDA_FUNCTION}" \
+  --name live \
+  --function-version "${VERSION}" \
+  --region "${AWS_REGION}" 2>/dev/null || \
+aws lambda create-alias \
+  --function-name "${LAMBDA_FUNCTION}" \
+  --name live \
+  --function-version "${VERSION}" \
+  --region "${AWS_REGION}"
+
 echo ""
 echo "==> Deploy complete!"
 echo "    Function : ${LAMBDA_FUNCTION}"
+echo "    Version  : ${VERSION}"
+echo "    Alias    : live → ${VERSION}"
 echo "    Image    : ${ECR_IMAGE}"
 echo ""
-echo "To test the deployed function:"
-echo "  aws lambda invoke --function-name ${LAMBDA_FUNCTION} \\"
-echo "    --payload '{\"dry_run\": true}' --cli-binary-format raw-in-base64-out /tmp/response.json \\"
-echo "    --region ${AWS_REGION} && cat /tmp/response.json"
+echo "To test:  aws lambda invoke --function-name ${LAMBDA_FUNCTION}:live --payload '{\"dry_run\": true}' --cli-binary-format raw-in-base64-out /tmp/response.json --region ${AWS_REGION} && cat /tmp/response.json"
+echo "Rollback: bash infrastructure/rollback.sh"
