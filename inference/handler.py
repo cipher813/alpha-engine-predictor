@@ -42,6 +42,7 @@ def handler(event: dict, context) -> dict:
         dry_run   (bool) : If True, skip S3 writes and email (for testing).
     """
     os.environ.setdefault("S3_BUCKET", "alpha-engine-research")
+    os.environ.setdefault("XDG_CACHE_HOME", "/tmp")
 
     logging.basicConfig(
         level=logging.INFO,

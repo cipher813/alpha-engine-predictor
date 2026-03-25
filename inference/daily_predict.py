@@ -2270,8 +2270,10 @@ def main(
 
     # ── Step 8: Send combined morning briefing email ──────────────────────────
     if not dry_run:
-        send_predictor_email(predictions, metrics, date_str, signals_data=signals_data,
-                             veto_threshold=veto_thresh)
+        email_sent = send_predictor_email(predictions, metrics, date_str, signals_data=signals_data,
+                                          veto_threshold=veto_thresh)
+        if not email_sent:
+            log.warning("Predictor email failed to send (Gmail + SES both failed)")
 
     # ── Write health status ──────────────────────────────────────────────────
     try:
