@@ -335,11 +335,15 @@ def write_slim_cache(
         except Exception as exc:
             log.warning("Slim cache write failed for %s: %s", parquet_path.stem, exc)
 
+    failed = len(parquet_files) - written
+    if failed > 0:
+        fail_pct = failed / max(len(parquet_files), 1) * 100
+        log.warning("Slim cache: %d/%d tickers failed (%.1f%%)", failed, len(parquet_files), fail_pct)
     log.info(
         "Slim cache written: %d / %d tickers uploaded to s3://%s/%s",
         written, len(parquet_files), bucket, slim_prefix,
     )
-    return written
+    return written, failed
 
 
 # ── Walk-forward validation ───────────────────────────────────────────────────
@@ -1438,13 +1442,14 @@ def main(
     # and instead download ~9 MB of parquets + a few daily_closes delta rows.
     # Skipped on dry_run since no model upload happened either.
     if not dry_run:
-        n_slim = write_slim_cache(
+        n_slim, n_slim_failed = write_slim_cache(
             bucket=bucket,
             full_cache_dir=tmp_cache,
             fd=fd,
         )
-        log.info("Slim cache written: %d tickers", n_slim)
+        log.info("Slim cache written: %d tickers (%d failed)", n_slim, n_slim_failed)
         result["slim_cache_tickers"] = n_slim
+        result["slim_cache_failed"] = n_slim_failed
     else:
         log.info("[dry-run] Skipping slim cache write")
 
@@ -1467,6 +1472,7 @@ def main(
                     "ic_30d": result.get("ic_30d"),
                     "n_train": result.get("n_train"),
                     "slim_cache_tickers": result.get("slim_cache_tickers"),
+                    "slim_cache_failed": result.get("slim_cache_failed", 0),
                 },
             )
         except Exception as _he:

@@ -1943,7 +1943,7 @@ def main(
     # Soft timeout gate: if nearing limit, write whatever we have and exit
     if _near_timeout():
         log.warning("Soft timeout before sector ETF fetch — writing partial predictions")
-        write_predictions(predictions, date_str, bucket, {"model_version": "timeout"}, dry_run=dry_run, fd=fd)
+        write_predictions(predictions, date_str, bucket, {"model_version": "timeout", "timed_out": True}, dry_run=dry_run, fd=fd)
         return
 
     # Ensure all sector ETFs needed are present in macro (may be missing from
@@ -1966,7 +1966,7 @@ def main(
     # Soft timeout gate
     if _near_timeout():
         log.warning("Soft timeout before alternative data fetch — writing partial predictions")
-        write_predictions(predictions, date_str, bucket, {"model_version": "timeout"}, dry_run=dry_run, fd=fd)
+        write_predictions(predictions, date_str, bucket, {"model_version": "timeout", "timed_out": True}, dry_run=dry_run, fd=fd)
         return
 
     # ── Step 3d: Fetch alternative data for O10-O12 features ─────────────────
@@ -2003,7 +2003,7 @@ def main(
     # Soft timeout gate
     if _near_timeout():
         log.warning("Soft timeout before inference — writing partial predictions")
-        write_predictions(predictions, date_str, bucket, {"model_version": "timeout"}, dry_run=dry_run, fd=fd)
+        write_predictions(predictions, date_str, bucket, {"model_version": "timeout", "timed_out": True}, dry_run=dry_run, fd=fd)
         return
 
     # ── Step 4: Run inference ─────────────────────────────────────────────────
