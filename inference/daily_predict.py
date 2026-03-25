@@ -300,7 +300,7 @@ def get_universe_tickers(s3_bucket: str, date_str: Optional[str] = None) -> list
     if date_str is None:
         date_str = datetime.now().strftime("%Y-%m-%d")
 
-    signals_key = f"signals/signals_{date_str.replace('-', '')}.json"
+    signals_key = f"signals/{date_str}/signals.json"
 
     try:
         import boto3
@@ -520,11 +520,6 @@ def fetch_today_prices(tickers: list[str], fd=None) -> dict[str, pd.DataFrame]:
                         result[ticker] = pd.DataFrame()
         except Exception as exc:
             log.warning("Batch price fetch failed: %s", exc)
-            if fd:
-                fd.report(exc, severity="error", context={
-                    "site": "batch_price_fetch",
-                    "batch_size": len(batch),
-                })
             for ticker in batch:
                 result[ticker] = pd.DataFrame()
 
@@ -1230,19 +1225,12 @@ def predict_ticker_gbm(
     p_down = float(np.clip(0.5 - s / (2.0 * max_r), 0.0, 1.0))
     p_flat = float(max(0.0, 1.0 - p_up - p_down))
 
-    if s > cfg.UP_THRESHOLD:
+    if s >= 0:
         predicted_direction = "UP"
         confidence = p_up
-    elif s < cfg.DOWN_THRESHOLD:
+    else:
         predicted_direction = "DOWN"
         confidence = p_down
-    else:
-        predicted_direction = "FLAT"
-        # How far from the nearest threshold (0 at boundary, 1 at dead center)
-        up_t = cfg.UP_THRESHOLD if cfg.UP_THRESHOLD else 0.01
-        dist_from_boundary = min(abs(s - up_t), abs(s - cfg.DOWN_THRESHOLD))
-        max_dist = abs(up_t)  # max possible distance from boundary within FLAT zone
-        confidence = float(np.clip(dist_from_boundary / max_dist, 0.0, 1.0)) if max_dist > 0 else 0.5
 
     return {
         "ticker":                ticker,
@@ -1345,12 +1333,6 @@ def write_predictions(
     except Exception as exc:
         log.error("S3 write failed: %s", exc)
         log.error("Predictions not written to S3. Check IAM permissions for s3://%s", s3_bucket)
-        if fd:
-            fd.report(exc, severity="critical", context={
-                "site": "s3_predictions_write",
-                "bucket": s3_bucket,
-                "date": date_str,
-            })
 
 
 # ── Predictor email ────────────────────────────────────────────────────────────
@@ -1385,7 +1367,6 @@ def _build_predictor_email(
 
     # Counts for subject line
     ups   = [p for p in predictions if p.get("predicted_direction") == "UP"]
-    flats = [p for p in predictions if p.get("predicted_direction") == "FLAT"]
     downs = [p for p in predictions if p.get("predicted_direction") == "DOWN"]
 
     # Vetoes: negative predicted alpha AND combined_rank in bottom half
@@ -1411,7 +1392,7 @@ def _build_predictor_email(
     cand_str    = f" | {len(population)} stocks" if population else ""
     subject = (
         f"Alpha Engine Brief | {date_str}{regime_str}{cand_str} | "
-        f"{len(ups)} UP / {len(flats)} FLAT / {len(downs)} DOWN"
+        f"{len(ups)} UP / {len(downs)} DOWN"
         f"{veto_str}"
     )
 
@@ -1446,7 +1427,7 @@ def _build_predictor_email(
         is_veto = (d == "DOWN" and p.get("prediction_confidence", 0) >= _vt)
         if is_veto:
             return '<span style="color:#c62828; font-weight:bold;">⚠ VETO</span>'
-        colors = {"UP": "#2e7d32", "DOWN": "#c62828", "FLAT": "#888"}
+        colors = {"UP": "#2e7d32", "DOWN": "#c62828"}
         return f'<span style="color:{colors.get(d, "#888")}; font-weight:bold;">{d}</span>'
 
     def _html_prediction_table(preds: list[dict]) -> str:
@@ -1647,7 +1628,7 @@ def _build_predictor_email(
         f"\n{'='*60}\n"
         f"GBM PREDICTIONS\n"
         f"{'='*60}\n"
-        f"\nPredictions (sorted by MSE α, {len(ups)} UP / {len(flats)} FLAT / {len(downs)} DOWN)\n"
+        f"\nPredictions (sorted by combined rank, {len(ups)} UP / {len(downs)} DOWN)\n"
         f"{_plain_prediction_list(sorted_preds)}"
     )
     if vetoes:
@@ -1792,12 +1773,6 @@ def main(
         return False
 
     fd = None
-    try:
-        import flow_doctor
-        fd = flow_doctor.init(config_path=os.path.join(
-            str(Path(__file__).resolve().parent.parent), "flow-doctor.yaml"))
-    except Exception:
-        pass
 
     if date_str is None:
         date_str = datetime.now().strftime("%Y-%m-%d")
@@ -2136,9 +2111,6 @@ def main(
                     log.info("MSE inference complete: %d tickers", n_tickers)
                 except Exception as exc:
                     log.error("MSE inference failed: %s", exc)
-                    if fd:
-                        fd.report(exc, severity="critical", context={
-                            "site": "mse_inference", "n_tickers": n_tickers})
 
             # Lambdarank model inference → cross-sectional rank
             if rank_scorer is not None:
@@ -2177,18 +2149,12 @@ def main(
                 p_up   = float(np.clip(0.5 + alpha / (2.0 * max_r), 0.0, 1.0))
                 p_down = float(np.clip(0.5 - alpha / (2.0 * max_r), 0.0, 1.0))
                 p_flat = float(max(0.0, 1.0 - p_up - p_down))
-                if alpha > cfg.UP_THRESHOLD:
+                if alpha >= 0:
                     predicted_direction = "UP"
                     confidence = p_up
-                elif alpha < cfg.DOWN_THRESHOLD:
+                else:
                     predicted_direction = "DOWN"
                     confidence = p_down
-                else:
-                    predicted_direction = "FLAT"
-                    up_t = cfg.UP_THRESHOLD if cfg.UP_THRESHOLD else 0.01
-                    dist_from_boundary = min(abs(alpha - up_t), abs(alpha - cfg.DOWN_THRESHOLD))
-                    max_dist = abs(up_t)
-                    confidence = float(np.clip(dist_from_boundary / max_dist, 0.0, 1.0)) if max_dist > 0 else 0.5
 
                 result = {
                     "ticker":                ticker,
@@ -2312,7 +2278,6 @@ def main(
         from health_status import write_health
         n_up = sum(1 for p in predictions if p.get("predicted_direction") == "UP")
         n_down = sum(1 for p in predictions if p.get("predicted_direction") == "DOWN")
-        n_flat = sum(1 for p in predictions if p.get("predicted_direction") == "FLAT")
         write_health(
             bucket=bucket,
             module_name="predictor_inference",
@@ -2323,7 +2288,6 @@ def main(
                 "n_predictions": len(predictions),
                 "n_up": n_up,
                 "n_down": n_down,
-                "n_flat": n_flat,
             },
         )
     except Exception as _he:

@@ -206,11 +206,6 @@ def refresh_price_cache(
                 "yfinance batch download failed for %s...: %s",
                 ticker_names[:3], exc,
             )
-            if fd:
-                fd.report(exc, severity="error", context={
-                    "site": "batch_yfinance_refresh",
-                    "batch_tickers": ticker_names[:5],
-                })
             continue
 
         for ticker, parquet_path in batch:
@@ -339,11 +334,6 @@ def write_slim_cache(
 
         except Exception as exc:
             log.warning("Slim cache write failed for %s: %s", parquet_path.stem, exc)
-            if fd:
-                fd.report(exc, severity="error", context={
-                    "site": "slim_cache_write",
-                    "ticker": parquet_path.stem,
-                })
 
     log.info(
         "Slim cache written: %d / %d tickers uploaded to s3://%s/%s",
@@ -1409,12 +1399,6 @@ def main(
         date_str = datetime.now().strftime("%Y-%m-%d")
 
     fd = None
-    try:
-        import flow_doctor
-        fd = flow_doctor.init(config_path=os.path.join(
-            str(Path(__file__).resolve().parent.parent), "flow-doctor-training.yaml"))
-    except Exception:
-        pass
 
     log.info("GBM training run: date=%s  bucket=%s  dry_run=%s", date_str, bucket, dry_run)
 
@@ -1467,5 +1451,25 @@ def main(
     # Step 3: Email
     if not dry_run:
         send_training_email(result, date_str)
+
+    # Step 4: Health status
+    if not dry_run:
+        try:
+            from health_status import write_health
+            write_health(
+                bucket=bucket,
+                module_name="predictor_training",
+                status="ok",
+                run_date=date_str,
+                duration_seconds=result.get("train_time_seconds", 0),
+                summary={
+                    "promoted": result.get("promoted", False),
+                    "ic_30d": result.get("ic_30d"),
+                    "n_train": result.get("n_train"),
+                    "slim_cache_tickers": result.get("slim_cache_tickers"),
+                },
+            )
+        except Exception as _he:
+            log.warning("Health status write failed: %s", _he)
 
     return result
