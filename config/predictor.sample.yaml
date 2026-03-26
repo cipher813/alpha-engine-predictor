@@ -124,6 +124,15 @@ alternative_data:
   revision_features_enabled: true    # O11: EPS revision momentum + streak
   options_features_enabled: true     # O12: put/call ratio, IV rank, IV vs RV
 
+# ── Feature Store ────────────────────────────────────────────────────────────
+# S3-based feature store. Writes dated Parquet snapshots after inference/training.
+# Consumers (executor, research, backtester) read from s3://{bucket}/{prefix}{date}/.
+feature_store:
+  enabled: false                     # set true to activate feature store writes
+  prefix: "features/"                # S3 key prefix for feature snapshots
+  write_on_inference: true           # write daily feature snapshot after inference
+  write_on_training: true            # upload registry.json after training
+
 # ── Feature selection / noise detection ──────────────────────────────────────
 feature_selection:
   shap_noise_threshold_pct: 1.0    # SHAP below this % of top feature → noise candidate
