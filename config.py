@@ -120,8 +120,17 @@ N_CLASSES = 3  # UP, FLAT, DOWN
 # cross-sectional alpha.  Excluded from GBM training/inference but kept in
 # FEATURES for other callers (Research module, backtester technical scoring).
 MACRO_FEATURES = {"vix_level", "yield_10y", "yield_curve_slope", "gold_mom_5d", "oil_mom_5d"}
-GBM_FEATURES = [f for f in FEATURES if f not in MACRO_FEATURES]
-N_GBM_FEATURES = len(GBM_FEATURES)  # 44 (29 technical + 7 alternative + 8 fundamental)
+
+# Fundamental features — computed and stored in feature store but excluded from
+# GBM training/inference until backtester A/B validates their contribution.
+# Move to GBM_FEATURES once validated with sufficient history.
+_FUNDAMENTAL_EXCLUDE = {
+    "pe_ratio", "pb_ratio", "debt_to_equity", "revenue_growth_yoy",
+    "fcf_yield", "gross_margin", "roe", "current_ratio",
+}
+
+GBM_FEATURES = [f for f in FEATURES if f not in MACRO_FEATURES and f not in _FUNDAMENTAL_EXCLUDE]
+N_GBM_FEATURES = len(GBM_FEATURES)  # 36 (29 technical + 7 alternative)
 
 # Class labels — index matches model output neuron order
 CLASS_LABELS = ["DOWN", "FLAT", "UP"]  # index 0, 1, 2

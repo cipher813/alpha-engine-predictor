@@ -188,11 +188,18 @@ class TestComputeFeaturesWithFundamentals:
 
         assert arr.shape[1] == 49
 
-    def test_gbm_features_excludes_macro_includes_fundamental(self):
-        """GBM features should include fundamentals but exclude macro."""
+    def test_gbm_features_excludes_macro_and_fundamental(self):
+        """GBM features should exclude both macro and fundamental (until validated)."""
         from config import GBM_FEATURES, MACRO_FEATURES, FUNDAMENTAL_FEATURES
 
         for f in FUNDAMENTAL_FEATURES:
-            assert f in GBM_FEATURES, f"Fundamental feature {f} missing from GBM_FEATURES"
+            assert f not in GBM_FEATURES, f"Fundamental feature {f} should not be in GBM_FEATURES yet"
         for f in MACRO_FEATURES:
             assert f not in GBM_FEATURES
+
+    def test_fundamental_features_in_full_features_list(self):
+        """Fundamental features should be in FEATURES (computed and stored) even if not in GBM."""
+        from config import FEATURES, FUNDAMENTAL_FEATURES
+
+        for f in FUNDAMENTAL_FEATURES:
+            assert f in FEATURES, f"Fundamental feature {f} missing from FEATURES"
