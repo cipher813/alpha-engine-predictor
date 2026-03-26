@@ -1453,6 +1453,15 @@ def main(
     else:
         log.info("[dry-run] Skipping slim cache write")
 
+    # Step 2c: Feature store — upload registry (best-effort, non-blocking)
+    import config as _fs_cfg
+    if _fs_cfg.FEATURE_STORE_ENABLED and _fs_cfg.FEATURE_STORE_WRITE_ON_TRAINING and not dry_run:
+        try:
+            from feature_store.registry import upload_registry
+            upload_registry(bucket, prefix=_fs_cfg.FEATURE_STORE_PREFIX)
+        except Exception as _fs_exc:
+            log.warning("Feature store registry upload failed (non-fatal): %s", _fs_exc)
+
     # Step 3: Email
     if not dry_run:
         send_training_email(result, date_str)

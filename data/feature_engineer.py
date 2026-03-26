@@ -157,9 +157,10 @@ def compute_features(
     earnings_data: dict | None = None,
     revision_data: dict | None = None,
     options_data: dict | None = None,
+    fundamental_data: dict | None = None,
 ) -> pd.DataFrame:
     """
-    Compute all 29 technical and macro features for a full OHLCV DataFrame.
+    Compute all technical, macro, and alternative data features for a full OHLCV DataFrame.
 
     Parameters
     ----------
@@ -197,12 +198,17 @@ def compute_features(
     options_data : dict or None
         Per-ticker options data with keys: put_call_ratio, iv_rank, atm_iv.
         Used for O12 options features. Defaults to neutral when None.
+    fundamental_data : dict or None
+        Per-ticker fundamental ratios with keys: pe_ratio, pb_ratio,
+        debt_to_equity, revenue_growth_yoy, fcf_yield, gross_margin, roe,
+        current_ratio. Pre-normalized by fundamental_fetcher. Defaults to
+        neutral (0.0) when None.
 
     Returns
     -------
     pd.DataFrame
-        Original columns plus the 34+7=41 feature columns. Rows without
-        sufficient history for any feature are dropped.
+        Original columns plus feature columns. Rows without sufficient
+        history for any feature are dropped.
 
     Notes
     -----
@@ -536,6 +542,28 @@ def compute_features(
         df["put_call_ratio"] = 0.0   # log(1.0) = 0
         df["iv_rank"] = 0.5          # 50th percentile
         df["iv_vs_rv"] = 1.0         # neutral
+
+    # ── v3.0 features — fundamental ratios (quarterly, from FMP) ─────────────
+    # Pre-normalized by fundamental_fetcher.py (P/E / 30, P/B / 5, etc.).
+    # Broadcast as constants across all rows (same pattern as earnings_data).
+    if fundamental_data:
+        df["pe_ratio"] = float(fundamental_data.get("pe_ratio", 0.0))
+        df["pb_ratio"] = float(fundamental_data.get("pb_ratio", 0.0))
+        df["debt_to_equity"] = float(fundamental_data.get("debt_to_equity", 0.0))
+        df["revenue_growth_yoy"] = float(fundamental_data.get("revenue_growth_yoy", 0.0))
+        df["fcf_yield"] = float(fundamental_data.get("fcf_yield", 0.0))
+        df["gross_margin"] = float(fundamental_data.get("gross_margin", 0.0))
+        df["roe"] = float(fundamental_data.get("roe", 0.0))
+        df["current_ratio"] = float(fundamental_data.get("current_ratio", 0.0))
+    else:
+        df["pe_ratio"] = 0.0
+        df["pb_ratio"] = 0.0
+        df["debt_to_equity"] = 0.0
+        df["revenue_growth_yoy"] = 0.0
+        df["fcf_yield"] = 0.0
+        df["gross_margin"] = 0.0
+        df["roe"] = 0.0
+        df["current_ratio"] = 0.0
 
     # ── Drop rows with any NaN in the feature columns ─────────────────────────
     from config import FEATURES as feature_cols

@@ -2038,6 +2038,7 @@ def main(
                 )
 
         raw_vectors: dict[str, np.ndarray] = {}   # ticker → raw feature vector
+        _store_rows: list[dict] = []  # feature store: collect all features per ticker
         for ticker in tickers:
             df = price_data.get(ticker, pd.DataFrame())
             if df.empty or len(df) < cfg.MIN_ROWS_FOR_FEATURES:
@@ -2072,6 +2073,14 @@ def main(
             except KeyError:
                 n_skipped += 1
                 continue
+            # Collect full feature row for feature store (all 49 features, not just GBM)
+            try:
+                row = {"ticker": ticker}
+                for f in cfg.FEATURES:
+                    row[f] = float(latest[f]) if f in latest.index else 0.0
+                _store_rows.append(row)
+            except Exception:
+                pass  # feature store is best-effort
 
         # Cross-sectional rank normalization across all tickers
         if raw_vectors:
@@ -2212,6 +2221,19 @@ def main(
 
     # Sort by combined_rank (ascending = best first), fall back to mse_rank
     predictions.sort(key=lambda p: p.get("combined_rank") or p.get("mse_rank") or 999)
+
+    # ── Feature store write (best-effort, non-blocking) ───────────────────────
+    if cfg.FEATURE_STORE_ENABLED and cfg.FEATURE_STORE_WRITE_ON_INFERENCE and _store_rows:
+        try:
+            import pandas as _fs_pd
+            from feature_store.writer import write_feature_snapshot
+            from feature_store.registry import upload_registry
+
+            _fs_df = _fs_pd.DataFrame(_store_rows)
+            write_feature_snapshot(date_str, _fs_df, bucket, prefix=cfg.FEATURE_STORE_PREFIX)
+            upload_registry(bucket, prefix=cfg.FEATURE_STORE_PREFIX)
+        except Exception as _fs_exc:
+            log.warning("Feature store write failed (non-fatal): %s", _fs_exc)
 
     # ── Step 5: Build metrics ─────────────────────────────────────────────────
     # For GBM: read training-time meta from S3 to populate training_samples,

@@ -103,8 +103,17 @@ FEATURES = [
     "put_call_ratio",           # O12: log-transformed put/call OI ratio
     "iv_rank",                  # O12: IV percentile rank (0-1)
     "iv_vs_rv",                 # O12: implied vol / realized vol ratio
+    # v3.0 additions — fundamental ratios (quarterly, from FMP)
+    "pe_ratio",                  # P/E / 30, normalized
+    "pb_ratio",                  # P/B / 5, normalized
+    "debt_to_equity",            # D/E / 2, normalized
+    "revenue_growth_yoy",        # YoY revenue growth (decimal)
+    "fcf_yield",                 # Free cash flow / market cap
+    "gross_margin",              # Gross profit / revenue (0-1)
+    "roe",                       # Return on equity (decimal)
+    "current_ratio",             # Current ratio / 3, normalized
 ]
-N_FEATURES = 41
+N_FEATURES = 49
 N_CLASSES = 3  # UP, FLAT, DOWN
 
 # Macro features — identical across all tickers on a given day, cannot predict
@@ -112,7 +121,7 @@ N_CLASSES = 3  # UP, FLAT, DOWN
 # FEATURES for other callers (Research module, backtester technical scoring).
 MACRO_FEATURES = {"vix_level", "yield_10y", "yield_curve_slope", "gold_mom_5d", "oil_mom_5d"}
 GBM_FEATURES = [f for f in FEATURES if f not in MACRO_FEATURES]
-N_GBM_FEATURES = len(GBM_FEATURES)  # 36 (29 original + 7 alternative data)
+N_GBM_FEATURES = len(GBM_FEATURES)  # 44 (29 technical + 7 alternative + 8 fundamental)
 
 # Class labels — index matches model output neuron order
 CLASS_LABELS = ["DOWN", "FLAT", "UP"]  # index 0, 1, 2
@@ -199,6 +208,25 @@ IC_NOISE_THRESHOLD = _fs_cfg.get("ic_noise_threshold", 0.005)
 
 # ── Feature engineering parameters ───────────────────────────────────────────
 FEATURE_CFG: dict = _cfg["features"]
+
+# ── Feature Store ────────────────────────────────────────────────────────────
+_fs_store_cfg = _cfg.get("feature_store", {})
+FEATURE_STORE_ENABLED = _fs_store_cfg.get("enabled", False)
+FEATURE_STORE_PREFIX = _fs_store_cfg.get("prefix", "features/")
+FEATURE_STORE_WRITE_ON_INFERENCE = _fs_store_cfg.get("write_on_inference", True)
+FEATURE_STORE_WRITE_ON_TRAINING = _fs_store_cfg.get("write_on_training", True)
+
+# Fundamental features (v3.0 — quarterly FMP data)
+FUNDAMENTAL_FEATURES = [
+    "pe_ratio",
+    "pb_ratio",
+    "debt_to_equity",
+    "revenue_growth_yoy",
+    "fcf_yield",
+    "gross_margin",
+    "roe",
+    "current_ratio",
+]
 
 # ── AWS / Email ──────────────────────────────────────────────────────────────
 AWS_REGION       = os.environ.get("AWS_REGION", "us-east-1")

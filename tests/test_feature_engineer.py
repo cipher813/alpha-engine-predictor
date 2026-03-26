@@ -66,7 +66,7 @@ class TestComputeFeatures:
 
         # Verify the constant matches the list length
         assert len(FEATURES) == N_FEATURES
-        assert N_FEATURES == 41
+        assert N_FEATURES == 49
 
     def test_output_rows_fewer_than_input(self):
         """Warmup rows (252+) should be dropped, so output has fewer rows."""
