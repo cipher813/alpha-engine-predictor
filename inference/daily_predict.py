@@ -2000,6 +2000,22 @@ def main(
     except Exception as exc:
         log.warning("O12: Options features fetch failed (features will use defaults): %s", exc)
 
+    _fundamental_all: dict[str, dict] = {}
+    try:
+        from feature_store.fundamental_fetcher import (
+            fetch_fundamental_data, cache_fundamentals_to_s3, load_fundamentals_from_s3,
+        )
+        # Try S3 cache first (fundamentals are quarterly — reuse within the quarter)
+        _fundamental_all = load_fundamentals_from_s3(date_str, bucket) or {}
+        if _fundamental_all:
+            log.info("Fundamentals: Loaded cached data for %d tickers from S3", len(_fundamental_all))
+        else:
+            _fundamental_all = fetch_fundamental_data(tickers)
+            cache_fundamentals_to_s3(_fundamental_all, date_str, bucket)
+            log.info("Fundamentals: Fetched data for %d tickers from FMP", len(_fundamental_all))
+    except Exception as exc:
+        log.warning("Fundamentals: Fetch failed (features will use defaults): %s", exc)
+
     # Soft timeout gate
     if _near_timeout():
         log.warning("Soft timeout before inference — writing partial predictions")
@@ -2059,6 +2075,7 @@ def main(
                     earnings_data=_earnings_all.get(ticker),
                     revision_data=_revision_all.get(ticker),
                     options_data=_options_all.get(ticker),
+                    fundamental_data=_fundamental_all.get(ticker),
                 )
             except Exception as exc:
                 log.warning("Feature computation failed for %s: %s", ticker, exc)
