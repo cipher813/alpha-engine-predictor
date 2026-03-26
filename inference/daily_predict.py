@@ -2035,17 +2035,37 @@ def main(
         gbm_feature_cols = cfg.GBM_FEATURES
 
         # Validate feature alignment between config and trained model.
-        # Use booster.num_feature() as the authoritative check — meta.json
-        # feature names can be empty if the file is missing.
+        # If the model was trained on fewer features (e.g., before fundamentals
+        # were added), use the model's feature list for inference. New features
+        # are still computed and written to the feature store, but the model
+        # only sees the features it was trained on.
+        _model_n_features = None
         for label, sc in [("MSE", mse_scorer), ("Rank", rank_scorer)]:
             if sc is None or sc._booster is None:
                 continue
             expected = sc._booster.num_feature()
             if len(gbm_feature_cols) != expected:
-                msg = (f"Feature count mismatch ({label} model): config has "
-                       f"{len(gbm_feature_cols)} features but model expects {expected}")
-                log.error(msg)
-                raise ValueError(msg)
+                if sc._feature_names and len(sc._feature_names) == expected:
+                    # Model has a recorded feature list — use it
+                    gbm_feature_cols = list(sc._feature_names)
+                    log.warning(
+                        "%s model expects %d features but config has %d — "
+                        "using model's feature list for inference (new features "
+                        "will be available after next training run)",
+                        label, expected, len(cfg.GBM_FEATURES),
+                    )
+                    _model_n_features = expected
+                    break
+                else:
+                    # No feature names in model metadata — fall back to truncating
+                    gbm_feature_cols = cfg.GBM_FEATURES[:expected]
+                    log.warning(
+                        "%s model expects %d features but config has %d — "
+                        "truncating to first %d features for inference",
+                        label, expected, len(cfg.GBM_FEATURES), expected,
+                    )
+                    _model_n_features = expected
+                    break
             if sc._feature_names and list(sc._feature_names) != list(gbm_feature_cols):
                 log.warning(
                     "Feature ORDER mismatch between config and %s model — "
