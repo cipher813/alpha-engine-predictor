@@ -2111,6 +2111,16 @@ def main(
             except KeyError:
                 n_skipped += 1
                 continue
+            # Log raw features for first ticker to diagnose stale prediction issue
+            if ticker == ordered_tickers_for_log[0] if 'ordered_tickers_for_log' in dir() else len(raw_vectors) == 1:
+                ordered_tickers_for_log = [ticker]  # mark that we've logged
+                _fv = raw_vectors[ticker]
+                log.info(
+                    "Feature debug %s: last_date=%s rsi=%.4f macd_cross=%.4f mom20d=%.4f hash=%s",
+                    ticker, featured_df.index[-1].date(),
+                    float(_fv[0]), float(_fv[1]), float(_fv[6]),
+                    hash(_fv.tobytes()),
+                )
             # Collect full feature row for feature store (all 49 features, not just GBM)
             try:
                 row = {"ticker": ticker}
@@ -2142,6 +2152,13 @@ def main(
                 log.info("Rank-normalized GBM features across %d tickers", n_tickers)
             else:
                 X_batch[:, :] = 0.5  # single ticker defaults to median percentile
+
+            # Log ranked features for first ticker
+            log.info(
+                "Ranked features debug %s: hash=%s first5=%s",
+                ordered_tickers[0], hash(X_batch[0].tobytes()),
+                X_batch[0, :5].tolist(),
+            )
 
             # Run BOTH models on the same rank-normalized features.
             # MSE → predicted_alpha (calibrated 5d return), direction, veto
