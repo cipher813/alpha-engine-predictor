@@ -725,8 +725,10 @@ def save_daily_closes(
                     last = df.iloc[-1]
                     raw_close = float(last["Close"])
                     adj_close = float(last["Adj Close"]) if "Adj Close" in df.columns else raw_close
+                    # Strip ^ prefix (yfinance uses ^VIX but slim cache stores VIX)
+                    store_ticker = ticker.lstrip("^")
                     records.append({
-                        "ticker":    ticker,
+                        "ticker":    store_ticker,
                         "date":      date_str,
                         "open":      round(float(last["Open"]),  4),
                         "high":      round(float(last["High"]),  4),
@@ -1962,7 +1964,16 @@ def main(
     # These files are the delta source for the slim-cache inference path.
     # adj_close = full (split + dividend) adjusted close; the ratio adj_close/close
     # captures the dividend factor and helps detect splits via sudden price jumps.
-    save_daily_closes(tickers, date_str, bucket, dry_run=dry_run)
+    # Include macro symbols (SPY, VIX, sector ETFs) so the delta has macro data
+    # for dates after the slim cache. Without this, compute_features drops rows
+    # after the slim cache's last date due to NaN in macro-dependent features
+    # (return_vs_spy_5d, mom5d_x_vix, etc.), and dropna() truncates featured_df
+    # to the slim cache's last date — making predictions identical every day.
+    _MACRO_YFINANCE = {"SPY": "SPY", "^VIX": "VIX", "^TNX": "TNX", "^IRX": "IRX", "GLD": "GLD", "USO": "USO"}
+    _sector_etfs = [s for s in (slim_data if 'slim_data' in dir() else {}) if s.startswith("XL")]
+    _macro_yf_tickers = list(_MACRO_YFINANCE.keys()) + _sector_etfs
+    _all_daily_tickers = sorted(set(tickers + _macro_yf_tickers))
+    save_daily_closes(_all_daily_tickers, date_str, bucket, dry_run=dry_run)
 
     # Soft timeout gate
     if _near_timeout():
