@@ -945,7 +945,7 @@ def load_price_data_from_cache(
 
     # ── Step 3: Load daily_closes delta ──────────────────────────────────────
     ticker_rows = _load_delta_from_daily_closes(
-        s3_bucket, slim_last_date, today - pd.Timedelta(days=1),
+        s3_bucket, slim_last_date, today,
     )
 
     # ── Step 4: Build combined price_data per ticker ──────────────────────────
@@ -1397,7 +1397,8 @@ def _build_predictor_email(
     )
 
     # ── Helpers ───────────────────────────────────────────────────────────────
-    run_time = _dt.datetime.now().strftime("%-I:%M %p PT")
+    _pt = _dt.timezone(_dt.timedelta(hours=-7))  # PDT
+    run_time = _dt.datetime.now(_pt).strftime("%-I:%M %p PT")
     ic_str   = f"{val_ic:.4f}" if isinstance(val_ic, (int, float)) else "—"
 
     def _source_tag(p: dict) -> str:

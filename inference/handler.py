@@ -44,10 +44,13 @@ def handler(event: dict, context) -> dict:
     os.environ.setdefault("S3_BUCKET", "alpha-engine-research")
     os.environ.setdefault("XDG_CACHE_HOME", "/tmp")
 
+    # Lambda runtime pre-configures the root logger, making basicConfig a no-op.
+    # Explicitly set the root logger level to ensure INFO lines reach CloudWatch.
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s  %(levelname)-8s  %(message)s",
     )
+    logging.getLogger().setLevel(logging.INFO)
 
     fd = None
 
