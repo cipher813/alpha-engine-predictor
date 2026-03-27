@@ -1015,7 +1015,7 @@ def load_price_data_from_cache(
         len(split_tickers),
     )
 
-    # ── Step 6: Build macro dict from slim cache ──────────────────────────────
+    # ── Step 6: Build macro dict from slim cache + delta ─────────────────────
     # These symbols are stored without caret in the training cache parquets.
     _MACRO_SLIM_KEYS = {
         "SPY": "SPY",
@@ -1026,10 +1026,15 @@ def load_price_data_from_cache(
         "USO": "USO",
     }
     macro: dict[str, pd.Series] = {}
+    _stale_macros: list[str] = []  # yfinance tickers to re-fetch
     for key, stem in _MACRO_SLIM_KEYS.items():
-        # Prefer combined price_data (includes delta) over raw slim_data
         source = price_data.get(stem) if stem in price_data else slim_data.get(stem)
         if source is not None and "Close" in source.columns:
+            last_macro_date = pd.Timestamp(source.index.max()).normalize()
+            if (today - last_macro_date).days > 1:
+                # Macro series is stale — needs fresh data from yfinance
+                _yf_sym = f"^{stem}" if stem in ("VIX", "TNX", "IRX") else stem
+                _stale_macros.append(_yf_sym)
             macro[key] = source["Close"].dropna()
         else:
             log.debug("Macro series %s not in slim cache", key)
@@ -1038,7 +1043,30 @@ def load_price_data_from_cache(
     for stem, df in slim_data.items():
         if stem.startswith("XL") and "Close" in df.columns:
             source = price_data.get(stem) if stem in price_data else df
+            last_etf_date = pd.Timestamp(source.index.max()).normalize()
+            if (today - last_etf_date).days > 1:
+                _stale_macros.append(stem)
             macro[stem] = source["Close"].dropna()
+
+    # Re-fetch stale macro series from yfinance so feature dropna doesn't
+    # truncate featured_df to the slim cache's last date
+    if _stale_macros:
+        log.info("Re-fetching %d stale macro series from yfinance: %s", len(_stale_macros), _stale_macros[:10])
+        _fresh = fetch_today_prices(_stale_macros)
+        for yf_sym, fresh_df in _fresh.items():
+            if fresh_df.empty:
+                continue
+            # Map yfinance ticker back to slim cache key
+            cache_key = yf_sym.lstrip("^")
+            macro_key = cache_key  # SPY→SPY, VIX→VIX, XLK→XLK
+            if cache_key in _MACRO_SLIM_KEYS.values():
+                # Find the macro dict key (SPY→SPY, VIX→VIX, etc.)
+                macro_key = next(k for k, v in _MACRO_SLIM_KEYS.items() if v == cache_key)
+            if "Close" in fresh_df.columns:
+                macro[macro_key] = fresh_df["Close"].dropna()
+                # Also update price_data so the delta merge benefits other tickers
+                price_data[cache_key] = fresh_df
+        log.info("Macro refresh complete: %d series updated", len(_fresh))
 
     return price_data, macro
 
