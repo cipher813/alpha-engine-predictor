@@ -1713,6 +1713,20 @@ def send_predictor_email(
         log.warning("Failed to build predictor email body: %s", exc)
         return False
 
+    # Archive morning briefing HTML to S3
+    try:
+        import boto3 as _boto3_arch
+        _s3_arch = _boto3_arch.client("s3")
+        _s3_arch.put_object(
+            Bucket=cfg.S3_BUCKET,
+            Key=f"consolidated/{date_str}/morning_brief.html",
+            Body=html_body.encode("utf-8"),
+            ContentType="text/html",
+        )
+        log.info("Morning briefing archived: consolidated/%s/morning_brief.html", date_str)
+    except Exception as _ae:
+        log.warning("Morning briefing archival failed (non-fatal): %s", _ae)
+
     app_password = os.environ.get("GMAIL_APP_PASSWORD", "").strip()
 
     if app_password:
@@ -2410,6 +2424,24 @@ def main(
         )
     except Exception as _he:
         log.warning("Health status write failed: %s", _he)
+
+    # ── Data manifest ──────────────────────────────────────────────────────────
+    try:
+        from health_status import write_data_manifest
+        write_data_manifest(
+            bucket=bucket,
+            module_name="predictor_inference",
+            run_date=date_str,
+            manifest={
+                "n_predictions": len(predictions),
+                "n_up": n_up,
+                "n_down": n_down,
+                "n_tickers_failed": len(getattr(cfg, 'FAILED_TICKERS', [])),
+                "model_version": getattr(cfg, 'GBM_VERSION', 'unknown'),
+            },
+        )
+    except Exception as _me:
+        log.warning("Data manifest write failed: %s", _me)
 
     log.info("Predictor run complete for %s", date_str)
 

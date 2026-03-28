@@ -950,6 +950,29 @@ def run_gbm_training(
                     reason,
                 )
 
+            # ── Feature importance time series (saved every retrain, promoted or not) ──
+            try:
+                fi_payload = {
+                    "date": date_str,
+                    "model_version": cfg.GBM_VERSION,
+                    "promoted": promoted,
+                    "promoted_mode": best_mode if promoted else None,
+                    "best_iteration": scorer._best_iteration,
+                    "gain_importance": dict(importance),
+                    "shap_importance": shap_importance,
+                    "feature_ics": feature_ics,
+                    "n_train": int(len(y_train)),
+                }
+                s3.put_object(
+                    Bucket=bucket,
+                    Key=f"predictor/metrics/feature_importance_{date_str}.json",
+                    Body=json.dumps(fi_payload, indent=2).encode(),
+                    ContentType="application/json",
+                )
+                log.info("Feature importance time series written for %s", date_str)
+            except Exception as _fi_err:
+                log.warning("Feature importance write failed (non-blocking): %s", _fi_err)
+
     result = {
         "model_version":         model_version,
         "best_iteration":        scorer._best_iteration,
@@ -1486,5 +1509,25 @@ def main(
             )
         except Exception as _he:
             log.warning("Health status write failed: %s", _he)
+
+        # Data manifest
+        try:
+            from health_status import write_data_manifest
+            write_data_manifest(
+                bucket=bucket,
+                module_name="predictor_training",
+                run_date=date_str,
+                manifest={
+                    "promoted": result.get("promoted", False),
+                    "promoted_mode": result.get("promoted_mode"),
+                    "test_ic": result.get("test_ic"),
+                    "n_train": result.get("n_train"),
+                    "n_test": result.get("n_test"),
+                    "slim_cache_tickers": result.get("slim_cache_tickers"),
+                    "slim_cache_failed": result.get("slim_cache_failed", 0),
+                },
+            )
+        except Exception as _me:
+            log.warning("Data manifest write failed: %s", _me)
 
     return result
