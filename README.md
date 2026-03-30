@@ -322,7 +322,7 @@ Key cross-asset opportunities:
 
 ### Training Pipeline Gaps
 
-1. ~~**Walk-forward fold generation mixes calendar and trading days**~~ — **Resolved 2026-03-18.** Config key renamed to `test_window_trading_days` (with backward compat fallback) to clarify that fold windows are in trading days. Walk-forward fast mode added (`wf_n_estimators: 500`, `wf_early_stopping: 20`) to reduce per-fold training time ~4x. Per-fold timing logged.
+1. ~~**Walk-forward fold generation mixes calendar and trading days**~~ — **Resolved 2026-03-18.** Config key renamed to `test_window_trading_days` (with backward compat fallback) to clarify that fold windows are in trading days. Walk-forward fast mode added (`wf_n_estimators: 500`, `wf_early_stopping: 20`) to reduce per-fold training time ~4x. Per-fold timing logged. **Note:** WF fast mode uses lighter params than production (500 vs 1000 estimators, 20 vs 30 early stopping). IC estimates from WF may be pessimistic relative to the final model. If WF frequently fails while single-split passes, consider aligning WF params with production (set `wf_n_estimators: null` in predictor.yaml) at the cost of ~4x longer training time.
 
 2. **No automated feature selection** — features are manually curated across 5 generations. SHAP-based noise feature detection now identifies candidates (features with SHAP < 1% of top feature AND |IC| < 0.005), logged as informational warnings in the training email. Auto-pruning (which requires syncing feature lists between training and inference) is deferred.
 
@@ -337,6 +337,12 @@ Key cross-asset opportunities:
 1. ~~**Label winsorization at ±15% clips earnings gap alpha**~~ — **Resolved 2026-03-18.** Label clip raised from ±15% to ±25%. Sector-neutral 5d returns >25% are extremely rare, but 15-25% earnings gaps are informative and no longer clipped.
 
 2. **Adaptive thresholds** — now supported via `adaptive_thresholds: true` in config (implemented 2026-03-17). Rolling percentile-based UP/DOWN classification adapts to volatility regime. Needs validation on historical data before enabling in production.
+
+### Operational Notes
+
+- **Data drift from weekly rewrite** (P7): Historical OHLCV is rewritten weekly with new split/dividend adjustments (yfinance `auto_adjust=True`). Model trained on one adjustment basis may be evaluated against a slightly different basis. Impact is minimal for liquid S&P 500 stocks but could cause issues around corporate actions. Consider frozen training windows if IC degrades post-split.
+- **Lambda /tmp 512MB** (P9): Model weights are ~30-50 MB combined (MSE + LambdaRank). Monitor `/tmp` usage via CloudWatch if adding more cached data.
+- **Slim cache boundary** (P10): `slim_df = df[df.index >= cutoff]` uses `>=` (inclusive). If cutoff date has AM trades vs inference PM, boundary row may be included or excluded. Impact is one extra/missing day of history — negligible for 2-year cache.
 
 ---
 

@@ -1347,22 +1347,28 @@ def write_predictions(
     latest_key = cfg.PREDICTIONS_LATEST_KEY
     metrics_key = cfg.METRICS_KEY
 
-    try:
-        import boto3
-        s3 = boto3.client("s3")
+    import boto3
+    s3 = boto3.client("s3")
 
-        _s3_put_json(s3, s3_bucket, dated_key, predictions_json)
-        log.info("Written s3://%s/%s", s3_bucket, dated_key)
-
-        _s3_put_json(s3, s3_bucket, latest_key, predictions_json)
-        log.info("Written s3://%s/%s", s3_bucket, latest_key)
-
-        _s3_put_json(s3, s3_bucket, metrics_key, metrics_json)
-        log.info("Written s3://%s/%s", s3_bucket, metrics_key)
-
-    except Exception as exc:
-        log.error("S3 write failed: %s", exc)
-        log.error("Predictions not written to S3. Check IAM permissions for s3://%s", s3_bucket)
+    # Write each S3 object independently so partial failures don't block others
+    writes = [
+        (dated_key, predictions_json, "predictions (dated)"),
+        (latest_key, predictions_json, "predictions (latest)"),
+        (metrics_key, metrics_json, "metrics"),
+    ]
+    n_ok = 0
+    for key, body, label in writes:
+        try:
+            _s3_put_json(s3, s3_bucket, key, body)
+            log.info("Written s3://%s/%s", s3_bucket, key)
+            n_ok += 1
+        except Exception as exc:
+            log.error("S3 write failed for %s: %s", label, exc)
+    if n_ok < len(writes):
+        log.error(
+            "Partial S3 write: %d/%d succeeded. Check IAM permissions for s3://%s",
+            n_ok, len(writes), s3_bucket,
+        )
 
 
 # ── Predictor email ────────────────────────────────────────────────────────────
@@ -1831,6 +1837,14 @@ def main(
         watchlist_path or "full universe",
     )
 
+    # Validate email config (warn early so operator knows before pipeline finishes)
+    if not cfg.EMAIL_SENDER or not cfg.EMAIL_RECIPIENTS:
+        log.warning(
+            "Email not configured (EMAIL_SENDER=%r, EMAIL_RECIPIENTS has %d entries) "
+            "— morning briefing will be skipped",
+            cfg.EMAIL_SENDER or "(empty)", len(cfg.EMAIL_RECIPIENTS),
+        )
+
     # ── Step 1: Load model ────────────────────────────────────────────────────
     scorer = None      # GBM path
     model = None       # MLP path
@@ -2012,7 +2026,8 @@ def main(
     # (return_vs_spy_5d, mom5d_x_vix, etc.), and dropna() truncates featured_df
     # to the slim cache's last date — making predictions identical every day.
     _MACRO_YFINANCE = {"SPY": "SPY", "^VIX": "VIX", "^TNX": "TNX", "^IRX": "IRX", "GLD": "GLD", "USO": "USO"}
-    _sector_etfs = [s for s in (slim_data if 'slim_data' in dir() else {}) if s.startswith("XL")]
+    _slim_source = slim_data if slim_data is not None else {}
+    _sector_etfs = [s for s in _slim_source if s.startswith("XL")]
     _macro_yf_tickers = list(_MACRO_YFINANCE.keys()) + _sector_etfs
     _all_daily_tickers = sorted(set(tickers + _macro_yf_tickers))
     save_daily_closes(_all_daily_tickers, date_str, bucket, dry_run=dry_run)
@@ -2070,6 +2085,24 @@ def main(
     except Exception as exc:
         log.warning("Fundamentals: Fetch failed (features will use defaults): %s", exc)
 
+    # Aggregate alert: if ALL alternative data sources failed, model runs on
+    # technical features only — predictions degrade silently.
+    _alt_data_sources = {
+        "O10_earnings": _earnings_all,
+        "O11_revisions": _revision_all,
+        "O12_options": _options_all,
+        "fundamentals": _fundamental_all,
+    }
+    _alt_data_populated = {k: len(v) for k, v in _alt_data_sources.items() if v}
+    if not _alt_data_populated:
+        log.error(
+            "ALL alternative data sources failed — model running on technical "
+            "features only. Predictions may be degraded. Sources attempted: %s",
+            list(_alt_data_sources.keys()),
+        )
+    else:
+        log.info("Alternative data summary: %s", _alt_data_populated)
+
     # Soft timeout gate
     if _near_timeout():
         log.warning("Soft timeout before inference — writing partial predictions")
@@ -2122,10 +2155,13 @@ def main(
                     break
             if sc._feature_names and list(sc._feature_names) != list(gbm_feature_cols):
                 log.warning(
-                    "Feature ORDER mismatch between config and %s model — "
-                    "predictions may be unreliable. Config: %s, Model: %s",
-                    label, gbm_feature_cols[:3], sc._feature_names[:3],
+                    "Feature ORDER mismatch — using %s model's feature order "
+                    "for inference. Config: %s..., Model: %s...",
+                    label, gbm_feature_cols[:3], list(sc._feature_names[:3]),
                 )
+                gbm_feature_cols = list(sc._feature_names)
+                _model_n_features = len(gbm_feature_cols)
+                break
 
         raw_vectors: dict[str, np.ndarray] = {}   # ticker → raw feature vector
         _store_rows: list[dict] = []  # feature store: collect all features per ticker
@@ -2165,8 +2201,7 @@ def main(
                 n_skipped += 1
                 continue
             # Log raw features for first ticker to diagnose stale prediction issue
-            if ticker == ordered_tickers_for_log[0] if 'ordered_tickers_for_log' in dir() else len(raw_vectors) == 1:
-                ordered_tickers_for_log = [ticker]  # mark that we've logged
+            if len(raw_vectors) == 1:
                 _fv = raw_vectors[ticker]
                 log.info(
                     "Feature debug %s: last_date=%s rsi=%.4f macd_cross=%.4f mom20d=%.4f hash=%s",

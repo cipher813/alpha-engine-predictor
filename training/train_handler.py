@@ -693,14 +693,27 @@ def run_gbm_training(
     if rank_scorer is not None:
         test_preds_rank = rank_scorer.predict(X_test)
         rank_ic = float(np.corrcoef(test_preds_rank, y_test)[0, 1])
+
+        # Ensemble correlation check: if MSE and LambdaRank are too correlated,
+        # the ensemble adds no diversification benefit
+        pred_corr = float(np.corrcoef(test_preds_mse, test_preds_rank)[0, 1])
+        if pred_corr >= 0.85:
+            log.warning(
+                "MSE-LambdaRank prediction correlation %.4f >= 0.85 — "
+                "ensemble adds minimal diversification, preferring single best model",
+                pred_corr,
+            )
+        else:
+            log.info("MSE-LambdaRank prediction correlation: %.4f (good diversity)", pred_corr)
+
         # Ensemble: rank-normalize each model's predictions, then average
         mse_ranked = rankdata(test_preds_mse).astype(np.float32)
         rank_ranked = rankdata(test_preds_rank).astype(np.float32)
         ensemble_preds = 0.5 * mse_ranked + 0.5 * rank_ranked
         ensemble_ic = float(np.corrcoef(ensemble_preds, y_test)[0, 1])
         log.info(
-            "Ensemble ICs: MSE=%.4f  Lambdarank=%.4f  Ensemble=%.4f",
-            mse_ic, rank_ic, ensemble_ic,
+            "Ensemble ICs: MSE=%.4f  Lambdarank=%.4f  Ensemble=%.4f  corr=%.4f",
+            mse_ic, rank_ic, ensemble_ic, pred_corr,
         )
 
     # Pick the best IC among all candidates for the gate
@@ -788,6 +801,10 @@ def run_gbm_training(
     passes_single_ic = float(test_ic) >= cfg.MIN_IC
     passes_ic_ir = ic_ir >= cfg.GBM_IC_IR_GATE
 
+    # Hit rate gate: predicted direction must match actual direction often enough
+    test_hit_rate = float((np.sign(test_preds) == np.sign(y_test)).mean())
+    passes_hit_rate = test_hit_rate >= cfg.MIN_HIT_RATE
+
     if wf_result and not wf_result.get("fallback"):
         passes_ic = wf_result["passes_wf"]
     else:
@@ -801,13 +818,20 @@ def run_gbm_training(
             )
         passes_ic = passes_single_ic and (pct_chunks_positive >= 0.50)
 
+    if passes_ic and not passes_hit_rate:
+        log.warning(
+            "IC gate passes but hit rate %.2f%% < MIN_HIT_RATE %.2f%% — NOT promoting",
+            test_hit_rate * 100, cfg.MIN_HIT_RATE * 100,
+        )
+    passes_ic = passes_ic and passes_hit_rate
+
     elapsed_s = (datetime.now(timezone.utc) - start_ts).total_seconds()
     model_version = f"GBM-v{scorer._best_iteration}"
 
     log.info(
         "Training complete: val_IC=%.4f  test_IC=%.4f  IC_IR=%.3f  "
-        "passes_ic=%s  elapsed=%.0fs",
-        scorer._val_ic, test_ic, ic_ir, passes_ic, elapsed_s,
+        "hit_rate=%.2f%%  passes_ic=%s  elapsed=%.0fs",
+        scorer._val_ic, test_ic, ic_ir, test_hit_rate * 100, passes_ic, elapsed_s,
     )
 
     # ── Upload to S3 ──────────────────────────────────────────────────────────
