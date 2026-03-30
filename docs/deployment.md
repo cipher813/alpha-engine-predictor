@@ -19,7 +19,7 @@
 | **Lambda zip** | `s3://alpha-engine-research/lambda/alpha-engine-predictor.zip` |
 | **ECR repo** | `711398986525.dkr.ecr.us-east-1.amazonaws.com/alpha-engine-predictor` (reserved for future container builds) |
 | **EventBridge rule** | `ae-predictor-run` |
-| **Schedule** | `cron(15 13 ? * MON-FRI *)` → 6:15am PDT / 5:15am PST |
+| **Schedule** | `cron(10 13 ? * MON-FRI *)` → 6:10am PDT / 5:10am PST |
 
 ---
 
@@ -27,16 +27,16 @@
 
 ```
 5:45am PT  alpha-engine-research Lambda completes → writes signals.json to S3
-6:15am PT  ae-predictor-run fires → alpha-engine-predictor-inference Lambda
-6:30am PT  ae-executor-start fires → EC2 executor starts (reads predictions from S3)
+6:10am PT  ae-predictor-run fires → alpha-engine-predictor-inference Lambda
+6:20am PT  ae-executor-start fires → EC2 executor starts (reads predictions from S3)
 ```
 
-The predictor sits in a 30-minute window between the research pipeline and the
+The predictor sits in a 10-minute window between the research pipeline and the
 executor, giving the GBM time to score all research tickers before trading begins.
 
-**DST behaviour**: The rule fires at 13:15 UTC regardless of US clock changes.
-- PDT (Mar–Nov): 13:15 UTC = 6:15am PT ✓ (nominal target)
-- PST (Nov–Mar): 13:15 UTC = 5:15am PT (1 hour early — still before 6:30am executor)
+**DST behaviour**: The rule fires at 13:10 UTC regardless of US clock changes.
+- PDT (Mar–Nov): 13:10 UTC = 6:10am PT ✓ (nominal target)
+- PST (Nov–Mar): 13:10 UTC = 5:10am PT (1 hour early — still before 6:20am executor)
 
 No manual cron updates are needed when clocks change; the 1-hour shift in winter
 is harmless because the research pipeline also runs earlier (same UTC anchor).
@@ -191,7 +191,7 @@ aws lambda create-function \
 # 4. Create EventBridge schedule
 aws events put-rule \
   --name ae-predictor-run \
-  --schedule-expression "cron(15 13 ? * MON-FRI *)" \
+  --schedule-expression "cron(10 13 ? * MON-FRI *)" \
   --state ENABLED \
   --region us-east-1
 
