@@ -687,7 +687,6 @@ def save_daily_closes(
     import io
 
     import boto3
-    import yfinance as yf
 
     log.info(
         "Capturing daily closes for %d tickers, date=%s …",
@@ -695,53 +694,83 @@ def save_daily_closes(
     )
 
     records: list[dict] = []
-    batch_size = cfg.INFERENCE_BATCH_SIZE
-    batches = [tickers[i : i + batch_size] for i in range(0, len(tickers), batch_size)]
 
-    for batch in batches:
-        try:
-            tickers_arg = batch[0] if len(batch) == 1 else batch
-            raw = yf.download(
-                tickers=tickers_arg,
-                period=cfg.DAILY_CLOSES_PERIOD,
-                interval="1d",
-                auto_adjust=False,  # keeps both Close (split-adj) and Adj Close (full-adj)
-                progress=False,
-                group_by="ticker",
-                threads=True,
-            )
-            is_multi = isinstance(raw.columns, pd.MultiIndex)
-
-            for ticker in batch:
-                try:
-                    df = (raw[ticker] if is_multi else raw).copy()
-                    df.index = pd.to_datetime(df.index)
-                    if df.index.tz is not None:
-                        df.index = df.index.tz_convert("UTC").tz_localize(None)
-                    df = df.dropna(subset=["Close"])
-                    if df.empty:
-                        continue
-
-                    last = df.iloc[-1]
-                    raw_close = float(last["Close"])
-                    adj_close = float(last["Adj Close"]) if "Adj Close" in df.columns else raw_close
-                    # Strip ^ prefix (yfinance uses ^VIX but slim cache stores VIX)
-                    store_ticker = ticker.lstrip("^")
+    # Try polygon grouped-daily first (all US stocks in 1 API call)
+    try:
+        from polygon_client import polygon_client
+        grouped = polygon_client().get_grouped_daily(date_str)
+        if grouped:
+            ticker_set = set(tickers) | {t.lstrip("^") for t in tickers}
+            for ticker in tickers:
+                store_ticker = ticker.lstrip("^")
+                g = grouped.get(store_ticker)
+                if g:
                     records.append({
                         "ticker":    store_ticker,
                         "date":      date_str,
-                        "open":      round(float(last["Open"]),  4),
-                        "high":      round(float(last["High"]),  4),
-                        "low":       round(float(last["Low"]),   4),
-                        "close":     round(raw_close,            4),
-                        "adj_close": round(adj_close,            4),
-                        "volume":    int(last["Volume"]) if pd.notna(last.get("Volume")) else 0,
+                        "open":      round(g["open"],   4),
+                        "high":      round(g["high"],   4),
+                        "low":       round(g["low"],    4),
+                        "close":     round(g["close"],  4),
+                        "adj_close": round(g["close"],  4),  # split-adjusted only; negligible diff
+                        "volume":    int(g["volume"]),
                     })
-                except Exception as exc:
-                    log.debug("Close extract failed for %s: %s", ticker, exc)
+            log.info("Polygon grouped-daily: %d/%d tickers captured", len(records), len(tickers))
+    except Exception as exc:
+        log.warning("Polygon grouped-daily failed, falling back to yfinance: %s", exc)
 
-        except Exception as exc:
-            log.warning("Raw price batch failed: %s", exc)
+    # Fallback to yfinance for any tickers polygon missed
+    captured_tickers = {r["ticker"] for r in records}
+    missing_tickers = [t for t in tickers if t.lstrip("^") not in captured_tickers]
+    if missing_tickers:
+        import yfinance as yf
+        log.info("Fetching %d remaining tickers from yfinance…", len(missing_tickers))
+        batch_size = cfg.INFERENCE_BATCH_SIZE
+        batches = [missing_tickers[i : i + batch_size] for i in range(0, len(missing_tickers), batch_size)]
+
+        for batch in batches:
+            try:
+                tickers_arg = batch[0] if len(batch) == 1 else batch
+                raw = yf.download(
+                    tickers=tickers_arg,
+                    period=cfg.DAILY_CLOSES_PERIOD,
+                    interval="1d",
+                    auto_adjust=False,
+                    progress=False,
+                    group_by="ticker",
+                    threads=True,
+                )
+                is_multi = isinstance(raw.columns, pd.MultiIndex)
+
+                for ticker in batch:
+                    try:
+                        df = (raw[ticker] if is_multi else raw).copy()
+                        df.index = pd.to_datetime(df.index)
+                        if df.index.tz is not None:
+                            df.index = df.index.tz_convert("UTC").tz_localize(None)
+                        df = df.dropna(subset=["Close"])
+                        if df.empty:
+                            continue
+
+                        last = df.iloc[-1]
+                        raw_close = float(last["Close"])
+                        adj_close = float(last["Adj Close"]) if "Adj Close" in df.columns else raw_close
+                        store_ticker = ticker.lstrip("^")
+                        records.append({
+                            "ticker":    store_ticker,
+                            "date":      date_str,
+                            "open":      round(float(last["Open"]),  4),
+                            "high":      round(float(last["High"]),  4),
+                            "low":       round(float(last["Low"]),   4),
+                            "close":     round(raw_close,            4),
+                            "adj_close": round(adj_close,            4),
+                            "volume":    int(last["Volume"]) if pd.notna(last.get("Volume")) else 0,
+                        })
+                    except Exception as exc:
+                        log.debug("Close extract failed for %s: %s", ticker, exc)
+
+            except Exception as exc:
+                log.warning("Raw price batch failed: %s", exc)
 
     if not records:
         log.warning("No raw closes captured for %s — skipping S3 write", date_str)
@@ -2026,7 +2055,7 @@ def main(
     # (return_vs_spy_5d, mom5d_x_vix, etc.), and dropna() truncates featured_df
     # to the slim cache's last date — making predictions identical every day.
     _MACRO_YFINANCE = {"SPY": "SPY", "^VIX": "VIX", "^TNX": "TNX", "^IRX": "IRX", "GLD": "GLD", "USO": "USO"}
-    _slim_source = slim_data if slim_data is not None else {}
+    _slim_source = price_data if price_data is not None else {}
     _sector_etfs = [s for s in _slim_source if s.startswith("XL")]
     _macro_yf_tickers = list(_MACRO_YFINANCE.keys()) + _sector_etfs
     _all_daily_tickers = sorted(set(tickers + _macro_yf_tickers))
