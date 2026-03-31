@@ -132,6 +132,7 @@ feature_store:
   prefix: "features/"                # S3 key prefix for feature snapshots
   write_on_inference: true           # write daily feature snapshot after inference
   write_on_training: true            # upload registry.json after training
+  full_universe: true                # compute technical features for all ~900 slim cache tickers
 
 # ── Feature selection / noise detection ──────────────────────────────────────
 feature_selection:

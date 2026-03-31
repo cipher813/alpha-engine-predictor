@@ -987,13 +987,21 @@ def run_gbm_training(
                     "feature_ics": feature_ics,
                     "n_train": int(len(y_train)),
                 }
+                fi_body = json.dumps(fi_payload, indent=2).encode()
                 s3.put_object(
                     Bucket=bucket,
                     Key=f"predictor/metrics/feature_importance_{date_str}.json",
-                    Body=json.dumps(fi_payload, indent=2).encode(),
+                    Body=fi_body,
                     ContentType="application/json",
                 )
-                log.info("Feature importance time series written for %s", date_str)
+                # Write latest pointer so dashboard can read without knowing the date
+                s3.put_object(
+                    Bucket=bucket,
+                    Key="predictor/metrics/feature_importance_latest.json",
+                    Body=fi_body,
+                    ContentType="application/json",
+                )
+                log.info("Feature importance time series written for %s (+ latest)", date_str)
             except Exception as _fi_err:
                 log.warning("Feature importance write failed (non-blocking): %s", _fi_err)
 

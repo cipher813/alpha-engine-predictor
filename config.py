@@ -224,6 +224,7 @@ FEATURE_STORE_ENABLED = _fs_store_cfg.get("enabled", False)
 FEATURE_STORE_PREFIX = _fs_store_cfg.get("prefix", "features/")
 FEATURE_STORE_WRITE_ON_INFERENCE = _fs_store_cfg.get("write_on_inference", True)
 FEATURE_STORE_WRITE_ON_TRAINING = _fs_store_cfg.get("write_on_training", True)
+FEATURE_STORE_FULL_UNIVERSE = _fs_store_cfg.get("full_universe", True)
 
 # Fundamental features (v3.0 — quarterly FMP data)
 FUNDAMENTAL_FEATURES = [

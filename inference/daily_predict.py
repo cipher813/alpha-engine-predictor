@@ -2394,6 +2394,70 @@ def main(
     # Sort by combined_rank (ascending = best first), fall back to mse_rank
     predictions.sort(key=lambda p: p.get("combined_rank") or p.get("mse_rank") or 999)
 
+    # ── Feature store: expand to full universe (technical features only) ────────
+    # Watchlist tickers already have all 49 features in _store_rows.
+    # For non-watchlist tickers in the slim cache, compute technical + interaction
+    # features only (no FMP/yfinance alternative data calls).
+    if (cfg.FEATURE_STORE_ENABLED and cfg.FEATURE_STORE_FULL_UNIVERSE
+            and cfg.FEATURE_STORE_WRITE_ON_INFERENCE
+            and model_type == "gbm" and not _near_timeout()):
+        try:
+            from data.feature_engineer import compute_features as _fs_compute
+
+            _watchlist_set = set(tickers)
+            _skip_set = {"SPY", "^VIX", "^TNX", "^IRX", "GLD", "USO"}
+            _skip_set.update(s for s in price_data if s.startswith("XL"))
+
+            _universe_tickers = [
+                t for t in price_data
+                if t not in _watchlist_set and t not in _skip_set
+                and price_data[t] is not None and len(price_data[t]) >= cfg.MIN_ROWS_FOR_FEATURES
+            ]
+            _n_universe = len(_universe_tickers)
+
+            if _n_universe > 0:
+                log.info("Feature store universe expansion: %d non-watchlist tickers", _n_universe)
+                _fs_spy = macro.get("SPY") if macro else None
+                _fs_vix = macro.get("VIX") if macro else None
+                _fs_tnx = macro.get("TNX") if macro else None
+                _fs_irx = macro.get("IRX") if macro else None
+                _fs_gld = macro.get("GLD") if macro else None
+                _fs_uso = macro.get("USO") if macro else None
+
+                _fs_ok = 0
+                _fs_err = 0
+                for _fs_ticker in _universe_tickers:
+                    if _near_timeout():
+                        log.warning("Soft timeout during universe expansion — wrote %d/%d", _fs_ok, _n_universe)
+                        break
+                    try:
+                        _fs_etf_sym = sector_map.get(_fs_ticker)
+                        _fs_etf_series = macro.get(_fs_etf_sym) if _fs_etf_sym else None
+                        _fs_featured = _fs_compute(
+                            price_data[_fs_ticker],
+                            spy_series=_fs_spy, vix_series=_fs_vix,
+                            sector_etf_series=_fs_etf_series,
+                            tnx_series=_fs_tnx, irx_series=_fs_irx,
+                            gld_series=_fs_gld, uso_series=_fs_uso,
+                            # No alternative data — technical features only
+                        )
+                        if not _fs_featured.empty:
+                            _fs_latest = _fs_featured.iloc[-1]
+                            _fs_row = {"ticker": _fs_ticker}
+                            for f in cfg.FEATURES:
+                                _fs_row[f] = float(_fs_latest[f]) if f in _fs_latest.index else 0.0
+                            _store_rows.append(_fs_row)
+                            _fs_ok += 1
+                    except Exception:
+                        _fs_err += 1
+
+                log.info(
+                    "Feature store universe expansion: %d OK, %d errors, %d total store rows",
+                    _fs_ok, _fs_err, len(_store_rows),
+                )
+        except Exception as _fs_univ_exc:
+            log.warning("Feature store universe expansion failed (non-fatal): %s", _fs_univ_exc)
+
     # ── Feature store write (best-effort, non-blocking) ───────────────────────
     if cfg.FEATURE_STORE_ENABLED and cfg.FEATURE_STORE_WRITE_ON_INFERENCE and _store_rows:
         try:
