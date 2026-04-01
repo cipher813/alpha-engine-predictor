@@ -21,8 +21,10 @@ def run(ctx: PipelineContext) -> None:
     # ── Build metrics ────────────────────────────────────────────────────────
     gbm_meta = _load_gbm_meta(ctx)
 
-    if ctx.model_type == "gbm":
-        last_trained = gbm_meta.get("trained_date", ctx.scorer._best_iteration)
+    if ctx.inference_mode == "meta":
+        last_trained = gbm_meta.get("trained_date", "unknown")
+    elif ctx.model_type == "gbm":
+        last_trained = gbm_meta.get("trained_date", getattr(ctx.scorer, "_best_iteration", "unknown"))
     else:
         last_trained = ctx.checkpoint.get("epoch", "unknown")
 

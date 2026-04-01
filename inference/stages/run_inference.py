@@ -93,8 +93,13 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
             irx_s = ctx.macro.get("IRX") if ctx.macro else None
 
             if spy_s is not None and len(spy_s) >= 20:
+                # build_features expects dict of Close Series, not DataFrames
+                _close_prices = {}
+                for _tk, _df in (ctx.price_data or {}).items():
+                    if _df is not None and not _df.empty and "Close" in _df.columns:
+                        _close_prices[_tk] = _df["Close"].astype(float)
                 regime_features_df = regime_model.build_features(
-                    spy_s, vix_s, vix3m_s, tnx_s, irx_s, ctx.price_data,
+                    spy_s, vix_s, vix3m_s, tnx_s, irx_s, _close_prices,
                 )
                 if not regime_features_df.empty:
                     latest_regime = regime_features_df.iloc[-1]
