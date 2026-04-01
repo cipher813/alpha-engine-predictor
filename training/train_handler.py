@@ -1873,6 +1873,26 @@ def main(
         except Exception as _fs_exc:
             log.warning("Feature store registry upload failed (non-fatal): %s", _fs_exc)
 
+    # Step 2d: Write training summary to S3 (works for all modes)
+    if not dry_run:
+        try:
+            import boto3 as _b3_sum
+            _s3_sum = _b3_sum.client("s3")
+            _sum_body = json.dumps(result, indent=2, default=str).encode()
+            _s3_sum.put_object(
+                Bucket=bucket,
+                Key=f"predictor/metrics/training_summary_{date_str}.json",
+                Body=_sum_body, ContentType="application/json",
+            )
+            _s3_sum.put_object(
+                Bucket=bucket,
+                Key="predictor/metrics/training_summary_latest.json",
+                Body=_sum_body, ContentType="application/json",
+            )
+            log.info("Training summary written to S3 (dated + latest)")
+        except Exception as _sum_err:
+            log.warning("Training summary write failed (non-blocking): %s", _sum_err)
+
     # Step 3: Email
     if not dry_run:
         send_training_email(result, date_str)

@@ -280,35 +280,62 @@ print()
 print('=' * 60)
 print('  SMOKE TEST RESULTS')
 print('=' * 60)
-print(f'  Test IC:        {result.get(\"test_ic\", \"n/a\")}')
-print(f'  MSE IC:         {result.get(\"mse_ic\", \"n/a\")}')
-print(f'  Rank IC:        {result.get(\"rank_ic\", \"n/a\")}')
-print(f'  Ensemble IC:    {result.get(\"ensemble_ic\", \"n/a\")}')
-if result.get('catboost_enabled'):
-    print(f'  CatBoost IC:    {result.get(\"catboost_ic\", \"n/a\")}')
-    print(f'  LGB-Cat Blend:  {result.get(\"lgb_cat_blend_ic\", \"n/a\")}  weights={result.get(\"blend_weights\", \"n/a\")}')
-print(f'  IC IR:          {result.get(\"ic_ir\", \"n/a\")}')
-print(f'  Passes IC gate: {result.get(\"passes_ic_gate\", \"n/a\")}')
+v = result.get('model_version', '')
+is_meta = 'meta' in str(v).lower()
+
+if is_meta:
+    print(f'  Architecture:   v3.0 Meta-Model')
+    print(f'  Meta-Model IC:  {result.get(\"meta_model_ic\", result.get(\"test_ic\", \"n/a\"))}')
+    print(f'  Momentum IC:    {result.get(\"momentum_test_ic\", \"n/a\")}')
+    print(f'  Volatility IC:  {result.get(\"volatility_test_ic\", \"n/a\")}')
+    print(f'  Regime Acc:     {(result.get(\"regime_accuracy\", 0) * 100):.1f}%')
+    rc = result.get('research_calibrator_metrics', {})
+    if rc:
+        print(f'  Research Cal:   {rc.get(\"n_samples\", 0)} samples, overall hit={rc.get(\"overall_hit_rate\", \"n/a\")}')
+        for bucket, info in rc.get('buckets', {}).items():
+            if info.get('n', 0) > 0:
+                print(f'    Score {bucket}: hit_rate={info[\"hit_rate\"]:.1%} (n={info[\"n\"]})')
+    wf = result.get('walk_forward', {})
+    print(f'  WF Momentum:    median_IC={wf.get(\"momentum_median_ic\", \"n/a\")}')
+    print(f'  WF Volatility:  median_IC={wf.get(\"volatility_median_ic\", \"n/a\")}')
+    wf_status = 'PASS' if wf.get('passes_wf') else 'FAIL'
+    print(f'  WF Status:      {wf_status}')
+    coefs = result.get('meta_coefficients', {})
+    if coefs:
+        print(f'  Meta-model coefficients:')
+        for name, val in sorted(coefs.items(), key=lambda x: -abs(x[1])):
+            if name != 'intercept' and abs(val) > 0.0001:
+                print(f'    {name:<30} {val:+.4f}')
+        print(f'    {\"intercept\":<30} {coefs.get(\"intercept\", 0):+.4f}')
+    if wf.get('folds'):
+        print(f'  Per-fold ICs (momentum / volatility):')
+        for f in wf['folds']:
+            print(f'    Fold {f[\"fold\"]:>2}: mom={f[\"mom_ic\"]:+.4f}  vol={f[\"vol_ic\"]:+.4f}  [{f[\"test_start\"]} → {f[\"test_end\"]}]')
+else:
+    print(f'  Architecture:   v2.0 Single/Ensemble GBM')
+    print(f'  Test IC:        {result.get(\"test_ic\", \"n/a\")}')
+    print(f'  MSE IC:         {result.get(\"mse_ic\", \"n/a\")}')
+    print(f'  Rank IC:        {result.get(\"rank_ic\", \"n/a\")}')
+    print(f'  Ensemble IC:    {result.get(\"ensemble_ic\", \"n/a\")}')
+    if result.get('catboost_enabled'):
+        print(f'  CatBoost IC:    {result.get(\"catboost_ic\", \"n/a\")}')
+        print(f'  LGB-Cat Blend:  {result.get(\"lgb_cat_blend_ic\", \"n/a\")}  weights={result.get(\"blend_weights\", \"n/a\")}')
+    print(f'  IC IR:          {result.get(\"ic_ir\", \"n/a\")}')
+    wf = result.get('walk_forward', {})
+    wf_status = 'PASS' if wf.get('passes_wf') else 'FAIL/skipped'
+    print(f'  Walk-forward:   {wf_status}  (median_IC={wf.get(\"median_ic\", \"n/a\")})')
+    fics = result.get('feature_ics', {})
+    if fics:
+        sorted_fics = sorted(fics.items(), key=lambda x: abs(x[1]), reverse=True)
+        print(f'  Top 5 feature ICs:')
+        for name, ic in sorted_fics[:5]:
+            print(f'    {name:<22} {ic:+.4f}')
+
 print(f'  Promoted:       {result.get(\"promoted\", \"n/a\")}')
-wf = result.get('walk_forward', {})
-wf_status = 'PASS' if wf.get('passes_wf') else 'FAIL/skipped'
-print(f'  Walk-forward:   {wf_status}  (median_IC={wf.get(\"median_ic\", \"n/a\")})')
-cal = result.get('calibration')
-if cal and cal.get('fitted'):
-    print(f'  Calibration:    ECE {cal[\"ece_before\"]:.4f} -> {cal[\"ece_after\"]:.4f} ({cal[\"method\"]})')
-mh = result.get('multi_horizon')
-if mh:
-    for h, v in mh.get('auxiliary', {}).items():
-        if isinstance(v, dict) and 'test_ic' in v:
-            print(f'  Horizon {h}d:     IC={v[\"test_ic\"]}  promoted={v.get(\"promoted\", False)}')
 print(f'  Elapsed:        {result.get(\"elapsed_s\", \"n/a\")}s')
-print(f'  Noise features: {result.get(\"noise_candidates\", [])}')
-fics = result.get('feature_ics', {})
-if fics:
-    sorted_fics = sorted(fics.items(), key=lambda x: abs(x[1]), reverse=True)
-    print(f'  Top 5 feature ICs:')
-    for name, ic in sorted_fics[:5]:
-        print(f'    {name:<22} {ic:+.4f}')
+noise = result.get('noise_candidates', [])
+if noise:
+    print(f'  Noise features: {noise}')
 print('=' * 60)
 "
 SMOKE
@@ -357,28 +384,39 @@ print()
 print('=' * 60)
 print('  FULL TRAINING RESULTS')
 print('=' * 60)
-print(f'  Test IC:        {result.get(\"test_ic\", \"n/a\")}')
-print(f'  MSE IC:         {result.get(\"mse_ic\", \"n/a\")}')
-print(f'  Rank IC:        {result.get(\"rank_ic\", \"n/a\")}')
-print(f'  Ensemble IC:    {result.get(\"ensemble_ic\", \"n/a\")}')
-if result.get('catboost_enabled'):
-    print(f'  CatBoost IC:    {result.get(\"catboost_ic\", \"n/a\")}')
-    print(f'  LGB-Cat Blend:  {result.get(\"lgb_cat_blend_ic\", \"n/a\")}  weights={result.get(\"blend_weights\", \"n/a\")}')
-print(f'  IC IR:          {result.get(\"ic_ir\", \"n/a\")}')
-print(f'  Passes IC gate: {result.get(\"passes_ic_gate\", \"n/a\")}')
+v = result.get('model_version', '')
+is_meta = 'meta' in str(v).lower()
+
+if is_meta:
+    print(f'  Architecture:   v3.0 Meta-Model')
+    print(f'  Meta-Model IC:  {result.get(\"meta_model_ic\", result.get(\"test_ic\", \"n/a\"))}')
+    print(f'  Momentum IC:    {result.get(\"momentum_test_ic\", \"n/a\")}')
+    print(f'  Volatility IC:  {result.get(\"volatility_test_ic\", \"n/a\")}')
+    print(f'  Regime Acc:     {(result.get(\"regime_accuracy\", 0) * 100):.1f}%')
+    rc = result.get('research_calibrator_metrics', {})
+    if rc:
+        print(f'  Research Cal:   {rc.get(\"n_samples\", 0)} samples, overall hit={rc.get(\"overall_hit_rate\", \"n/a\")}')
+    wf = result.get('walk_forward', {})
+    print(f'  WF Momentum:    median_IC={wf.get(\"momentum_median_ic\", \"n/a\")}')
+    print(f'  WF Volatility:  median_IC={wf.get(\"volatility_median_ic\", \"n/a\")}')
+    coefs = result.get('meta_coefficients', {})
+    if coefs:
+        print(f'  Meta-model coefficients:')
+        for name, val in sorted(coefs.items(), key=lambda x: -abs(x[1])):
+            if name != 'intercept' and abs(val) > 0.0001:
+                print(f'    {name:<30} {val:+.4f}')
+else:
+    print(f'  Architecture:   v2.0 Single/Ensemble GBM')
+    print(f'  Test IC:        {result.get(\"test_ic\", \"n/a\")}')
+    print(f'  MSE IC:         {result.get(\"mse_ic\", \"n/a\")}')
+    print(f'  Rank IC:        {result.get(\"rank_ic\", \"n/a\")}')
+    print(f'  Ensemble IC:    {result.get(\"ensemble_ic\", \"n/a\")}')
+    wf = result.get('walk_forward', {})
+    wf_status = 'PASS' if wf.get('passes_wf') else 'FAIL/skipped'
+    print(f'  Walk-forward:   {wf_status}  (median_IC={wf.get(\"median_ic\", \"n/a\")})')
+
 print(f'  Promoted:       {result.get(\"promoted\", \"n/a\")}')
 print(f'  Promoted mode:  {result.get(\"promoted_mode\", \"n/a\")}')
-wf = result.get('walk_forward', {})
-wf_status = 'PASS' if wf.get('passes_wf') else 'FAIL/skipped'
-print(f'  Walk-forward:   {wf_status}  (median_IC={wf.get(\"median_ic\", \"n/a\")})')
-cal = result.get('calibration')
-if cal and cal.get('fitted'):
-    print(f'  Calibration:    ECE {cal[\"ece_before\"]:.4f} -> {cal[\"ece_after\"]:.4f} ({cal[\"method\"]})')
-mh = result.get('multi_horizon')
-if mh:
-    for h, v in mh.get('auxiliary', {}).items():
-        if isinstance(v, dict) and 'test_ic' in v:
-            print(f'  Horizon {h}d:     IC={v[\"test_ic\"]}  promoted={v.get(\"promoted\", False)}')
 print(f'  Elapsed:        {result.get(\"elapsed_s\", \"n/a\")}s')
 print(f'  Slim cache:     {result.get(\"slim_cache_tickers\", \"n/a\")} tickers')
 print('=' * 60)
