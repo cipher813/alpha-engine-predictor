@@ -28,7 +28,9 @@ def run(ctx: PipelineContext) -> None:
     ctx.predictions = []
     ctx.n_skipped = 0
 
-    if ctx.model_type == "gbm":
+    if ctx.inference_mode == "meta" and ctx.meta_models:
+        _run_meta_inference(ctx)
+    elif ctx.model_type == "gbm":
         _run_gbm_inference(ctx)
     else:
         _run_mlp_inference(ctx)
@@ -62,6 +64,221 @@ def run(ctx: PipelineContext) -> None:
             upload_registry(ctx.bucket, prefix=cfg.FEATURE_STORE_PREFIX)
         except Exception as _fs_exc:
             log.warning("Feature store write failed (non-fatal): %s", _fs_exc)
+
+
+def _run_meta_inference(ctx: PipelineContext) -> None:
+    """Run Layer 1 specialized models → meta-model → predictions."""
+    from data.feature_engineer import compute_features as _compute_features
+    from model.meta_model import META_FEATURES
+
+    mom_scorer = ctx.meta_models.get("momentum")
+    vol_scorer = ctx.meta_models.get("volatility")
+    regime_model = ctx.meta_models.get("regime")
+    research_cal = ctx.meta_models.get("research_calibrator")
+    meta_model = ctx.meta_models.get("meta")
+
+    if mom_scorer is None and vol_scorer is None and meta_model is None:
+        log.error("No meta-models available — falling back to v2.0")
+        _run_gbm_inference(ctx)
+        return
+
+    # ── Step 1: Compute regime (once, market-wide) ───────────────────────────
+    regime_probs = {"regime_bear": 0.33, "regime_neutral": 0.34, "regime_bull": 0.33}
+    if regime_model is not None and regime_model.is_fitted:
+        try:
+            spy_s = ctx.macro.get("SPY") if ctx.macro else None
+            vix_s = ctx.macro.get("VIX") if ctx.macro else None
+            vix3m_s = ctx.macro.get("VIX3M") if ctx.macro else None
+            tnx_s = ctx.macro.get("TNX") if ctx.macro else None
+            irx_s = ctx.macro.get("IRX") if ctx.macro else None
+
+            if spy_s is not None and len(spy_s) >= 20:
+                regime_features_df = regime_model.build_features(
+                    spy_s, vix_s, vix3m_s, tnx_s, irx_s, ctx.price_data,
+                )
+                if not regime_features_df.empty:
+                    latest_regime = regime_features_df.iloc[-1]
+                    regime_probs = regime_model.predict_single(latest_regime.to_dict())
+                    log.info("Regime: bull=%.2f  neutral=%.2f  bear=%.2f",
+                             regime_probs["regime_bull"], regime_probs["regime_neutral"],
+                             regime_probs["regime_bear"])
+        except Exception as e:
+            log.warning("Regime prediction failed: %s — using uniform priors", e)
+
+    # ── Step 2: Load research signals for calibrator ─────────────────────────
+    # Read signals.json for composite scores and conviction
+    research_signals = {}
+    try:
+        import boto3 as _b3_sig
+        _s3_sig = _b3_sig.client("s3")
+        sig_key = f"signals/{ctx.date_str}/signals.json"
+        try:
+            sig_obj = _s3_sig.get_object(Bucket=ctx.bucket, Key=sig_key)
+            sig_data = json.loads(sig_obj["Body"].read())
+            for sig in sig_data.get("universe", []):
+                ticker = sig.get("ticker")
+                if ticker:
+                    research_signals[ticker] = sig
+            log.info("Loaded %d research signals for calibrator", len(research_signals))
+        except Exception:
+            # Try previous day
+            from datetime import datetime as _dt, timedelta as _td
+            prev = (_dt.strptime(ctx.date_str, "%Y-%m-%d") - _td(days=1)).strftime("%Y-%m-%d")
+            try:
+                sig_obj = _s3_sig.get_object(Bucket=ctx.bucket, Key=f"signals/{prev}/signals.json")
+                sig_data = json.loads(sig_obj["Body"].read())
+                for sig in sig_data.get("universe", []):
+                    ticker = sig.get("ticker")
+                    if ticker:
+                        research_signals[ticker] = sig
+                log.info("Loaded %d research signals (previous day %s)", len(research_signals), prev)
+            except Exception:
+                log.info("No research signals available for calibrator")
+    except Exception as e:
+        log.warning("Research signal loading failed: %s", e)
+
+    import json
+
+    # ── Step 3: Per-ticker feature computation + Layer 1 inference ────────────
+    max_r = getattr(cfg, "LABEL_CLIP", 0.15)
+
+    for ticker in ctx.tickers:
+        df = ctx.price_data.get(ticker, pd.DataFrame())
+        if df.empty or len(df) < cfg.MIN_ROWS_FOR_FEATURES:
+            ctx.n_skipped += 1
+            continue
+
+        sector_etf_sym = ctx.sector_map.get(ticker)
+        sector_etf_series = ctx.macro.get(sector_etf_sym) if sector_etf_sym else None
+
+        try:
+            featured_df = _compute_features(
+                df,
+                spy_series=ctx.macro.get("SPY") if ctx.macro else None,
+                vix_series=ctx.macro.get("VIX") if ctx.macro else None,
+                sector_etf_series=sector_etf_series,
+                tnx_series=ctx.macro.get("TNX") if ctx.macro else None,
+                irx_series=ctx.macro.get("IRX") if ctx.macro else None,
+                gld_series=ctx.macro.get("GLD") if ctx.macro else None,
+                uso_series=ctx.macro.get("USO") if ctx.macro else None,
+                vix3m_series=ctx.macro.get("VIX3M") if ctx.macro else None,
+            )
+        except Exception as exc:
+            log.warning("Feature computation failed for %s: %s", ticker, exc)
+            ctx.n_skipped += 1
+            continue
+
+        if featured_df.empty:
+            ctx.n_skipped += 1
+            continue
+
+        latest = featured_df.iloc[-1]
+
+        # Layer 1A: Momentum model
+        momentum_score = 0.0
+        if mom_scorer is not None:
+            try:
+                mom_x = latest[cfg.MOMENTUM_FEATURES].to_numpy(dtype=np.float32).reshape(1, -1)
+                momentum_score = float(mom_scorer.predict(mom_x)[0])
+            except Exception:
+                pass
+
+        # Layer 1B: Volatility model
+        expected_move = 0.0
+        if vol_scorer is not None:
+            try:
+                vol_x = latest[cfg.VOLATILITY_FEATURES].to_numpy(dtype=np.float32).reshape(1, -1)
+                expected_move = float(vol_scorer.predict(vol_x)[0])
+            except Exception:
+                pass
+
+        # Layer 1C: Research calibrator
+        research_cal_prob = 0.5  # neutral default
+        research_score_norm = 0.5
+        research_conviction = 0.0
+        sector_modifier = 0.0
+        sig = research_signals.get(ticker)
+        if sig:
+            raw_score = sig.get("score", 50)
+            research_score_norm = raw_score / 100.0
+            conv = sig.get("conviction", "stable")
+            research_conviction = {"rising": 1.0, "stable": 0.0, "declining": -1.0}.get(conv, 0.0)
+            sector_modifier = sig.get("sector_modifiers", {}).get(sig.get("sector", ""), 1.0) - 1.0
+            if research_cal is not None and research_cal.is_fitted:
+                research_cal_prob = research_cal.predict(raw_score)
+
+        # Layer 2: Meta-model
+        meta_features = {
+            "research_calibrator_prob": research_cal_prob,
+            "momentum_score": momentum_score,
+            "expected_move": expected_move,
+            "regime_bull": regime_probs["regime_bull"],
+            "regime_bear": regime_probs["regime_bear"],
+            "research_composite_score": research_score_norm,
+            "research_conviction": research_conviction,
+            "sector_macro_modifier": sector_modifier,
+        }
+
+        if meta_model is not None and meta_model.is_fitted:
+            alpha = float(meta_model.predict_single(meta_features))
+        else:
+            # Fallback: weighted average of Layer 1 outputs
+            alpha = 0.4 * momentum_score + 0.3 * (research_cal_prob - 0.5) * 0.1 + 0.2 * expected_move * np.sign(momentum_score) + 0.1 * (regime_probs["regime_bull"] - regime_probs["regime_bear"]) * 0.05
+
+        alpha = float(np.clip(alpha, -max_r, max_r))
+
+        # Calibrated confidence
+        _cal = getattr(ctx, "calibrator", None)
+        if _cal is not None and _cal.is_fitted:
+            _cal_result = _cal.calibrate_prediction(alpha, label_clip=max_r)
+            p_up = _cal_result["p_up"]
+            p_down = _cal_result["p_down"]
+            predicted_direction = _cal_result["predicted_direction"]
+            confidence = _cal_result["prediction_confidence"]
+        else:
+            p_up = float(np.clip(0.5 + alpha / (2.0 * max_r), 0.0, 1.0))
+            p_down = float(np.clip(0.5 - alpha / (2.0 * max_r), 0.0, 1.0))
+            if alpha >= 0:
+                predicted_direction = "UP"
+                confidence = p_up
+            else:
+                predicted_direction = "DOWN"
+                confidence = p_down
+
+        result = {
+            "ticker": ticker,
+            "predicted_direction": predicted_direction,
+            "prediction_confidence": round(confidence, 4),
+            "predicted_alpha": round(alpha, 6),
+            "p_up": round(p_up, 4),
+            "p_flat": 0.0,
+            "p_down": round(p_down, 4),
+            "mse_rank": None,
+            "model_rank": None,
+            "combined_rank": None,
+            # Meta-model detail (new fields, additive)
+            "research_calibrator_prob": round(research_cal_prob, 4),
+            "momentum_confirmation": round(momentum_score, 6),
+            "expected_move": round(expected_move, 6),
+            "regime_bull": round(regime_probs["regime_bull"], 4),
+            "regime_bear": round(regime_probs["regime_bear"], 4),
+            "meta_model_version": "v3.0",
+        }
+
+        if ticker in ctx.ticker_data_age:
+            result["price_data_age_days"] = ctx.ticker_data_age[ticker]
+        if ctx.ticker_sources:
+            result["watchlist_source"] = ctx.ticker_sources.get(ticker, "unknown")
+
+        ctx.predictions.append(result)
+
+    # Sort by predicted_alpha descending (best first)
+    ctx.predictions.sort(key=lambda p: -(p.get("predicted_alpha") or 0))
+    # Assign combined_rank
+    for i, p in enumerate(ctx.predictions):
+        p["combined_rank"] = i + 1
+
+    log.info("Meta-inference complete: %d predictions, %d skipped", len(ctx.predictions), ctx.n_skipped)
 
 
 def _run_gbm_inference(ctx: PipelineContext) -> None:

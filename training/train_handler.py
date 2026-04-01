@@ -1820,7 +1820,15 @@ def main(
 
     # Step 2: Train + upload
     import config as _train_cfg
-    if _train_cfg.MULTI_HORIZON_ENABLED:
+    if _train_cfg.META_MODEL_ENABLED:
+        from training.meta_trainer import run_meta_training
+        result = run_meta_training(
+            data_dir=str(tmp_cache),
+            bucket=bucket,
+            date_str=date_str,
+            dry_run=dry_run,
+        )
+    elif _train_cfg.MULTI_HORIZON_ENABLED:
         mh_result = run_multi_horizon_training(
             data_dir=str(tmp_cache),
             bucket=bucket,

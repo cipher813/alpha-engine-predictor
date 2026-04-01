@@ -246,6 +246,26 @@ _mh_cfg = _cfg.get("multi_horizon", {})
 MULTI_HORIZON_ENABLED = _mh_cfg.get("enabled", False)
 MULTI_HORIZON_LIST = _mh_cfg.get("horizons", [1, 5, 10, 20])
 
+# ── Meta-model architecture (v3.0) ─────────────────────────────────────────
+_meta_cfg = _cfg.get("meta_model", {})
+META_MODEL_ENABLED = _meta_cfg.get("enabled", False)
+
+# Per-model feature sets (subsets of FEATURES computed by feature_engineer)
+MOMENTUM_FEATURES = [
+    "momentum_5d", "momentum_20d", "price_vs_ma50", "price_vs_ma200",
+    "rsi_14", "macd_cross",
+]
+VOLATILITY_FEATURES = [
+    "atr_14_pct", "realized_vol_20d", "vol_ratio_10_60",
+    "iv_rank", "dist_from_52w_high", "dist_from_52w_low",
+]
+# Regime predictor uses macro series directly (not GBM features)
+# Research calibrator uses signals.json fields (not price features)
+
+# S3 keys for meta-model weights
+META_WEIGHTS_PREFIX = "predictor/weights/meta/"
+META_MANIFEST_KEY = "predictor/weights/meta/manifest.json"
+
 # ── Feature engineering parameters ───────────────────────────────────────────
 FEATURE_CFG: dict = _cfg["features"]
 

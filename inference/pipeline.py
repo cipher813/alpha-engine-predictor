@@ -58,6 +58,7 @@ class PipelineContext:
     cat_scorer: object = None       # CatBoostScorer (for LGB-Cat ensemble)
     blend_weights: dict = None      # {"lgb": 0.5, "cat": 0.5}
     horizon_scorers: dict = field(default_factory=dict)  # {1: GBMScorer, 10: GBMScorer, 20: GBMScorer}
+    meta_models: dict = field(default_factory=dict)  # v3.0: {"momentum": GBMScorer, "volatility": GBMScorer, "regime": RegimePredictor, "meta": MetaModel, ...}
 
     # ── Universe (set by load_universe) ──────────────────────────────────────
     tickers: list = field(default_factory=list)
