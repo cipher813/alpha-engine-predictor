@@ -110,8 +110,8 @@ class TestRegistry:
         assert all_from_groups == all_from_catalog
 
     def test_group_counts(self):
-        assert len(GROUPS["technical"]) == 28
-        assert len(GROUPS["macro"]) == 5
+        assert len(GROUPS["technical"]) == 26
+        assert len(GROUPS["macro"]) == 7
         assert len(GROUPS["interaction"]) == 5
         assert len(GROUPS["alternative"]) == 7
         assert len(GROUPS["fundamental"]) == 8

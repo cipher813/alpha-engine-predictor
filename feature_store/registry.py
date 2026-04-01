@@ -64,8 +64,8 @@ CATALOG: list[FeatureEntry] = [
     FeatureEntry("yield_curve_slope", "macro", "10Y - 2Y spread, normalized", source="yfinance", refresh="daily", per_ticker=False),
     FeatureEntry("gold_mom_5d", "macro", "5-day gold (GLD) momentum", source="yfinance", refresh="daily", per_ticker=False),
     FeatureEntry("oil_mom_5d", "macro", "5-day oil (USO) momentum", source="yfinance", refresh="daily", per_ticker=False),
-    FeatureEntry("vix_term_slope", "technical", "VIX spot vs VIX3M term structure slope, normalized", source="yfinance", refresh="daily"),
-    FeatureEntry("xsect_dispersion", "technical", "Cross-sectional std dev of daily returns across universe", source="computed", refresh="daily", per_ticker=False),
+    FeatureEntry("vix_term_slope", "macro", "VIX spot vs VIX3M term structure slope, normalized", source="yfinance", refresh="daily", per_ticker=False),
+    FeatureEntry("xsect_dispersion", "macro", "Cross-sectional std dev of daily returns across universe", source="computed", refresh="daily", per_ticker=False),
 
     # ── Regime interactions (5) — macro × ticker-specific signals ─────────────
     FeatureEntry("mom5d_x_vix", "interaction", "momentum_5d * VIX regime indicator", source="computed", refresh="daily"),
