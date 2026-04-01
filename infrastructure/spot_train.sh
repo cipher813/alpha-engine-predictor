@@ -284,10 +284,23 @@ print(f'  Test IC:        {result.get(\"test_ic\", \"n/a\")}')
 print(f'  MSE IC:         {result.get(\"mse_ic\", \"n/a\")}')
 print(f'  Rank IC:        {result.get(\"rank_ic\", \"n/a\")}')
 print(f'  Ensemble IC:    {result.get(\"ensemble_ic\", \"n/a\")}')
+if result.get('catboost_enabled'):
+    print(f'  CatBoost IC:    {result.get(\"catboost_ic\", \"n/a\")}')
+    print(f'  LGB-Cat Blend:  {result.get(\"lgb_cat_blend_ic\", \"n/a\")}  weights={result.get(\"blend_weights\", \"n/a\")}')
 print(f'  IC IR:          {result.get(\"ic_ir\", \"n/a\")}')
 print(f'  Passes IC gate: {result.get(\"passes_ic_gate\", \"n/a\")}')
 print(f'  Promoted:       {result.get(\"promoted\", \"n/a\")}')
-print(f'  Walk-forward:   {\"PASS\" if result.get(\"walk_forward\", {}).get(\"passes_wf\") else \"FAIL/skipped\"}')
+wf = result.get('walk_forward', {})
+wf_status = 'PASS' if wf.get('passes_wf') else 'FAIL/skipped'
+print(f'  Walk-forward:   {wf_status}  (median_IC={wf.get(\"median_ic\", \"n/a\")})')
+cal = result.get('calibration')
+if cal and cal.get('fitted'):
+    print(f'  Calibration:    ECE {cal[\"ece_before\"]:.4f} -> {cal[\"ece_after\"]:.4f} ({cal[\"method\"]})')
+mh = result.get('multi_horizon')
+if mh:
+    for h, v in mh.get('auxiliary', {}).items():
+        if isinstance(v, dict) and 'test_ic' in v:
+            print(f'  Horizon {h}d:     IC={v[\"test_ic\"]}  promoted={v.get(\"promoted\", False)}')
 print(f'  Elapsed:        {result.get(\"elapsed_s\", \"n/a\")}s')
 print(f'  Noise features: {result.get(\"noise_candidates\", [])}')
 fics = result.get('feature_ics', {})
@@ -348,11 +361,24 @@ print(f'  Test IC:        {result.get(\"test_ic\", \"n/a\")}')
 print(f'  MSE IC:         {result.get(\"mse_ic\", \"n/a\")}')
 print(f'  Rank IC:        {result.get(\"rank_ic\", \"n/a\")}')
 print(f'  Ensemble IC:    {result.get(\"ensemble_ic\", \"n/a\")}')
+if result.get('catboost_enabled'):
+    print(f'  CatBoost IC:    {result.get(\"catboost_ic\", \"n/a\")}')
+    print(f'  LGB-Cat Blend:  {result.get(\"lgb_cat_blend_ic\", \"n/a\")}  weights={result.get(\"blend_weights\", \"n/a\")}')
 print(f'  IC IR:          {result.get(\"ic_ir\", \"n/a\")}')
 print(f'  Passes IC gate: {result.get(\"passes_ic_gate\", \"n/a\")}')
 print(f'  Promoted:       {result.get(\"promoted\", \"n/a\")}')
 print(f'  Promoted mode:  {result.get(\"promoted_mode\", \"n/a\")}')
-print(f'  Walk-forward:   {\"PASS\" if result.get(\"walk_forward\", {}).get(\"passes_wf\") else \"FAIL/skipped\"}')
+wf = result.get('walk_forward', {})
+wf_status = 'PASS' if wf.get('passes_wf') else 'FAIL/skipped'
+print(f'  Walk-forward:   {wf_status}  (median_IC={wf.get(\"median_ic\", \"n/a\")})')
+cal = result.get('calibration')
+if cal and cal.get('fitted'):
+    print(f'  Calibration:    ECE {cal[\"ece_before\"]:.4f} -> {cal[\"ece_after\"]:.4f} ({cal[\"method\"]})')
+mh = result.get('multi_horizon')
+if mh:
+    for h, v in mh.get('auxiliary', {}).items():
+        if isinstance(v, dict) and 'test_ic' in v:
+            print(f'  Horizon {h}d:     IC={v[\"test_ic\"]}  promoted={v.get(\"promoted\", False)}')
 print(f'  Elapsed:        {result.get(\"elapsed_s\", \"n/a\")}s')
 print(f'  Slim cache:     {result.get(\"slim_cache_tickers\", \"n/a\")} tickers')
 print('=' * 60)

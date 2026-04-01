@@ -1202,6 +1202,80 @@ def run_gbm_training(
         except Exception as _cal_err:
             log.warning("Calibrator fitting/upload failed (non-blocking): %s", _cal_err)
 
+    # ── Write comprehensive training summary to S3 ───────────────────────────
+    # Persists all training metrics so dashboard/debugging don't depend on email.
+    if not dry_run:
+        try:
+            import boto3 as _boto3_summary
+            _s3_sum = _boto3_summary.client("s3")
+            training_summary = {
+                "date": date_str,
+                "model_version": model_version,
+                "promoted": promoted,
+                "promoted_mode": best_mode if promoted else None,
+                "elapsed_s": round(elapsed_s, 1),
+                "n_train": int(len(y_train)),
+                "n_val": int(len(y_val)),
+                "n_test": int(len(y_test)),
+                "n_features": len(cfg.GBM_FEATURES),
+                # IC metrics
+                "mse_ic": round(float(mse_ic), 6),
+                "rank_ic": round(float(rank_ic), 6) if rank_scorer is not None else None,
+                "ensemble_ic": round(float(ensemble_ic), 6) if rank_scorer is not None else None,
+                "test_ic": round(float(test_ic), 6),
+                "ic_ir": round(ic_ir, 4),
+                "test_hit_rate": round(test_hit_rate, 4),
+                # CatBoost
+                "catboost_enabled": cat_scorer is not None,
+                "catboost_ic": round(float(cat_ic), 6) if cat_scorer is not None else None,
+                "lgb_cat_blend_ic": round(float(lgb_cat_blend_ic), 6) if cat_scorer is not None else None,
+                "blend_weights": blend_weights,
+                # Calibration
+                "calibration": calibration_metrics,
+                # Walk-forward
+                "walk_forward": {
+                    "median_ic": wf_result["median_ic"],
+                    "pct_positive": wf_result["pct_positive"],
+                    "passes_wf": wf_result["passes_wf"],
+                    "n_folds": len(wf_result["folds"]),
+                    "catboost_median_ic": wf_result.get("catboost", {}).get("cat_median_ic") if wf_result.get("catboost") else None,
+                } if wf_result and not wf_result.get("fallback") else None,
+                # Features
+                "feature_ics": feature_ics,
+                "noise_candidates": noise_candidates,
+                "feature_importance_top10": [
+                    {"feature": f, "gain": round(s, 2)} for f, s in
+                    sorted(importance.items(), key=lambda x: -x[1])[:10]
+                ],
+                "shap_top10": [
+                    {"feature": f, "shap": round(s, 4)} for f, s in
+                    sorted(shap_importance.items(), key=lambda x: -x[1])[:10]
+                ] if shap_importance else [],
+                # Gates
+                "gates": {
+                    "min_ic": cfg.MIN_IC,
+                    "min_hit_rate": cfg.MIN_HIT_RATE,
+                    "wf_median_ic_gate": cfg.WF_MEDIAN_IC_GATE,
+                    "wf_min_folds_positive": cfg.WF_MIN_FOLDS_POSITIVE,
+                },
+            }
+            _sum_body = json.dumps(training_summary, indent=2, default=str).encode()
+            _s3_sum.put_object(
+                Bucket=bucket,
+                Key=f"predictor/metrics/training_summary_{date_str}.json",
+                Body=_sum_body,
+                ContentType="application/json",
+            )
+            _s3_sum.put_object(
+                Bucket=bucket,
+                Key="predictor/metrics/training_summary_latest.json",
+                Body=_sum_body,
+                ContentType="application/json",
+            )
+            log.info("Training summary written to S3 (dated + latest)")
+        except Exception as _sum_err:
+            log.warning("Training summary write failed (non-blocking): %s", _sum_err)
+
     result = {
         "model_version":         model_version,
         "best_iteration":        scorer._best_iteration,
@@ -1338,9 +1412,17 @@ def send_training_email(result: dict, date_str: str) -> bool:
     )
     status_str  = "PASS" if passes_ic else "FAIL"
 
+    # CatBoost metrics for email
+    cat_enabled  = result.get("catboost_enabled", False)
+    cat_ic_val   = result.get("catboost_ic")
+    blend_ic_val = result.get("lgb_cat_blend_ic")
+    blend_wts    = result.get("blend_weights")
+    cal_metrics  = result.get("calibration")
+    mh_data      = result.get("multi_horizon")
+
     subject = (
-        f"GBM Trainer | {date_str} | IC {test_ic:.4f} {status_str} | "
-        f"{'Promoted' if promoted else 'Not promoted'}"
+        f"Alpha Engine Training | {date_str} | IC {test_ic:.4f} {status_str} | "
+        f"{'Promoted (' + promoted_mode + ')' if promoted else 'Not promoted'}"
     )
 
     # Feature importance bar chart (top 5)
@@ -1507,7 +1589,7 @@ def send_training_email(result: dict, date_str: str) -> bool:
 
     html_body = (
         f'<html><body style="font-family:sans-serif; font-size:13px; color:#222; max-width:600px;">'
-        f'<h2 style="margin-bottom:4px;">GBM Weekly Retrain — {date_str}</h2>'
+        f'<h2 style="margin-bottom:4px;">Alpha Engine Training — {date_str}</h2>'
         f'<p style="color:#555; font-size:12px; margin-top:0;">'
         f'Model: <b>{version}</b> &nbsp;|&nbsp;'
         f'Training samples: <b>{n_train:,}</b> &nbsp;|&nbsp;'
@@ -1547,6 +1629,22 @@ def send_training_email(result: dict, date_str: str) -> bool:
             f'  {test_ic:.4f} — {ic_label}</td>'
             f'</tr>'
         ) +
+        + (
+            f'<tr style="background:#f9f9f9;">'
+            f'  <td style="padding:5px 10px; color:#555;">CatBoost IC</td>'
+            f'  <td style="padding:5px 10px; font-family:monospace; font-weight:bold;'
+            f'{f" color:{ic_color};" if promoted_mode == "catboost" else ""}">'
+            f'{cat_ic_val:.4f}{"  ✓" if promoted_mode == "catboost" else ""}</td>'
+            f'</tr>'
+            f'<tr>'
+            f'  <td style="padding:5px 10px; color:#555;">LGB-Cat Blend IC</td>'
+            f'  <td style="padding:5px 10px; font-family:monospace; font-weight:bold;'
+            f'{f" color:{ic_color};" if promoted_mode == "lgb_cat_blend" else ""}">'
+            f'{blend_ic_val:.4f} (w_lgb={blend_wts["lgb"]:.1f})'
+            f'{"  ✓" if promoted_mode == "lgb_cat_blend" else ""}</td>'
+            f'</tr>'
+            if cat_enabled and cat_ic_val is not None else ""
+        ) +
         f'<tr style="background:#f9f9f9;">'
         f'  <td style="padding:5px 10px; color:#555;">IC IR</td>'
         f'  <td style="padding:5px 10px; font-family:monospace; color:#555;">'
@@ -1567,6 +1665,32 @@ def send_training_email(result: dict, date_str: str) -> bool:
 
         f'{feat_health_html}'
 
+        + (
+            f'<h3 style="margin-top:16px; margin-bottom:4px;">Confidence Calibration</h3>'
+            f'<p style="font-size:12px;">Method: <b>{cal_metrics["method"]}</b> &nbsp;|&nbsp; '
+            f'Samples: <b>{cal_metrics["n_samples"]:,}</b> &nbsp;|&nbsp; '
+            f'ECE: <b>{cal_metrics["ece_before"]:.4f} → {cal_metrics["ece_after"]:.4f}</b> '
+            f'({(1 - cal_metrics["ece_after"] / max(cal_metrics["ece_before"], 1e-8)) * 100:.0f}% reduction)</p>'
+            if cal_metrics and cal_metrics.get("fitted") else ""
+        ) +
+
+        + (
+            f'<h3 style="margin-top:16px; margin-bottom:4px;">Multi-Horizon Models</h3>'
+            f'<table style="border-collapse:collapse; font-size:11px;">'
+            f'<tr style="background:#e0e0e0;">'
+            f'<th style="padding:3px 8px;">Horizon</th>'
+            f'<th style="padding:3px 8px;">IC</th>'
+            f'<th style="padding:3px 8px;">Promoted</th></tr>'
+            + "".join(
+                f'<tr><td style="padding:2px 8px; font-family:monospace;">{h}d</td>'
+                f'<td style="padding:2px 8px; font-family:monospace;">{v.get("test_ic", "err")}</td>'
+                f'<td style="padding:2px 8px; font-family:monospace;">{v.get("promoted", False)}</td></tr>'
+                for h, v in mh_data["auxiliary"].items() if isinstance(v, dict) and "error" not in v
+            )
+            + f'</table>'
+            if mh_data and mh_data.get("auxiliary") else ""
+        ) +
+
         f'<p style="font-size:11px; color:#aaa; margin-top:20px;">'
         f'IC gate: ≥{cfg.MIN_IC:.2f} to promote &nbsp;|&nbsp; Walk-forward: median IC ≥{cfg.WF_MEDIAN_IC_GATE:.2f}, {cfg.WF_MIN_FOLDS_POSITIVE*100:.0f}%+ positive folds</p>'
         f'</body></html>'
@@ -1576,7 +1700,7 @@ def send_training_email(result: dict, date_str: str) -> bool:
     _rank_mark = " ✓" if promoted_mode == "rank" else ""
     _ens_mark  = " ✓" if promoted_mode == "ensemble" else ""
     plain_body = (
-        f"GBM Weekly Retrain — {date_str}\n"
+        f"Alpha Engine Training — {date_str}\n"
         f"Model: {version}  Samples: {n_train:,}  Elapsed: {elapsed_s:.0f}s\n"
         f"\nVal IC:             {val_ic:.4f}"
         f"\nMSE Model IC:       {mse_ic:.4f}{' — ' + ic_label if promoted_mode == 'mse' else ''}{_mse_mark}"
@@ -1585,6 +1709,11 @@ def send_training_email(result: dict, date_str: str) -> bool:
             f"\nEnsemble IC:        {ensemble_ic:.4f}{' — ' + ic_label if promoted_mode == 'ensemble' else ''}{_ens_mark}"
             if ensemble_on and rank_ic is not None and ensemble_ic is not None else
             f"\nTest IC:            {test_ic:.4f} — {ic_label}"
+        ) +
+        + (
+            f"\nCatBoost IC:        {cat_ic_val:.4f}"
+            f"\nLGB-Cat Blend IC:   {blend_ic_val:.4f} (w_lgb={blend_wts['lgb']:.1f})"
+            if cat_enabled and cat_ic_val is not None else ""
         ) +
         f"\nPromoted:           {promoted_mode if promoted else 'none'}"
         f"\nIC IR:              {ic_ir:.3f} ({ic_pos}/20 positive)"
