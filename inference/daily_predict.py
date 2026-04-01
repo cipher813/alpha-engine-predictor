@@ -1059,7 +1059,11 @@ def load_price_data_from_cache(
     for key, stem in _MACRO_SLIM_KEYS.items():
         source = price_data.get(stem) if stem in price_data else slim_data.get(stem)
         if source is not None and "Close" in source.columns:
-            last_macro_date = pd.Timestamp(source.index.max()).normalize()
+            _idx_max = source.index.max()
+            if pd.isna(_idx_max):
+                log.warning("Macro series %s has empty/NaT index — skipping", key)
+                continue
+            last_macro_date = pd.Timestamp(_idx_max).normalize()
             if (today - last_macro_date).days > 1:
                 # Macro series is stale — needs fresh data from yfinance
                 _yf_sym = f"^{stem}" if stem in ("VIX", "TNX", "IRX") else stem
@@ -1072,7 +1076,11 @@ def load_price_data_from_cache(
     for stem, df in slim_data.items():
         if stem.startswith("XL") and "Close" in df.columns:
             source = price_data.get(stem) if stem in price_data else df
-            last_etf_date = pd.Timestamp(source.index.max()).normalize()
+            _etf_idx_max = source.index.max()
+            if pd.isna(_etf_idx_max):
+                log.warning("Sector ETF %s has empty/NaT index — skipping", stem)
+                continue
+            last_etf_date = pd.Timestamp(_etf_idx_max).normalize()
             if (today - last_etf_date).days > 1:
                 _stale_macros.append(stem)
             macro[stem] = source["Close"].dropna()
