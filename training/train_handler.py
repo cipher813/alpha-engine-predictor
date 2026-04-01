@@ -1373,6 +1373,57 @@ def run_gbm_training(
 
 # ── Training email ─────────────────────────────────────────────────────────────
 
+def _build_ic_table_html(result, is_meta, ic_color, ic_label, promoted_mode,
+                         promo_color, promo_label, val_ic, mse_ic, test_ic,
+                         rank_ic, ensemble_ic, ensemble_on, ic_ir, ic_pos):
+    """Build the IC metrics table HTML for the training email."""
+    _bg_style = ' style="background:#f9f9f9;"'
+    _row = lambda label, value, bg=False: (
+        f'<tr{_bg_style if bg else ""}>'
+        f'<td style="padding:5px 10px; color:#555; width:160px;">{label}</td>'
+        f'<td style="padding:5px 10px; font-family:monospace; font-weight:bold;">{value}</td></tr>'
+    )
+
+    rows = '<table style="border-collapse:collapse; width:100%; margin-bottom:12px;">'
+
+    if is_meta:
+        meta_ic = result.get("meta_model_ic", test_ic)
+        mom_ic = result.get("momentum_test_ic", mse_ic)
+        vol_ic = result.get("volatility_test_ic", 0)
+        regime_acc = result.get("regime_accuracy", 0)
+        rows += _row("Meta-Model IC", f'{meta_ic:.4f}', bg=True)
+        rows += _row("Momentum IC", f'{mom_ic:.4f}')
+        rows += _row("Volatility IC", f'{vol_ic:.4f}', bg=True)
+        rows += _row("Regime Accuracy", f'{regime_acc*100:.1f}%')
+        coefs = result.get("meta_coefficients", {})
+        if coefs:
+            coef_str = " | ".join(
+                f'{k}={v:+.3f}' for k, v in sorted(coefs.items(), key=lambda x: -abs(x[1]))
+                if k != "intercept" and abs(v) > 0.0001
+            )
+            rows += _row("Meta Coefficients", coef_str, bg=True)
+    else:
+        rows += _row("Val IC", f'{val_ic:.4f}', bg=True)
+        rows += _row("MSE Model IC",
+                      f'{mse_ic:.4f}{f" — {ic_label}" if promoted_mode == "mse" else ""}')
+        if ensemble_on and rank_ic is not None:
+            rows += _row("Lambdarank IC",
+                          f'{rank_ic:.4f}{f" — {ic_label}" if promoted_mode == "rank" else ""}', bg=True)
+            rows += _row("Ensemble IC",
+                          f'{ensemble_ic:.4f}{f" — {ic_label}" if promoted_mode == "ensemble" else ""}')
+        else:
+            rows += _row("Test IC", f'<span style="color:{ic_color};">{test_ic:.4f} — {ic_label}</span>')
+        rows += _row("IC IR", f'{ic_ir:.3f} ({ic_pos}/20 positive)', bg=True)
+
+    rows += (
+        f'<tr style="background:#f9f9f9;">'
+        f'<td style="padding:5px 10px; color:#555; font-weight:bold;">Promotion</td>'
+        f'<td style="padding:5px 10px; font-weight:bold; color:{promo_color};">{promo_label}</td></tr>'
+    )
+    rows += '</table>'
+    return rows
+
+
 def send_training_email(result: dict, date_str: str) -> bool:
     """
     Send GBM training summary email via Gmail SMTP (primary) or SES (fallback).
@@ -1442,49 +1493,92 @@ def send_training_email(result: dict, date_str: str) -> bool:
     wf_data = result.get("walk_forward")
     wf_html = ""
     wf_plain = ""
+    is_meta = "meta" in str(result.get("model_version", "")).lower()
     if wf_data and wf_data.get("folds"):
-        wf_median = wf_data["median_ic"]
-        wf_pct = wf_data["pct_positive"]
+        # Meta-model uses per-model median ICs; v2.0 uses single median_ic
+        wf_median = wf_data.get("median_ic") or wf_data.get("momentum_median_ic", 0.0)
+        wf_pct = wf_data.get("pct_positive", 0.0)
         wf_pass = wf_data.get("passes_wf", False)
         wf_color = "#2e7d32" if wf_pass else "#c62828"
         wf_label = "PASS ✓" if wf_pass else "FAIL ✗"
-        fold_rows = "".join(
-            f'<tr style="background:{"#f9f9f9" if i % 2 == 0 else "#fff"};">'
-            f'<td style="padding:2px 6px; font-family:monospace; font-size:11px;">{f["fold"]}</td>'
-            f'<td style="padding:2px 6px; font-family:monospace; font-size:11px;">{f["test_start"]}</td>'
-            f'<td style="padding:2px 6px; font-family:monospace; font-size:11px;">{f["test_end"]}</td>'
-            f'<td style="padding:2px 6px; font-family:monospace; font-size:11px;">{f["n_train"]:,}</td>'
-            f'<td style="padding:2px 6px; font-family:monospace; font-size:11px; '
-            f'color:{"#2e7d32" if f["ic"] > 0 else "#c62828"};">{f["ic"]:.4f}</td>'
-            f'</tr>'
-            for i, f in enumerate(wf_data["folds"])
-        )
-        wf_html = (
-            f'<h3 style="margin-top:16px; margin-bottom:4px;">Walk-Forward Validation '
-            f'({len(wf_data["folds"])} folds)</h3>'
-            f'<p style="font-size:12px; margin:2px 0;">Median IC: <b style="color:{wf_color};">'
-            f'{wf_median:.4f}</b> — {wf_label} &nbsp;|&nbsp; '
-            f'Positive folds: <b>{wf_pct*100:.0f}%</b></p>'
-            f'<table style="border-collapse:collapse; width:100%; font-size:11px;">'
-            f'<tr style="background:#e0e0e0;">'
-            f'<th style="padding:3px 6px;">Fold</th>'
-            f'<th style="padding:3px 6px;">Test Start</th>'
-            f'<th style="padding:3px 6px;">Test End</th>'
-            f'<th style="padding:3px 6px;">Train N</th>'
-            f'<th style="padding:3px 6px;">IC</th></tr>'
-            f'{fold_rows}</table>'
-        )
-        wf_plain = (
-            f"\n--- Walk-Forward ({len(wf_data['folds'])} folds) ---"
-            f"\nMedian IC: {wf_median:.4f} — {wf_label}"
-            f"\nPositive folds: {wf_pct*100:.0f}%\n"
-            + "\n".join(
-                f"  Fold {f['fold']}: [{f['test_start']} → {f['test_end']}] "
-                f"train={f['n_train']:,}  IC={f['ic']:.4f}"
-                for f in wf_data["folds"]
+
+        if is_meta:
+            mom_median = wf_data.get("momentum_median_ic", "n/a")
+            vol_median = wf_data.get("volatility_median_ic", "n/a")
+            fold_rows = "".join(
+                f'<tr style="background:{"#f9f9f9" if i % 2 == 0 else "#fff"};">'
+                f'<td style="padding:2px 6px; font-family:monospace; font-size:11px;">{f["fold"]}</td>'
+                f'<td style="padding:2px 6px; font-family:monospace; font-size:11px;">{f["test_start"]}</td>'
+                f'<td style="padding:2px 6px; font-family:monospace; font-size:11px;">{f["test_end"]}</td>'
+                f'<td style="padding:2px 6px; font-family:monospace; font-size:11px; '
+                f'color:{"#2e7d32" if f.get("mom_ic", 0) > 0 else "#c62828"};">{f.get("mom_ic", 0):.4f}</td>'
+                f'<td style="padding:2px 6px; font-family:monospace; font-size:11px; '
+                f'color:#2e7d32;">{f.get("vol_ic", 0):.4f}</td>'
+                f'</tr>'
+                for i, f in enumerate(wf_data["folds"])
             )
-            + "\n"
-        )
+            wf_html = (
+                f'<h3 style="margin-top:16px; margin-bottom:4px;">Walk-Forward Validation '
+                f'({len(wf_data["folds"])} folds)</h3>'
+                f'<p style="font-size:12px; margin:2px 0;">Momentum median IC: <b>{mom_median}</b> '
+                f'&nbsp;|&nbsp; Volatility median IC: <b>{vol_median}</b> '
+                f'&nbsp;|&nbsp; Status: <b style="color:{wf_color};">{wf_label}</b></p>'
+                f'<table style="border-collapse:collapse; width:100%; font-size:11px;">'
+                f'<tr style="background:#e0e0e0;">'
+                f'<th style="padding:3px 6px;">Fold</th>'
+                f'<th style="padding:3px 6px;">Test Start</th>'
+                f'<th style="padding:3px 6px;">Test End</th>'
+                f'<th style="padding:3px 6px;">Mom IC</th>'
+                f'<th style="padding:3px 6px;">Vol IC</th></tr>'
+                f'{fold_rows}</table>'
+            )
+            wf_plain = (
+                f"\n--- Walk-Forward ({len(wf_data['folds'])} folds) ---"
+                f"\nMomentum median IC: {mom_median}  |  Volatility median IC: {vol_median}"
+                f"\nStatus: {wf_label}\n"
+                + "\n".join(
+                    f"  Fold {f['fold']}: [{f['test_start']} → {f['test_end']}] "
+                    f"mom={f.get('mom_ic', 0):.4f}  vol={f.get('vol_ic', 0):.4f}"
+                    for f in wf_data["folds"]
+                ) + "\n"
+            )
+        else:
+            fold_rows = "".join(
+                f'<tr style="background:{"#f9f9f9" if i % 2 == 0 else "#fff"};">'
+                f'<td style="padding:2px 6px; font-family:monospace; font-size:11px;">{f["fold"]}</td>'
+                f'<td style="padding:2px 6px; font-family:monospace; font-size:11px;">{f["test_start"]}</td>'
+                f'<td style="padding:2px 6px; font-family:monospace; font-size:11px;">{f["test_end"]}</td>'
+                f'<td style="padding:2px 6px; font-family:monospace; font-size:11px;">{f["n_train"]:,}</td>'
+                f'<td style="padding:2px 6px; font-family:monospace; font-size:11px; '
+                f'color:{"#2e7d32" if f["ic"] > 0 else "#c62828"};">{f["ic"]:.4f}</td>'
+                f'</tr>'
+                for i, f in enumerate(wf_data["folds"])
+            )
+            wf_html = (
+                f'<h3 style="margin-top:16px; margin-bottom:4px;">Walk-Forward Validation '
+                f'({len(wf_data["folds"])} folds)</h3>'
+                f'<p style="font-size:12px; margin:2px 0;">Median IC: <b style="color:{wf_color};">'
+                f'{wf_median:.4f}</b> — {wf_label} &nbsp;|&nbsp; '
+                f'Positive folds: <b>{wf_pct*100:.0f}%</b></p>'
+                f'<table style="border-collapse:collapse; width:100%; font-size:11px;">'
+                f'<tr style="background:#e0e0e0;">'
+                f'<th style="padding:3px 6px;">Fold</th>'
+                f'<th style="padding:3px 6px;">Test Start</th>'
+                f'<th style="padding:3px 6px;">Test End</th>'
+                f'<th style="padding:3px 6px;">Train N</th>'
+                f'<th style="padding:3px 6px;">IC</th></tr>'
+                f'{fold_rows}</table>'
+            )
+            wf_plain = (
+                f"\n--- Walk-Forward ({len(wf_data['folds'])} folds) ---"
+                f"\nMedian IC: {wf_median:.4f} — {wf_label}"
+                f"\nPositive folds: {wf_pct*100:.0f}%\n"
+                + "\n".join(
+                    f"  Fold {f['fold']}: [{f['test_start']} → {f['test_end']}] "
+                    f"train={f['n_train']:,}  IC={f['ic']:.4f}"
+                    for f in wf_data["folds"]
+                ) + "\n"
+            )
 
     # ── SHAP vs Gain comparison section ──────────────────────────────────────
     shap_top10    = result.get("feature_importance_shap_top10", [])
@@ -1595,66 +1689,9 @@ def send_training_email(result: dict, date_str: str) -> bool:
         f'Training samples: <b>{n_train:,}</b> &nbsp;|&nbsp;'
         f'Elapsed: <b>{elapsed_s:.0f}s ({elapsed_s/60:.1f} min)</b></p>'
 
-        f'<table style="border-collapse:collapse; width:100%; margin-bottom:12px;">'
-        f'<tr style="background:#f9f9f9;">'
-        f'  <td style="padding:5px 10px; color:#555; width:160px;">Val IC</td>'
-        f'  <td style="padding:5px 10px; font-family:monospace; font-weight:bold;">{val_ic:.4f}</td>'
-        f'</tr>'
-        f'<tr>'
-        f'  <td style="padding:5px 10px; color:#555;">MSE Model IC</td>'
-        f'  <td style="padding:5px 10px; font-family:monospace; font-weight:bold;'
-        f'{f" color:{ic_color};" if promoted_mode == "mse" else ""}">'
-        f'{mse_ic:.4f}{f" — {ic_label}" if promoted_mode == "mse" else ""}'
-        f'{"  ✓" if promoted_mode == "mse" else ""}</td>'
-        f'</tr>'
-        + (
-            f'<tr style="background:#f9f9f9;">'
-            f'  <td style="padding:5px 10px; color:#555;">Lambdarank Model IC</td>'
-            f'  <td style="padding:5px 10px; font-family:monospace; font-weight:bold;'
-            f'{f" color:{ic_color};" if promoted_mode == "rank" else ""}">'
-            f'{rank_ic:.4f}{f" — {ic_label}" if promoted_mode == "rank" else ""}'
-            f'{"  ✓" if promoted_mode == "rank" else ""}</td>'
-            f'</tr>'
-            f'<tr>'
-            f'  <td style="padding:5px 10px; color:#555;">Ensemble IC</td>'
-            f'  <td style="padding:5px 10px; font-family:monospace; font-weight:bold;'
-            f'{f" color:{ic_color};" if promoted_mode == "ensemble" else ""}">'
-            f'{ensemble_ic:.4f}{f" — {ic_label}" if promoted_mode == "ensemble" else ""}'
-            f'{"  ✓" if promoted_mode == "ensemble" else ""}</td>'
-            f'</tr>'
-            if ensemble_on and rank_ic is not None and ensemble_ic is not None else
-            f'<tr>'
-            f'  <td style="padding:5px 10px; color:#555;">Test IC</td>'
-            f'  <td style="padding:5px 10px; font-family:monospace; font-weight:bold; color:{ic_color};">'
-            f'  {test_ic:.4f} — {ic_label}</td>'
-            f'</tr>'
-        ) +
-        + (
-            f'<tr style="background:#f9f9f9;">'
-            f'  <td style="padding:5px 10px; color:#555;">CatBoost IC</td>'
-            f'  <td style="padding:5px 10px; font-family:monospace; font-weight:bold;'
-            f'{f" color:{ic_color};" if promoted_mode == "catboost" else ""}">'
-            f'{cat_ic_val:.4f}{"  ✓" if promoted_mode == "catboost" else ""}</td>'
-            f'</tr>'
-            f'<tr>'
-            f'  <td style="padding:5px 10px; color:#555;">LGB-Cat Blend IC</td>'
-            f'  <td style="padding:5px 10px; font-family:monospace; font-weight:bold;'
-            f'{f" color:{ic_color};" if promoted_mode == "lgb_cat_blend" else ""}">'
-            f'{blend_ic_val:.4f} (w_lgb={blend_wts["lgb"]:.1f})'
-            f'{"  ✓" if promoted_mode == "lgb_cat_blend" else ""}</td>'
-            f'</tr>'
-            if cat_enabled and cat_ic_val is not None else ""
-        ) +
-        f'<tr style="background:#f9f9f9;">'
-        f'  <td style="padding:5px 10px; color:#555;">IC IR</td>'
-        f'  <td style="padding:5px 10px; font-family:monospace; color:#555;">'
-        f'  {ic_ir:.3f} ({ic_pos}/20 positive)</td>'
-        f'</tr>'
-        f'<tr style="background:#f9f9f9;">'
-        f'  <td style="padding:5px 10px; color:#555; font-weight:bold;">Promotion</td>'
-        f'  <td style="padding:5px 10px; font-weight:bold; color:{promo_color};">{promo_label}</td>'
-        f'</tr>'
-        f'</table>'
+        + _build_ic_table_html(result, is_meta, ic_color, ic_label, promoted_mode,
+                               promo_color, promo_label, val_ic, mse_ic, test_ic,
+                               rank_ic, ensemble_ic, ensemble_on, ic_ir, ic_pos) +
 
         f'{wf_html}'
 
