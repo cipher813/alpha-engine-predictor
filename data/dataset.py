@@ -182,6 +182,52 @@ def _load_ticker_parquet(path: Path) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def _compute_xsect_dispersion(data_path: Path) -> pd.Series | None:
+    """
+    Compute cross-sectional dispersion: std dev of daily returns across tickers.
+
+    Returns a pd.Series indexed by date with the daily cross-sectional std dev.
+    High dispersion = stock-picking environment; low = factor-driven.
+    """
+    _SKIP = {
+        "SPY", "VIX", "TNX", "IRX", "GLD", "USO",
+        "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "XLB", "XLRE", "XLC",
+        "VIX3M",
+    }
+    parquets = sorted(data_path.glob("*.parquet"))
+    returns_by_date: dict[pd.Timestamp, list[float]] = {}
+    for path in parquets:
+        ticker = path.stem
+        if ticker in _SKIP:
+            continue
+        try:
+            df = _load_ticker_parquet(path)
+            if df.empty or "Close" not in df.columns or len(df) < 10:
+                continue
+            rets = df["Close"].pct_change().dropna()
+            for dt, r in rets.items():
+                if np.isfinite(r):
+                    returns_by_date.setdefault(dt, []).append(r)
+        except Exception:
+            continue
+
+    if not returns_by_date:
+        return None
+
+    dispersion = {}
+    for dt, rets in returns_by_date.items():
+        if len(rets) >= 10:
+            dispersion[dt] = float(np.std(rets))
+
+    if not dispersion:
+        return None
+
+    series = pd.Series(dispersion).sort_index()
+    log.info("Cross-sectional dispersion computed: %d dates, mean=%.4f",
+             len(series), series.mean())
+    return series
+
+
 def build_datasets(
     data_dir: str,
     config_module,
@@ -596,6 +642,13 @@ def build_regression_arrays(
     gld_series = _load_close("GLD.parquet")
     uso_series = _load_close("USO.parquet")
 
+    # VIX3M (3-month VIX) for term structure slope
+    vix3m_series = _load_close("VIX3M.parquet")
+
+    # Cross-sectional dispersion: std dev of daily returns across all tickers.
+    # Pre-computed as a single pass before per-ticker feature computation.
+    xsect_dispersion = _compute_xsect_dispersion(data_path)
+
     sector_map: dict[str, str] = {}
     sector_map_path = data_path / "sector_map.json"
     if sector_map_path.exists():
@@ -610,7 +663,7 @@ def build_regression_arrays(
                 sector_etf_cache[etf_symbol] = etf_df["Close"].astype(float)
 
     _SKIP = {
-        "SPY", "VIX", "TNX", "IRX", "GLD", "USO",
+        "SPY", "VIX", "VIX3M", "TNX", "IRX", "GLD", "USO",
         "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "XLB", "XLRE", "XLC",
     }
 
@@ -629,6 +682,7 @@ def build_regression_arrays(
                 raw_df, spy_series=spy_series, vix_series=vix_series,
                 sector_etf_series=sector_etf_series, tnx_series=tnx_series,
                 irx_series=irx_series, gld_series=gld_series, uso_series=uso_series,
+                vix3m_series=vix3m_series, xsect_dispersion=xsect_dispersion,
             )
             labeled_df = compute_labels(
                 featured_df,

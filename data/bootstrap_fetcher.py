@@ -40,6 +40,7 @@ _RETRY_DELAY = 5.0        # seconds before retrying a failed batch
 _ALWAYS_DOWNLOAD = [
     "SPY",                                                                         # S&P 500 benchmark
     "VIX",                                                                         # CBOE Volatility Index
+    "VIX3M",                                                                       # 3-Month VIX (term structure)
     "TNX",                                                                         # 10-Year Treasury yield
     "IRX",                                                                         # 3-Month T-bill yield
     "GLD",                                                                         # Gold ETF
@@ -49,7 +50,7 @@ _ALWAYS_DOWNLOAD = [
 
 # yfinance requires a leading caret for index/rate tickers.
 # Stored locally without the caret (TNX.parquet, not ^TNX.parquet).
-_CARET_SYMBOLS = {"VIX", "TNX", "IRX"}
+_CARET_SYMBOLS = {"VIX", "VIX3M", "TNX", "IRX"}
 
 # GICS sector name → sector ETF symbol
 GICS_TO_ETF: dict[str, str] = {

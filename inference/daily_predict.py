@@ -462,6 +462,22 @@ def load_watchlist(
 
 # ── Price fetch ───────────────────────────────────────────────────────────────
 
+
+def _safe_last_date(idx: "pd.Index") -> "pd.Timestamp | None":
+    """Return the normalized last date from a DatetimeIndex, or None if empty/NaT.
+
+    Centralizes the NaT guard that caused the 2026-04-01 crash.  Every call
+    site that previously did ``pd.Timestamp(df.index.max()).normalize()``
+    should use this instead.
+    """
+    if idx is None or idx.empty:
+        return None
+    last = idx.max()
+    if pd.isna(last):
+        return None
+    return pd.Timestamp(last).normalize()
+
+
 @retry(max_attempts=2, retryable=(Exception,), label="yfinance")
 def _yf_download_batch(tickers, **kwargs):
     """Download a batch of tickers from yfinance with retry."""
@@ -566,6 +582,7 @@ def fetch_macro_series(
     _MACRO_MAP = {
         "SPY": "SPY",
         "VIX": "^VIX",
+        "VIX3M": "^VIX3M",
         "TNX": "^TNX",
         "IRX": "^IRX",
         "GLD": "GLD",
@@ -967,8 +984,12 @@ def load_price_data_from_cache(
         log.warning("Slim cache parquets empty — falling back to yfinance")
         return None, None
 
-    slim_last_date = max(df.index.max() for df in slim_data.values())
-    slim_last_date = pd.Timestamp(slim_last_date).normalize()
+    _candidate_dates = [_safe_last_date(df.index) for df in slim_data.values()]
+    _valid_dates = [d for d in _candidate_dates if d is not None]
+    if not _valid_dates:
+        log.warning("Slim cache loaded but all indices are empty/NaT — falling back to yfinance")
+        return None, None
+    slim_last_date = max(_valid_dates)
     log.info(
         "Slim cache loaded: %d tickers, last date: %s",
         len(slim_data), slim_last_date.date(),
@@ -1032,8 +1053,14 @@ def load_price_data_from_cache(
             len(split_tickers),
             sorted(split_tickers)[:10],
         )
-        fresh = fetch_today_prices(sorted(split_tickers))
-        price_data.update(fresh)
+        # Map bare macro tickers to yfinance caret format before re-fetch
+        _CARET_MAP = {"VIX": "^VIX", "TNX": "^TNX", "IRX": "^IRX"}
+        yf_tickers = [_CARET_MAP.get(t, t) for t in sorted(split_tickers)]
+        fresh = fetch_today_prices(yf_tickers)
+        # Map caret tickers back to bare keys for price_data
+        for yf_sym, df in fresh.items():
+            cache_key = yf_sym.lstrip("^")
+            price_data[cache_key] = df
 
     n_success = sum(1 for df in price_data.values() if not df.empty)
     log.info(
@@ -1049,6 +1076,7 @@ def load_price_data_from_cache(
     _MACRO_SLIM_KEYS = {
         "SPY": "SPY",
         "VIX": "VIX",   # stored as VIX, yfinance ticker is ^VIX
+        "VIX3M": "VIX3M",  # stored as VIX3M, yfinance ticker is ^VIX3M
         "TNX": "TNX",   # stored as TNX, yfinance ticker is ^TNX
         "IRX": "IRX",
         "GLD": "GLD",
@@ -1059,14 +1087,13 @@ def load_price_data_from_cache(
     for key, stem in _MACRO_SLIM_KEYS.items():
         source = price_data.get(stem) if stem in price_data else slim_data.get(stem)
         if source is not None and "Close" in source.columns:
-            _idx_max = source.index.max()
-            if pd.isna(_idx_max):
+            last_macro_date = _safe_last_date(source.index)
+            if last_macro_date is None:
                 log.warning("Macro series %s has empty/NaT index — skipping", key)
                 continue
-            last_macro_date = pd.Timestamp(_idx_max).normalize()
             if (today - last_macro_date).days > 1:
                 # Macro series is stale — needs fresh data from yfinance
-                _yf_sym = f"^{stem}" if stem in ("VIX", "TNX", "IRX") else stem
+                _yf_sym = f"^{stem}" if stem in ("VIX", "VIX3M", "TNX", "IRX") else stem
                 _stale_macros.append(_yf_sym)
             macro[key] = source["Close"].dropna()
         else:
@@ -1076,11 +1103,10 @@ def load_price_data_from_cache(
     for stem, df in slim_data.items():
         if stem.startswith("XL") and "Close" in df.columns:
             source = price_data.get(stem) if stem in price_data else df
-            _etf_idx_max = source.index.max()
-            if pd.isna(_etf_idx_max):
+            last_etf_date = _safe_last_date(source.index)
+            if last_etf_date is None:
                 log.warning("Sector ETF %s has empty/NaT index — skipping", stem)
                 continue
-            last_etf_date = pd.Timestamp(_etf_idx_max).normalize()
             if (today - last_etf_date).days > 1:
                 _stale_macros.append(stem)
             macro[stem] = source["Close"].dropna()
@@ -1224,6 +1250,7 @@ def predict_ticker_gbm(
     scorer,
     macro: dict[str, pd.Series] | None = None,
     sector_etf_series: pd.Series | None = None,
+    calibrator=None,
 ) -> Optional[dict]:
     """
     Compute features for one ticker and run GBMScorer inference.
@@ -1286,18 +1313,24 @@ def predict_ticker_gbm(
     max_r = getattr(cfg, "LABEL_CLIP", 0.15)
     s = float(np.clip(s, -max_r, max_r))
 
-    # Convert continuous alpha scalar → pseudo-probabilities for output compatibility.
-    # Linear map over [-LABEL_CLIP, +LABEL_CLIP] → p_up ∈ [0, 1]; clamp outside range.
-    p_up   = float(np.clip(0.5 + s / (2.0 * max_r), 0.0, 1.0))
-    p_down = float(np.clip(0.5 - s / (2.0 * max_r), 0.0, 1.0))
-    p_flat = float(max(0.0, 1.0 - p_up - p_down))
-
-    if s >= 0:
-        predicted_direction = "UP"
-        confidence = p_up
+    # Calibrated confidence (Platt scaling if available, linear fallback)
+    if calibrator is not None and calibrator.is_fitted:
+        _cal_result = calibrator.calibrate_prediction(s, label_clip=max_r)
+        p_up = _cal_result["p_up"]
+        p_down = _cal_result["p_down"]
+        p_flat = _cal_result["p_flat"]
+        predicted_direction = _cal_result["predicted_direction"]
+        confidence = _cal_result["prediction_confidence"]
     else:
-        predicted_direction = "DOWN"
-        confidence = p_down
+        p_up   = float(np.clip(0.5 + s / (2.0 * max_r), 0.0, 1.0))
+        p_down = float(np.clip(0.5 - s / (2.0 * max_r), 0.0, 1.0))
+        p_flat = float(max(0.0, 1.0 - p_up - p_down))
+        if s >= 0:
+            predicted_direction = "UP"
+            confidence = p_up
+        else:
+            predicted_direction = "DOWN"
+            confidence = p_down
 
     return {
         "ticker":                ticker,
@@ -1882,704 +1915,21 @@ def main(
             cfg.EMAIL_SENDER or "(empty)", len(cfg.EMAIL_RECIPIENTS),
         )
 
-    # ── Step 1: Load model ────────────────────────────────────────────────────
-    scorer = None      # GBM path
-    model = None       # MLP path
-    checkpoint = {}    # MLP path
+    # ── Delegate to staged pipeline ──────────────────────────────────────────
+    from inference.pipeline import PipelineContext, run_pipeline
 
-    if model_type == "gbm":
-        # Determine inference mode from gbm_mode.json
-        inference_mode = "mse"  # default (backwards compat)
-        if getattr(cfg, "GBM_ENSEMBLE_LAMBDARANK", True):
-            if local:
-                mode_path = Path("checkpoints/gbm_mode.json")
-                if mode_path.exists():
-                    try:
-                        inference_mode = json.loads(mode_path.read_text()).get("mode", "mse")
-                    except Exception as exc:
-                        log.warning("Could not read local gbm_mode.json: %s — defaulting to mse", exc)
-            else:
-                try:
-                    import boto3 as _boto3_mode
-                    _s3_mode = _boto3_mode.client("s3")
-                    _mode_obj = _s3_mode.get_object(Bucket=bucket, Key=cfg.GBM_MODE_KEY)
-                    inference_mode = json.loads(_mode_obj["Body"].read()).get("mode", "mse")
-                except Exception as exc:
-                    log.info(
-                        "gbm_mode.json not found on S3 — defaulting to mse: %s", exc
-                    )
-        log.info("Inference mode: %s", inference_mode)
-
-        # Always load BOTH MSE and lambdarank models.
-        # - MSE model: calibrated 5d return prediction → predicted_alpha, direction, veto
-        # - Lambdarank model: cross-sectional ranking → model_rank column
-        # The promoted model (inference_mode) determines which one the executor
-        # relies on for the veto gate, but both outputs are shown side by side
-        # so we can compare their views over time.
-        mse_scorer = None
-        rank_scorer = None
-
-        # Load MSE model
-        try:
-            if local:
-                mse_scorer = load_gbm_local("checkpoints/gbm_best.txt")
-            else:
-                mse_scorer = load_gbm_s3(bucket, cfg.GBM_MSE_WEIGHTS_KEY)
-            log.info("MSE model loaded for alpha estimation")
-        except Exception as exc:
-            log.warning("MSE model not available: %s", exc)
-
-        # Load lambdarank model
-        try:
-            if local:
-                rank_scorer = load_gbm_local("checkpoints/gbm_rank_best.txt")
-            else:
-                rank_scorer = load_gbm_s3(bucket, cfg.GBM_RANK_WEIGHTS_KEY)
-            log.info("Lambdarank model loaded for ranking")
-        except Exception as exc:
-            log.warning("Lambdarank model not available: %s", exc)
-
-        # Primary scorer for model_version display — use the promoted model
-        if inference_mode == "rank" and rank_scorer is not None:
-            scorer = rank_scorer
-        elif inference_mode == "ensemble" and mse_scorer is not None:
-            scorer = mse_scorer
-        elif mse_scorer is not None:
-            scorer = mse_scorer
-        elif rank_scorer is not None:
-            scorer = rank_scorer
-        else:
-            raise RuntimeError("No GBM model available — both MSE and rank failed to load")
-
-        model_version = f"GBM-v{scorer._best_iteration}"
-        val_loss = scorer._val_ic   # IC is the GBM analogue of val_loss
-    else:
-        # mlp (default)
-        if local:
-            model, checkpoint = load_model_local("checkpoints/best.pt")
-        else:
-            model, checkpoint = load_model(bucket, cfg.MODEL_WEIGHTS_KEY)
-        norm_stats = checkpoint.get("norm_stats", {})
-        if not norm_stats:
-            log.warning("No norm_stats in checkpoint — features may not normalize correctly")
-        model_version = checkpoint.get("model_version", "unknown")
-        val_loss = checkpoint.get("val_loss", float("nan"))
-
-    # ── Step 2: Get universe ──────────────────────────────────────────────────
-    ticker_sources: dict[str, str] = {}   # ticker → watchlist_source annotation
-    signals_data: dict = {}               # raw signals.json payload for email
-    if watchlist_path:
-        tickers, ticker_sources, signals_data = load_watchlist(
-            path=watchlist_path,
-            s3_bucket=bucket,
-            date_str=date_str,
-        )
-    else:
-        tickers = get_universe_tickers(bucket, date_str)
-
-    # ── Step 3: Load sector map ───────────────────────────────────────────────
-    # sector_map: ticker → sector ETF symbol (e.g. "AAPL" → "XLK")
-    # Built by bootstrap_fetcher.py and stored in data/cache/sector_map.json.
-    sector_map: dict[str, str] = {}
-    sector_map_path = Path("data/cache/sector_map.json")
-    if sector_map_path.exists():
-        try:
-            sector_map = json.loads(sector_map_path.read_text())
-            log.info("Sector map loaded: %d mappings", len(sector_map))
-        except Exception as exc:
-            log.warning("Could not load sector_map.json: %s — sector_vs_spy_5d will be 0", exc)
-    else:
-        log.warning(
-            "data/cache/sector_map.json not found — sector_vs_spy_5d will be 0. "
-            "Run bootstrap_fetcher.py to generate it."
-        )
-
-    # ── Step 3b: Prices + macro — slim cache preferred, yfinance fallback ─────
-    # Primary path (after first Sunday training run):
-    #   slim cache (2y, weekly) + daily_closes delta (Mon–Fri, 1–4 rows/ticker)
-    #   → eliminates the 2y × 900 ticker yfinance fetch entirely.
-    # Fallback (slim cache not yet created or download failure):
-    #   fetch_today_prices() + fetch_macro_series() from yfinance as before.
-    price_data: dict[str, pd.DataFrame] = {}
-    macro:      dict[str, pd.Series]    = {}
-
-    cached_prices, cached_macro = load_price_data_from_cache(
-        tickers, date_str, bucket,
+    ctx = PipelineContext(
+        date_str=date_str,
+        bucket=bucket,
+        dry_run=dry_run,
+        local=local,
+        model_type=model_type,
+        watchlist_path=watchlist_path,
+        fd=fd,
+        start_ts=_start_ts,
+        soft_timeout_s=_SOFT_TIMEOUT_S,
     )
-
-    if cached_prices is not None:
-        price_data = cached_prices
-        macro      = cached_macro or {}
-        log.info("Using slim-cache + daily_closes for prices and macro")
-    else:
-        log.info("Slim cache unavailable — fetching from yfinance (full 2y)")
-        price_data = fetch_today_prices(tickers, fd=fd)
-        sector_etfs_needed = sorted({sector_map[t] for t in tickers if t in sector_map})
-        macro = fetch_macro_series(extra_tickers=sector_etfs_needed)
-
-    # ── Compute per-ticker price data age ────────────────────────────────────
-    ticker_data_age: dict[str, int] = {}
-    if price_data:
-        _today_ts = pd.Timestamp(date_str).normalize()
-        for _tk, _df in price_data.items():
-            if _df is not None and not _df.empty:
-                try:
-                    _last_date = pd.Timestamp(_df.index.max()).normalize()
-                    ticker_data_age[_tk] = (_today_ts - _last_date).days
-                except Exception:
-                    pass  # skip tickers with unparseable index
-    if ticker_data_age:
-        log.info(
-            "Price data age: max=%d days, n_stale(>1d)=%d / %d tickers",
-            max(ticker_data_age.values()),
-            sum(1 for d in ticker_data_age.values() if d > 1),
-            len(ticker_data_age),
-        )
-
-    # Soft timeout gate: if nearing limit, write whatever we have and exit
-    if _near_timeout():
-        log.warning("Soft timeout before sector ETF fetch — writing partial predictions")
-        write_predictions(predictions, date_str, bucket, {"model_version": "timeout", "timed_out": True}, dry_run=dry_run, fd=fd)
-        return
-
-    # Ensure all sector ETFs needed are present in macro (may be missing from
-    # slim cache if a ticker's sector changed since the last bootstrap)
-    sector_etfs_needed = sorted({sector_map[t] for t in tickers if t in sector_map})
-    missing_etfs = [e for e in sector_etfs_needed if e not in macro]
-    if missing_etfs:
-        log.info("Fetching %d missing sector ETFs from yfinance: %s", len(missing_etfs), missing_etfs)
-        extra = fetch_macro_series(extra_tickers=missing_etfs)
-        macro.update({k: v for k, v in extra.items() if k not in macro})
-
-    # ── Step 3c: Persist daily closes to S3 (independent price archive) ───────
-    # Saves split-adjusted (auto_adjust=False) OHLCV + adj_close to:
-    #   predictor/daily_closes/{date_str}.parquet
-    # These files are the delta source for the slim-cache inference path.
-    # adj_close = full (split + dividend) adjusted close; the ratio adj_close/close
-    # captures the dividend factor and helps detect splits via sudden price jumps.
-    # Include macro symbols (SPY, VIX, sector ETFs) so the delta has macro data
-    # for dates after the slim cache. Without this, compute_features drops rows
-    # after the slim cache's last date due to NaN in macro-dependent features
-    # (return_vs_spy_5d, mom5d_x_vix, etc.), and dropna() truncates featured_df
-    # to the slim cache's last date — making predictions identical every day.
-    _MACRO_YFINANCE = {"SPY": "SPY", "^VIX": "VIX", "^TNX": "TNX", "^IRX": "IRX", "GLD": "GLD", "USO": "USO"}
-    _slim_source = price_data if price_data is not None else {}
-    _sector_etfs = [s for s in _slim_source if s.startswith("XL")]
-    _macro_yf_tickers = list(_MACRO_YFINANCE.keys()) + _sector_etfs
-    _all_daily_tickers = sorted(set(tickers + _macro_yf_tickers))
-    save_daily_closes(_all_daily_tickers, date_str, bucket, dry_run=dry_run)
-
-    # Soft timeout gate
-    if _near_timeout():
-        log.warning("Soft timeout before alternative data fetch — writing partial predictions")
-        write_predictions(predictions, date_str, bucket, {"model_version": "timeout", "timed_out": True}, dry_run=dry_run, fd=fd)
-        return
-
-    # ── Step 3d: Fetch alternative data for O10-O12 features ─────────────────
-    _earnings_all: dict[str, dict] = {}
-    _revision_all: dict[str, dict] = {}
-    _options_all: dict[str, dict] = {}
-    try:
-        from data.earnings_fetcher import fetch_earnings_data, cache_earnings_to_s3
-        _earnings_all = fetch_earnings_data(tickers, reference_date=date_str)
-        cache_earnings_to_s3(_earnings_all, date_str, bucket)
-        log.info("O10: Fetched earnings data for %d tickers", len(_earnings_all))
-    except Exception as exc:
-        log.warning("O10: Earnings data fetch failed (features will use defaults): %s", exc)
-
-    try:
-        from data.earnings_fetcher import fetch_revision_history
-        _revision_all = fetch_revision_history(tickers, bucket=bucket, reference_date=date_str)
-        log.info("O11: Loaded revision data for %d tickers", len(_revision_all))
-    except Exception as exc:
-        log.warning("O11: Revision data fetch failed (features will use defaults): %s", exc)
-
-    try:
-        from data.options_fetcher import load_historical_options, fetch_options_features
-        # Try Research S3 cache first (saves ~50s of yfinance calls)
-        _options_all = load_historical_options(date_str, bucket) or {}
-        if _options_all:
-            log.info("O12: Loaded cached options for %d tickers from S3", len(_options_all))
-        else:
-            _options_all = fetch_options_features(tickers, reference_date=date_str)
-            log.info("O12: Fetched options features for %d tickers via yfinance", len(_options_all))
-    except Exception as exc:
-        log.warning("O12: Options features fetch failed (features will use defaults): %s", exc)
-
-    _fundamental_all: dict[str, dict] = {}
-    try:
-        from feature_store.fundamental_fetcher import (
-            fetch_fundamental_data, cache_fundamentals_to_s3, load_fundamentals_from_s3,
-        )
-        # Try S3 cache first (fundamentals are quarterly — reuse within the quarter)
-        _fundamental_all = load_fundamentals_from_s3(date_str, bucket) or {}
-        if _fundamental_all:
-            log.info("Fundamentals: Loaded cached data for %d tickers from S3", len(_fundamental_all))
-        else:
-            _fundamental_all = fetch_fundamental_data(tickers)
-            cache_fundamentals_to_s3(_fundamental_all, date_str, bucket)
-            log.info("Fundamentals: Fetched data for %d tickers from FMP", len(_fundamental_all))
-    except Exception as exc:
-        log.warning("Fundamentals: Fetch failed (features will use defaults): %s", exc)
-
-    # Aggregate alert: if ALL alternative data sources failed, model runs on
-    # technical features only — predictions degrade silently.
-    _alt_data_sources = {
-        "O10_earnings": _earnings_all,
-        "O11_revisions": _revision_all,
-        "O12_options": _options_all,
-        "fundamentals": _fundamental_all,
-    }
-    _alt_data_populated = {k: len(v) for k, v in _alt_data_sources.items() if v}
-    if not _alt_data_populated:
-        log.error(
-            "ALL alternative data sources failed — model running on technical "
-            "features only. Predictions may be degraded. Sources attempted: %s",
-            list(_alt_data_sources.keys()),
-        )
-    else:
-        log.info("Alternative data summary: %s", _alt_data_populated)
-
-    # Soft timeout gate
-    if _near_timeout():
-        log.warning("Soft timeout before inference — writing partial predictions")
-        write_predictions(predictions, date_str, bucket, {"model_version": "timeout", "timed_out": True}, dry_run=dry_run, fd=fd)
-        return
-
-    # ── Step 4: Run inference ─────────────────────────────────────────────────
-    predictions: list[dict] = []
-    n_skipped = 0
-
-    if model_type == "gbm":
-        # Batch GBM path: compute features for all tickers first, then
-        # cross-sectional rank-normalize, then run inference.
-        # This ensures rank normalization has the full cross-section.
-        from data.feature_engineer import compute_features as _compute_features
-
-        gbm_feature_cols = cfg.GBM_FEATURES
-
-        # Validate feature alignment between config and trained model.
-        # If the model was trained on fewer features (e.g., before fundamentals
-        # were added), use the model's feature list for inference. New features
-        # are still computed and written to the feature store, but the model
-        # only sees the features it was trained on.
-        _model_n_features = None
-        for label, sc in [("MSE", mse_scorer), ("Rank", rank_scorer)]:
-            if sc is None or sc._booster is None:
-                continue
-            expected = sc._booster.num_feature()
-            if len(gbm_feature_cols) != expected:
-                if sc._feature_names and len(sc._feature_names) == expected:
-                    # Model has a recorded feature list — use it
-                    gbm_feature_cols = list(sc._feature_names)
-                    log.warning(
-                        "%s model expects %d features but config has %d — "
-                        "using model's feature list for inference (new features "
-                        "will be available after next training run)",
-                        label, expected, len(cfg.GBM_FEATURES),
-                    )
-                    _model_n_features = expected
-                    break
-                else:
-                    # No feature names in model metadata — fall back to truncating
-                    gbm_feature_cols = cfg.GBM_FEATURES[:expected]
-                    log.warning(
-                        "%s model expects %d features but config has %d — "
-                        "truncating to first %d features for inference",
-                        label, expected, len(cfg.GBM_FEATURES), expected,
-                    )
-                    _model_n_features = expected
-                    break
-            if sc._feature_names and list(sc._feature_names) != list(gbm_feature_cols):
-                log.warning(
-                    "Feature ORDER mismatch — using %s model's feature order "
-                    "for inference. Config: %s..., Model: %s...",
-                    label, gbm_feature_cols[:3], list(sc._feature_names[:3]),
-                )
-                gbm_feature_cols = list(sc._feature_names)
-                _model_n_features = len(gbm_feature_cols)
-                break
-
-        raw_vectors: dict[str, np.ndarray] = {}   # ticker → raw feature vector
-        _store_rows: list[dict] = []  # feature store: collect all features per ticker
-        for ticker in tickers:
-            df = price_data.get(ticker, pd.DataFrame())
-            if df.empty or len(df) < cfg.MIN_ROWS_FOR_FEATURES:
-                n_skipped += 1
-                continue
-            sector_etf_sym = sector_map.get(ticker)
-            sector_etf_series = macro.get(sector_etf_sym) if sector_etf_sym else None
-            try:
-                featured_df = _compute_features(
-                    df,
-                    spy_series=macro.get("SPY") if macro else None,
-                    vix_series=macro.get("VIX") if macro else None,
-                    sector_etf_series=sector_etf_series,
-                    tnx_series=macro.get("TNX") if macro else None,
-                    irx_series=macro.get("IRX") if macro else None,
-                    gld_series=macro.get("GLD") if macro else None,
-                    uso_series=macro.get("USO") if macro else None,
-                    earnings_data=_earnings_all.get(ticker),
-                    revision_data=_revision_all.get(ticker),
-                    options_data=_options_all.get(ticker),
-                    fundamental_data=_fundamental_all.get(ticker),
-                )
-            except Exception as exc:
-                log.warning("Feature computation failed for %s: %s", ticker, exc)
-                n_skipped += 1
-                continue
-            if featured_df.empty:
-                n_skipped += 1
-                continue
-            latest = featured_df.iloc[-1]
-            try:
-                raw_vectors[ticker] = latest[gbm_feature_cols].to_numpy(dtype=np.float32)
-            except KeyError:
-                n_skipped += 1
-                continue
-            # Log raw features for first ticker to diagnose stale prediction issue
-            if len(raw_vectors) == 1:
-                _fv = raw_vectors[ticker]
-                log.info(
-                    "Feature debug %s: last_date=%s rsi=%.4f macd_cross=%.4f mom20d=%.4f hash=%s",
-                    ticker, featured_df.index[-1].date(),
-                    float(_fv[0]), float(_fv[1]), float(_fv[6]),
-                    hash(_fv.tobytes()),
-                )
-            # Collect full feature row for feature store (all 49 features, not just GBM)
-            try:
-                row = {"ticker": ticker}
-                for f in cfg.FEATURES:
-                    row[f] = float(latest[f]) if f in latest.index else 0.0
-                _store_rows.append(row)
-            except Exception:
-                pass  # feature store is best-effort
-
-        # Cross-sectional rank normalization across all tickers
-        if raw_vectors:
-            ordered_tickers = list(raw_vectors.keys())
-            X_batch = np.stack([raw_vectors[t] for t in ordered_tickers])  # (N_tickers, N_features)
-            n_tickers = X_batch.shape[0]
-            if n_tickers > 1:
-                for f in range(X_batch.shape[1]):
-                    vals = X_batch[:, f]
-                    order = vals.argsort()
-                    ranks = np.empty_like(order, dtype=np.float32)
-                    ranks[order] = np.arange(n_tickers, dtype=np.float32)
-                    # Average ranks for ties
-                    unique_vals, inverse = np.unique(vals, return_inverse=True)
-                    if len(unique_vals) < n_tickers:
-                        for uv_idx in range(len(unique_vals)):
-                            mask = inverse == uv_idx
-                            if mask.sum() > 1:
-                                ranks[mask] = ranks[mask].mean()
-                    X_batch[:, f] = ranks / max(n_tickers - 1, 1)
-                log.info("Rank-normalized GBM features across %d tickers", n_tickers)
-            else:
-                X_batch[:, :] = 0.5  # single ticker defaults to median percentile
-
-            # Log ranked features for first ticker
-            log.info(
-                "Ranked features debug %s: hash=%s first5=%s",
-                ordered_tickers[0], hash(X_batch[0].tobytes()),
-                X_batch[0, :5].tolist(),
-            )
-
-            # Run BOTH models on the same rank-normalized features.
-            # MSE → predicted_alpha (calibrated 5d return), direction, veto
-            # Lambdarank → cross-sectional ranking (model_rank)
-            from scipy.stats import rankdata as _rankdata_inf
-
-            alpha_scores = np.full(n_tickers, np.nan)
-            rank_model_ranks = np.full(n_tickers, np.nan)
-
-            # MSE model inference
-            if mse_scorer is not None:
-                try:
-                    alpha_scores = mse_scorer.predict(X_batch)
-                    log.info("MSE inference complete: %d tickers", n_tickers)
-                except Exception as exc:
-                    log.error("MSE inference failed: %s", exc)
-
-            # Lambdarank model inference → cross-sectional rank
-            if rank_scorer is not None:
-                try:
-                    rank_raw = rank_scorer.predict(X_batch)
-                    # Convert to rank: 1 = best (highest score), N = worst
-                    valid_r = ~np.isnan(rank_raw)
-                    if valid_r.sum() > 0:
-                        ranks = _rankdata_inf(-rank_raw[valid_r], method="average")
-                        rank_model_ranks[valid_r] = ranks
-                    log.info("Lambdarank inference complete: %d tickers", n_tickers)
-                except Exception as exc:
-                    log.warning("Lambdarank inference failed: %s", exc)
-
-            # If MSE failed but rank succeeded, derive alpha from MSE rank
-            # as fallback (won't be calibrated but better than nothing)
-            if np.all(np.isnan(alpha_scores)) and not np.all(np.isnan(rank_model_ranks)):
-                log.warning("MSE unavailable — no calibrated alpha scores this run")
-
-            max_r = getattr(cfg, "LABEL_CLIP", 0.15)
-            alpha_scores = np.clip(alpha_scores, -max_r, max_r)
-
-            # MSE rank (for comparison — how MSE orders stocks vs lambdarank)
-            mse_ranks = np.full(n_tickers, np.nan)
-            valid_a = ~np.isnan(alpha_scores)
-            if valid_a.sum() > 0:
-                mse_ranks[valid_a] = _rankdata_inf(-alpha_scores[valid_a], method="average")
-
-            for i, ticker in enumerate(ordered_tickers):
-                alpha = float(alpha_scores[i])
-                if np.isnan(alpha):
-                    n_skipped += 1
-                    continue
-
-                # Direction from MSE alpha thresholds (calibrated scale)
-                p_up   = float(np.clip(0.5 + alpha / (2.0 * max_r), 0.0, 1.0))
-                p_down = float(np.clip(0.5 - alpha / (2.0 * max_r), 0.0, 1.0))
-                p_flat = float(max(0.0, 1.0 - p_up - p_down))
-                if alpha >= 0:
-                    predicted_direction = "UP"
-                    confidence = p_up
-                else:
-                    predicted_direction = "DOWN"
-                    confidence = p_down
-
-                result = {
-                    "ticker":                ticker,
-                    "predicted_direction":   predicted_direction,
-                    "prediction_confidence": round(confidence, 4),
-                    "predicted_alpha":       round(alpha, 6),
-                    "p_up":                  round(p_up, 4),
-                    "p_flat":               round(p_flat, 4),
-                    "p_down":                round(p_down, 4),
-                    "mse_rank":              int(mse_ranks[i]) if not np.isnan(mse_ranks[i]) else None,
-                    "model_rank":            int(rank_model_ranks[i]) if not np.isnan(rank_model_ranks[i]) else None,
-                    "combined_rank":         None,  # computed after all predictions built
-                }
-                if ticker in ticker_data_age:
-                    result["price_data_age_days"] = ticker_data_age[ticker]
-                if ticker_sources:
-                    result["watchlist_source"] = ticker_sources.get(ticker, "unknown")
-                # O10: earnings proximity for executor warning
-                earnings_info = _earnings_all.get(ticker, {})
-                if earnings_info.get("next_earnings_days") is not None:
-                    result["next_earnings_days"] = earnings_info["next_earnings_days"]
-                predictions.append(result)
-    else:
-        # NN path — per-ticker inference (unchanged)
-        for ticker in tickers:
-            df = price_data.get(ticker, pd.DataFrame())
-            sector_etf_sym = sector_map.get(ticker)
-            sector_etf_series = macro.get(sector_etf_sym) if sector_etf_sym else None
-            result = predict_ticker(
-                ticker, df, model, norm_stats,
-                macro=macro,
-                sector_etf_series=sector_etf_series,
-            )
-            if result is not None:
-                if ticker in ticker_data_age:
-                    result["price_data_age_days"] = ticker_data_age[ticker]
-                if ticker_sources:
-                    result["watchlist_source"] = ticker_sources.get(ticker, "unknown")
-                predictions.append(result)
-            else:
-                n_skipped += 1
-
-    log.info(
-        "Inference complete: %d predictions  %d skipped",
-        len(predictions),
-        n_skipped,
-    )
-
-    # Compute combined_rank = average of mse_rank and model_rank (LR rank)
-    for p in predictions:
-        mse_r = p.get("mse_rank")
-        lr_r = p.get("model_rank")
-        if mse_r is not None and lr_r is not None:
-            p["combined_rank"] = round((mse_r + lr_r) / 2, 1)
-
-    # Sort by combined_rank (ascending = best first), fall back to mse_rank
-    predictions.sort(key=lambda p: p.get("combined_rank") or p.get("mse_rank") or 999)
-
-    # ── Feature store: expand to full universe (technical features only) ────────
-    # Watchlist tickers already have all 49 features in _store_rows.
-    # For non-watchlist tickers in the slim cache, compute technical + interaction
-    # features only (no FMP/yfinance alternative data calls).
-    if (cfg.FEATURE_STORE_ENABLED and cfg.FEATURE_STORE_FULL_UNIVERSE
-            and cfg.FEATURE_STORE_WRITE_ON_INFERENCE
-            and model_type == "gbm" and not _near_timeout()):
-        try:
-            from data.feature_engineer import compute_features as _fs_compute
-
-            _watchlist_set = set(tickers)
-            _skip_set = {"SPY", "^VIX", "^TNX", "^IRX", "GLD", "USO"}
-            _skip_set.update(s for s in price_data if s.startswith("XL"))
-
-            _universe_tickers = [
-                t for t in price_data
-                if t not in _watchlist_set and t not in _skip_set
-                and price_data[t] is not None and len(price_data[t]) >= cfg.MIN_ROWS_FOR_FEATURES
-            ]
-            _n_universe = len(_universe_tickers)
-
-            if _n_universe > 0:
-                log.info("Feature store universe expansion: %d non-watchlist tickers", _n_universe)
-                _fs_spy = macro.get("SPY") if macro else None
-                _fs_vix = macro.get("VIX") if macro else None
-                _fs_tnx = macro.get("TNX") if macro else None
-                _fs_irx = macro.get("IRX") if macro else None
-                _fs_gld = macro.get("GLD") if macro else None
-                _fs_uso = macro.get("USO") if macro else None
-
-                _fs_ok = 0
-                _fs_err = 0
-                for _fs_ticker in _universe_tickers:
-                    if _near_timeout():
-                        log.warning("Soft timeout during universe expansion — wrote %d/%d", _fs_ok, _n_universe)
-                        break
-                    try:
-                        _fs_etf_sym = sector_map.get(_fs_ticker)
-                        _fs_etf_series = macro.get(_fs_etf_sym) if _fs_etf_sym else None
-                        _fs_featured = _fs_compute(
-                            price_data[_fs_ticker],
-                            spy_series=_fs_spy, vix_series=_fs_vix,
-                            sector_etf_series=_fs_etf_series,
-                            tnx_series=_fs_tnx, irx_series=_fs_irx,
-                            gld_series=_fs_gld, uso_series=_fs_uso,
-                            # No alternative data — technical features only
-                        )
-                        if not _fs_featured.empty:
-                            _fs_latest = _fs_featured.iloc[-1]
-                            _fs_row = {"ticker": _fs_ticker}
-                            for f in cfg.FEATURES:
-                                _fs_row[f] = float(_fs_latest[f]) if f in _fs_latest.index else 0.0
-                            _store_rows.append(_fs_row)
-                            _fs_ok += 1
-                    except Exception:
-                        _fs_err += 1
-
-                log.info(
-                    "Feature store universe expansion: %d OK, %d errors, %d total store rows",
-                    _fs_ok, _fs_err, len(_store_rows),
-                )
-        except Exception as _fs_univ_exc:
-            log.warning("Feature store universe expansion failed (non-fatal): %s", _fs_univ_exc)
-
-    # ── Feature store write (best-effort, non-blocking) ───────────────────────
-    if cfg.FEATURE_STORE_ENABLED and cfg.FEATURE_STORE_WRITE_ON_INFERENCE and _store_rows:
-        try:
-            import pandas as _fs_pd
-            from feature_store.writer import write_feature_snapshot
-            from feature_store.registry import upload_registry
-
-            _fs_df = _fs_pd.DataFrame(_store_rows)
-            write_feature_snapshot(date_str, _fs_df, bucket, prefix=cfg.FEATURE_STORE_PREFIX)
-            upload_registry(bucket, prefix=cfg.FEATURE_STORE_PREFIX)
-        except Exception as _fs_exc:
-            log.warning("Feature store write failed (non-fatal): %s", _fs_exc)
-
-    # ── Step 5: Build metrics ─────────────────────────────────────────────────
-    # For GBM: read training-time meta from S3 to populate training_samples,
-    # last_trained (date string), ic_30d, ic_ir_30d. Falls back gracefully if
-    # meta is absent (e.g. model was never promoted through train_handler.py).
-    gbm_meta: dict = {}
-    if model_type == "gbm" and not local:
-        try:
-            import boto3 as _boto3
-            _s3 = _boto3.client("s3")
-            _resp = _s3.get_object(Bucket=bucket, Key=cfg.GBM_WEIGHTS_META_KEY)
-            gbm_meta = json.loads(_resp["Body"].read())
-            log.info("GBM weights meta loaded: trained_date=%s  n_train=%s",
-                     gbm_meta.get("trained_date"), gbm_meta.get("n_train"))
-        except Exception as _exc:
-            log.debug("GBM weights meta not found or unreadable: %s", _exc)
-
-    if model_type == "gbm":
-        last_trained = gbm_meta.get("trained_date", scorer._best_iteration)
-    else:
-        last_trained = checkpoint.get("epoch", "unknown")
-
-    metrics = {
-        "model_version": model_version,
-        "model_type": model_type,
-        "inference_mode": inference_mode if model_type == "gbm" else "mlp",
-        "last_trained": last_trained,
-        "training_samples": gbm_meta.get("n_train") if model_type == "gbm" else None,
-        "val_loss": round(float(val_loss), 6) if isinstance(val_loss, (int, float)) else None,
-        # ic_30d/ic_ir_30d seeded from training-time values; overwritten by backtester
-        # once 30 days of live outcome data accumulates.
-        "ic_30d": gbm_meta.get("test_ic") if model_type == "gbm" else None,
-        "ic_ir_30d": gbm_meta.get("ic_ir") if model_type == "gbm" else None,
-        # Rolling hit rate requires 30 days of resolved outcomes (populated by backtester)
-        "hit_rate_30d_rolling": None,
-        "price_freshness": {
-            "max_age_days": max(ticker_data_age.values()) if ticker_data_age else -1,
-            "n_stale": sum(1 for d in ticker_data_age.values() if d > 1),
-        },
-    }
-
-    # ── Step 6: Resolve veto threshold and mark vetoed predictions ──────────
-    market_regime = signals_data.get("market_regime", "") if signals_data else ""
-    veto_thresh = get_veto_threshold(bucket, market_regime=market_regime)
-
-    # Mark vetoed predictions: negative alpha + bottom-half combined rank
-    n_preds = len(predictions)
-    for p in predictions:
-        cr = p.get("combined_rank")
-        alpha = p.get("predicted_alpha", 0) or 0
-        p["gbm_veto"] = (alpha < 0 and cr is not None and cr > n_preds / 2)
-
-    # ── Step 7: Write output ──────────────────────────────────────────────────
-    write_predictions(predictions, date_str, bucket, metrics, dry_run=dry_run,
-                      veto_threshold=veto_thresh, fd=fd)
-
-    # ── Step 8: Send combined morning briefing email ──────────────────────────
-    if not dry_run:
-        email_sent = send_predictor_email(predictions, metrics, date_str, signals_data=signals_data,
-                                          veto_threshold=veto_thresh)
-        if not email_sent:
-            log.warning("Predictor email failed to send (Gmail + SES both failed)")
-
-    # ── Write health status ──────────────────────────────────────────────────
-    try:
-        from health_status import write_health
-        n_up = sum(1 for p in predictions if p.get("predicted_direction") == "UP")
-        n_down = sum(1 for p in predictions if p.get("predicted_direction") == "DOWN")
-        write_health(
-            bucket=bucket,
-            module_name="predictor_inference",
-            status="ok",
-            run_date=date_str,
-            duration_seconds=_time.monotonic() - _start_ts,
-            summary={
-                "n_predictions": len(predictions),
-                "n_up": n_up,
-                "n_down": n_down,
-            },
-        )
-    except Exception as _he:
-        log.warning("Health status write failed: %s", _he)
-
-    # ── Data manifest ──────────────────────────────────────────────────────────
-    try:
-        from health_status import write_data_manifest
-        write_data_manifest(
-            bucket=bucket,
-            module_name="predictor_inference",
-            run_date=date_str,
-            manifest={
-                "n_predictions": len(predictions),
-                "n_up": n_up,
-                "n_down": n_down,
-                "n_tickers_failed": len(getattr(cfg, 'FAILED_TICKERS', [])),
-                "model_version": getattr(cfg, 'GBM_VERSION', 'unknown'),
-            },
-        )
-    except Exception as _me:
-        log.warning("Data manifest write failed: %s", _me)
-
-    log.info("Predictor run complete for %s", date_str)
+    run_pipeline(ctx)
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────

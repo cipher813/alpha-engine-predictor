@@ -175,8 +175,8 @@ class TestComputeFeaturesWithFundamentals:
         """Verify the total feature count after adding fundamentals."""
         from config import FEATURES, N_FEATURES
 
-        assert len(FEATURES) == 49
-        assert N_FEATURES == 49
+        assert len(FEATURES) == 53
+        assert N_FEATURES == 53
 
     def test_features_to_array_shape(self):
         """features_to_array should produce 49 columns."""
@@ -186,7 +186,7 @@ class TestComputeFeaturesWithFundamentals:
         result = compute_features(df)
         arr = features_to_array(result)
 
-        assert arr.shape[1] == 49
+        assert arr.shape[1] == 53
 
     def test_gbm_features_excludes_macro_and_fundamental(self):
         """GBM features should exclude both macro and fundamental (until validated)."""

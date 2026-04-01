@@ -47,6 +47,8 @@ CATALOG: list[FeatureEntry] = [
     FeatureEntry("vol_ratio_10_60", "technical", "10-day vol / 60-day vol", source="yfinance", refresh="daily"),
     FeatureEntry("bollinger_pct", "technical", "Position within Bollinger Bands (0-1)", source="yfinance", refresh="daily"),
     FeatureEntry("sector_vs_spy_5d", "technical", "5-day sector ETF return minus SPY return", source="yfinance", refresh="daily"),
+    FeatureEntry("sector_vs_spy_10d", "technical", "10-day sector ETF return minus SPY return", source="yfinance", refresh="daily"),
+    FeatureEntry("sector_vs_spy_20d", "technical", "20-day sector ETF return minus SPY return", source="yfinance", refresh="daily"),
     FeatureEntry("price_accel", "technical", "Momentum acceleration (5d mom - 20d mom)", source="yfinance", refresh="daily"),
     FeatureEntry("ema_cross_8_21", "technical", "EMA(8) / EMA(21) ratio", source="yfinance", refresh="daily"),
     FeatureEntry("atr_14_pct", "technical", "ATR(14) / Close, normalized volatility", source="yfinance", refresh="daily"),
@@ -62,6 +64,8 @@ CATALOG: list[FeatureEntry] = [
     FeatureEntry("yield_curve_slope", "macro", "10Y - 2Y spread, normalized", source="yfinance", refresh="daily", per_ticker=False),
     FeatureEntry("gold_mom_5d", "macro", "5-day gold (GLD) momentum", source="yfinance", refresh="daily", per_ticker=False),
     FeatureEntry("oil_mom_5d", "macro", "5-day oil (USO) momentum", source="yfinance", refresh="daily", per_ticker=False),
+    FeatureEntry("vix_term_slope", "technical", "VIX spot vs VIX3M term structure slope, normalized", source="yfinance", refresh="daily"),
+    FeatureEntry("xsect_dispersion", "technical", "Cross-sectional std dev of daily returns across universe", source="computed", refresh="daily", per_ticker=False),
 
     # ── Regime interactions (5) — macro × ticker-specific signals ─────────────
     FeatureEntry("mom5d_x_vix", "interaction", "momentum_5d * VIX regime indicator", source="computed", refresh="daily"),

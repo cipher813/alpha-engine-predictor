@@ -155,6 +155,60 @@ def compute_labels(
     return df
 
 
+def compute_multi_horizon_labels(
+    df: pd.DataFrame,
+    horizons: list[int] = (1, 5, 10, 20),
+    benchmark_returns: pd.Series | None = None,
+) -> pd.DataFrame:
+    """
+    Compute forward returns for multiple horizons.
+
+    Adds columns `forward_return_{h}d` for each horizon h. The primary label
+    (forward_return_5d) is always included. Other horizons are auxiliary.
+
+    Does NOT add direction/direction_int columns — those are computed
+    by compute_labels() for the primary horizon only.
+
+    Parameters
+    ----------
+    df : DataFrame with 'Close' column.
+    horizons : list of forward-day horizons.
+    benchmark_returns : Benchmark Close series for relative returns.
+
+    Returns
+    -------
+    DataFrame with forward_return_{h}d columns added. Rows where the
+    longest horizon return is NaN are dropped.
+    """
+    if df.empty:
+        df = df.copy()
+        for h in horizons:
+            df[f"forward_return_{h}d"] = pd.Series(dtype=float)
+        return df
+
+    df = df.copy()
+    close = df["Close"].astype(float)
+
+    if benchmark_returns is not None:
+        bench_aligned = benchmark_returns.reindex(df.index)
+
+    for h in horizons:
+        future_close = close.shift(-h)
+        stock_fwd = (future_close / close) - 1.0
+        if benchmark_returns is not None:
+            bench_future = bench_aligned.shift(-h)
+            bench_fwd = (bench_future / bench_aligned) - 1.0
+            df[f"forward_return_{h}d"] = stock_fwd - bench_fwd
+        else:
+            df[f"forward_return_{h}d"] = stock_fwd
+
+    # Drop rows where the longest horizon is NaN
+    max_h = max(horizons)
+    df = df.dropna(subset=[f"forward_return_{max_h}d"])
+
+    return df
+
+
 def label_distribution(df: pd.DataFrame) -> dict[str, float]:
     """
     Return the class distribution as proportions.

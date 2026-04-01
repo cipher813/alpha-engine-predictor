@@ -1,7 +1,8 @@
 # Dockerfile — Lambda container image for alpha-engine-predictor.
 #
-# GBM-only inference. PyTorch removed since switching to LightGBM.
-# Container image is ~300MB (vs ~1.5GB with PyTorch).
+# LightGBM + CatBoost inference with Platt calibration.
+# Training runs on EC2 spot (spot_train.sh); Lambda is inference-only.
+# Container image is ~500MB (LightGBM + CatBoost + scikit-learn).
 #
 # Build:
 #   docker build --platform linux/amd64 -t alpha-engine-predictor .

@@ -88,7 +88,7 @@ def download_price_cache(bucket: str, prefix: str, local_dir: Path) -> int:
 # ── Incremental price cache refresh ────────────────────────────────────────────
 
 # yfinance requires a leading caret for these index / rate tickers.
-_CARET_SYMBOLS = {"VIX", "TNX", "IRX"}
+_CARET_SYMBOLS = {"VIX", "TNX", "IRX", "VIX3M"}
 
 # Batch size for yfinance multi-ticker downloads (from config).
 from config import REFRESH_BATCH_SIZE as _REFRESH_BATCH_SIZE
@@ -452,6 +452,13 @@ def run_walk_forward(
     wf_early_stop = getattr(cfg, "WF_EARLY_STOPPING", None) or cfg.GBM_EARLY_STOPPING_ROUNDS
     log.info("Walk-forward training params: n_estimators=%d, early_stopping=%d", wf_n_est, wf_early_stop)
     fold_results: list[dict] = []
+    oos_preds_all: list[np.ndarray] = []    # pooled OOS predictions for calibrator
+    oos_actuals_all: list[np.ndarray] = []  # pooled OOS forward returns for calibrator
+
+    # CatBoost walk-forward (if enabled)
+    catboost_enabled = getattr(cfg, "CATBOOST_ENABLED", False)
+    cat_fold_ics: list[float] = []
+    cat_oos_preds: list[np.ndarray] = []
 
     for i, fold in enumerate(folds):
         fold_start = time.time()
@@ -479,11 +486,38 @@ def run_walk_forward(
 
         test_preds = scorer.predict(X_test_fold)
 
+        # Collect OOS predictions + actuals for calibrator fitting
+        oos_preds_all.append(test_preds)
+        oos_actuals_all.append(y_test_fold)
+
         # IC for this fold
         if len(test_preds) > 1 and np.std(test_preds) > 1e-10 and np.std(y_test_fold) > 1e-10:
             fold_ic = float(np.corrcoef(test_preds, y_test_fold)[0, 1])
         else:
             fold_ic = 0.0
+
+        # CatBoost per fold (if enabled)
+        cat_fold_ic = None
+        if catboost_enabled:
+            try:
+                from model.catboost_scorer import CatBoostScorer as _CatFold
+                cat_scorer_fold = _CatFold(
+                    params=getattr(cfg, "CATBOOST_PARAMS", None),
+                    n_estimators=wf_n_est,
+                    early_stopping_rounds=wf_early_stop,
+                )
+                cat_scorer_fold.fit(X_sub_train, y_sub_train, X_sub_val, y_sub_val,
+                                    feature_names=cfg.GBM_FEATURES)
+                cat_preds_fold = cat_scorer_fold.predict(X_test_fold)
+                cat_oos_preds.append(cat_preds_fold)
+                if len(cat_preds_fold) > 1 and np.std(cat_preds_fold) > 1e-10:
+                    cat_fold_ic = float(np.corrcoef(cat_preds_fold, y_test_fold)[0, 1])
+                else:
+                    cat_fold_ic = 0.0
+                cat_fold_ics.append(cat_fold_ic)
+            except Exception as _cat_err:
+                log.warning("CatBoost fold %d failed: %s", i + 1, _cat_err)
+                cat_fold_ics.append(0.0)
 
         fold_elapsed = time.time() - fold_start
         fold_result = {
@@ -494,6 +528,7 @@ def run_walk_forward(
             "n_train": len(y_train_fold),
             "n_test": len(y_test_fold),
             "ic": round(fold_ic, 6),
+            "cat_ic": round(cat_fold_ic, 6) if cat_fold_ic is not None else None,
             "best_iteration": scorer._best_iteration,
             "elapsed_s": round(fold_elapsed, 1),
         }
@@ -520,6 +555,41 @@ def run_walk_forward(
         passes_wf,
     )
 
+    # Pool OOS predictions + actuals for calibrator fitting
+    pooled_oos_preds = np.concatenate(oos_preds_all) if oos_preds_all else np.array([])
+    pooled_oos_actuals = np.concatenate(oos_actuals_all) if oos_actuals_all else np.array([])
+
+    # CatBoost walk-forward summary
+    cat_wf_summary = None
+    best_blend_weight = None
+    if catboost_enabled and cat_fold_ics:
+        cat_median_ic = float(np.median(cat_fold_ics))
+        log.info("CatBoost WF median IC: %.4f  (LGB: %.4f)", cat_median_ic, median_ic)
+        cat_wf_summary = {"cat_median_ic": round(cat_median_ic, 6)}
+
+        # Blend optimization: find best w_lgb in [0.3, 0.4, 0.5, 0.6, 0.7]
+        if len(cat_oos_preds) == len(oos_preds_all) and len(oos_preds_all) > 0:
+            blend_candidates = [0.3, 0.4, 0.5, 0.6, 0.7]
+            best_blend_ic = -1.0
+            for w_lgb in blend_candidates:
+                blend_ics = []
+                for lgb_p, cat_p, actual in zip(oos_preds_all, cat_oos_preds, oos_actuals_all):
+                    from scipy.stats import rankdata as _rd
+                    lgb_r = _rd(lgb_p, method="average") / len(lgb_p)
+                    cat_r = _rd(cat_p, method="average") / len(cat_p)
+                    blend = w_lgb * lgb_r + (1 - w_lgb) * cat_r
+                    if np.std(blend) > 1e-10 and np.std(actual) > 1e-10:
+                        blend_ics.append(float(np.corrcoef(blend, actual)[0, 1]))
+                if blend_ics:
+                    avg_blend_ic = float(np.median(blend_ics))
+                    if avg_blend_ic > best_blend_ic:
+                        best_blend_ic = avg_blend_ic
+                        best_blend_weight = w_lgb
+            if best_blend_weight is not None:
+                log.info("Best blend: w_lgb=%.1f  blend_IC=%.4f", best_blend_weight, best_blend_ic)
+                cat_wf_summary["best_blend_weight"] = best_blend_weight
+                cat_wf_summary["best_blend_ic"] = round(best_blend_ic, 6)
+
     return {
         "folds": fold_results,
         "median_ic": round(median_ic, 6),
@@ -528,6 +598,10 @@ def run_walk_forward(
         "passes_pct_positive": passes_pct,
         "passes_wf": passes_wf,
         "fallback": False,
+        "oos_preds": pooled_oos_preds,
+        "oos_actuals": pooled_oos_actuals,
+        "catboost": cat_wf_summary,
+        "best_blend_weight": best_blend_weight,
     }
 
 
@@ -672,6 +746,23 @@ def run_gbm_training(
             log.warning("Lambdarank training failed — falling back to MSE-only: %s", e)
             rank_scorer = None
 
+    # ── CatBoost training (if enabled) ─────────────────────────────────────
+    cat_scorer = None
+    if cfg.CATBOOST_ENABLED:
+        try:
+            from model.catboost_scorer import CatBoostScorer
+            cat_scorer = CatBoostScorer(
+                params=cfg.CATBOOST_PARAMS,
+                n_estimators=cfg.GBM_N_ESTIMATORS,
+                early_stopping_rounds=cfg.GBM_EARLY_STOPPING_ROUNDS,
+            )
+            cat_scorer.fit(X_train, y_train, X_val, y_val,
+                           feature_names=cfg.GBM_FEATURES)
+            log.info("CatBoost model trained: val_IC=%.4f", cat_scorer._val_ic)
+        except Exception as e:
+            log.warning("CatBoost training failed: %s", e)
+            cat_scorer = None
+
     # ── Evaluate ─────────────────────────────────────────────────────────────
     try:
         from scipy.stats import rankdata
@@ -716,12 +807,37 @@ def run_gbm_training(
             mse_ic, rank_ic, ensemble_ic, pred_corr,
         )
 
+    # CatBoost IC + LGB-Cat blend
+    cat_ic = 0.0
+    lgb_cat_blend_ic = 0.0
+    blend_weights = None
+    if cat_scorer is not None:
+        test_preds_cat = cat_scorer.predict(X_test)
+        cat_ic = float(np.corrcoef(test_preds_cat, y_test)[0, 1])
+
+        # Blend optimization using WF-optimized weight or grid search on test set
+        w_lgb = 0.5
+        if wf_result and wf_result.get("best_blend_weight") is not None:
+            w_lgb = wf_result["best_blend_weight"]
+        mse_ranked_b = rankdata(test_preds_mse).astype(np.float32)
+        cat_ranked_b = rankdata(test_preds_cat).astype(np.float32)
+        blend_preds = w_lgb * mse_ranked_b + (1 - w_lgb) * cat_ranked_b
+        lgb_cat_blend_ic = float(np.corrcoef(blend_preds, y_test)[0, 1])
+        blend_weights = {"lgb": round(w_lgb, 2), "cat": round(1 - w_lgb, 2)}
+        log.info(
+            "CatBoost IC: %.4f  LGB-Cat blend IC: %.4f (w_lgb=%.1f)",
+            cat_ic, lgb_cat_blend_ic, w_lgb,
+        )
+
     # Pick the best IC among all candidates for the gate
     if rank_scorer is not None:
         candidates = {"mse": mse_ic, "ensemble": ensemble_ic}
         candidates["rank"] = rank_ic
     else:
         candidates = {"mse": mse_ic}
+    if cat_scorer is not None:
+        candidates["catboost"] = cat_ic
+        candidates["lgb_cat_blend"] = lgb_cat_blend_ic
     best_mode = max(candidates, key=candidates.get)
     best_ic = candidates[best_mode]
     test_ic = best_ic
@@ -791,6 +907,33 @@ def run_gbm_training(
                 "Noise feature candidates (%d): %s (SHAP < %.4f AND |IC| < %.4f)",
                 len(noise_candidates), noise_candidates, shap_noise_thresh, ic_noise_thresh,
             )
+            # Auto-prune: retrain production model without noise features
+            if cfg.AUTO_PRUNE_NOISE_FEATURES and len(noise_candidates) < len(cfg.GBM_FEATURES) // 2:
+                pruned_features = [f for f in cfg.GBM_FEATURES if f not in noise_candidates]
+                pruned_indices = [cfg.GBM_FEATURES.index(f) for f in pruned_features]
+                log.info("Auto-pruning: retraining with %d features (dropped %d noise)",
+                         len(pruned_features), len(noise_candidates))
+                _pruned_scorer = GBMScorer(
+                    params=tuned_params,
+                    n_estimators=cfg.GBM_N_ESTIMATORS,
+                    early_stopping_rounds=cfg.GBM_EARLY_STOPPING_ROUNDS,
+                )
+                _pruned_scorer.fit(
+                    X_train[:, pruned_indices], y_train,
+                    X_val[:, pruned_indices], y_val,
+                    feature_names=pruned_features,
+                )
+                _pruned_ic = float(np.corrcoef(
+                    _pruned_scorer.predict(X_test[:, pruned_indices]), y_test
+                )[0, 1])
+                log.info("Pruned model IC: %.4f (vs full: %.4f)", _pruned_ic, mse_ic)
+                if _pruned_ic >= mse_ic * 0.95:  # accept if within 5% of full model
+                    scorer = _pruned_scorer
+                    mse_ic = _pruned_ic
+                    test_ic = _pruned_ic
+                    log.info("Pruned model accepted — using %d features", len(pruned_features))
+                else:
+                    log.info("Pruned model rejected (IC dropped >5%%) — keeping full model")
         else:
             log.info("No noise feature candidates detected")
 
@@ -862,6 +1005,15 @@ def run_gbm_training(
                 s3.upload_file(str(rank_booster_path), bucket, dated_rank_key)
                 log.info("Uploaded dated backup (lambdarank): s3://%s/%s", bucket, dated_rank_key)
 
+            # Save CatBoost model (if trained)
+            cat_booster_path = None
+            if cat_scorer is not None:
+                cat_booster_path = Path(tmp) / "catboost_model.cbm"
+                cat_scorer.save(cat_booster_path)
+                dated_cat_key = f"predictor/weights/catboost_{date_str}.cbm"
+                s3.upload_file(str(cat_booster_path), bucket, dated_cat_key)
+                log.info("Uploaded dated backup (CatBoost): s3://%s/%s", bucket, dated_cat_key)
+
             if passes_ic:
                 # Always upload BOTH models — inference runs both side by side.
                 # MSE → predicted_alpha (calibrated returns)
@@ -871,18 +1023,25 @@ def run_gbm_training(
                 if rank_booster_path is not None:
                     s3.upload_file(str(rank_booster_path), bucket, cfg.GBM_RANK_WEIGHTS_KEY)
                     log.info("Uploaded lambdarank model: s3://%s/%s", bucket, cfg.GBM_RANK_WEIGHTS_KEY)
+                if cat_booster_path is not None:
+                    s3.upload_file(str(cat_booster_path), bucket, cfg.CATBOOST_WEIGHTS_KEY)
+                    s3.upload_file(str(cat_booster_path) + ".meta.json", bucket, cfg.CATBOOST_WEIGHTS_META_KEY)
+                    log.info("Uploaded CatBoost model: s3://%s/%s", bucket, cfg.CATBOOST_WEIGHTS_KEY)
 
                 # Promote best_mode to gbm_latest (for model_version tracking)
                 if best_mode == "mse":
                     s3.upload_file(str(booster_path), bucket, cfg.GBM_WEIGHTS_KEY)
                 elif best_mode == "rank" and rank_booster_path is not None:
                     s3.upload_file(str(rank_booster_path), bucket, cfg.GBM_WEIGHTS_KEY)
-                elif best_mode == "ensemble":
+                elif best_mode in ("ensemble", "lgb_cat_blend", "catboost"):
                     s3.upload_file(str(booster_path), bucket, cfg.GBM_WEIGHTS_KEY)
                 log.info("Promoted %s to active weights: s3://%s/%s", best_mode, bucket, cfg.GBM_WEIGHTS_KEY)
 
                 # Write gbm_mode.json to S3
-                mode_payload = json.dumps({"mode": best_mode}, indent=2).encode()
+                mode_data = {"mode": best_mode}
+                if blend_weights is not None:
+                    mode_data["blend_weights"] = blend_weights
+                mode_payload = json.dumps(mode_data, indent=2).encode()
                 s3.put_object(
                     Bucket=bucket,
                     Key=cfg.GBM_MODE_KEY,
@@ -1005,6 +1164,44 @@ def run_gbm_training(
             except Exception as _fi_err:
                 log.warning("Feature importance write failed (non-blocking): %s", _fi_err)
 
+    # ── Fit and upload calibrator (Platt scaling) ──────────────────────────────
+    calibration_metrics = None
+    if (cfg.CALIBRATION_ENABLED and wf_result and not wf_result.get("fallback")
+            and len(wf_result.get("oos_preds", [])) >= 100 and not dry_run):
+        try:
+            from model.calibrator import PlattCalibrator
+
+            oos_preds_raw = np.clip(wf_result["oos_preds"], -cfg.LABEL_CLIP, cfg.LABEL_CLIP)
+            oos_up_labels = (wf_result["oos_actuals"] > 0).astype(np.int32)
+
+            calibrator = PlattCalibrator(method=cfg.CALIBRATION_METHOD)
+            calibrator.fit(oos_preds_raw, oos_up_labels, label_clip=cfg.LABEL_CLIP)
+
+            if calibrator.is_fitted and promoted:
+                with tempfile.TemporaryDirectory() as cal_tmp:
+                    cal_path = Path(cal_tmp) / "calibrator.pkl"
+                    calibrator.save(cal_path)
+
+                    import boto3 as _boto3_cal
+                    _s3_cal = _boto3_cal.client("s3")
+                    _s3_cal.upload_file(str(cal_path), bucket, cfg.CALIBRATOR_WEIGHTS_KEY)
+                    _s3_cal.upload_file(
+                        str(cal_path) + ".meta.json", bucket, cfg.CALIBRATOR_WEIGHTS_META_KEY,
+                    )
+                    # Dated backup
+                    _s3_cal.upload_file(
+                        str(cal_path), bucket,
+                        f"predictor/weights/calibrator_{date_str}.pkl",
+                    )
+                log.info(
+                    "Calibrator uploaded: ECE %.4f → %.4f (%s)",
+                    calibrator._ece_before, calibrator._ece_after, cfg.CALIBRATION_METHOD,
+                )
+
+            calibration_metrics = calibrator.metrics()
+        except Exception as _cal_err:
+            log.warning("Calibrator fitting/upload failed (non-blocking): %s", _cal_err)
+
     result = {
         "model_version":         model_version,
         "best_iteration":        scorer._best_iteration,
@@ -1014,6 +1211,10 @@ def run_gbm_training(
         "rank_ic":               round(float(rank_ic), 6) if rank_scorer is not None else None,
         "ensemble_ic":           round(float(ensemble_ic), 6) if rank_scorer is not None else None,
         "ensemble_enabled":      rank_scorer is not None,
+        "catboost_enabled":      cat_scorer is not None,
+        "catboost_ic":           round(float(cat_ic), 6) if cat_scorer is not None else None,
+        "lgb_cat_blend_ic":      round(float(lgb_cat_blend_ic), 6) if cat_scorer is not None else None,
+        "blend_weights":         blend_weights,
         "promoted_mode":         best_mode if promoted else None,
         "test_ic_p":             0.0,  # p-value omitted (numpy-only path)
         "ic_ir":                 round(ic_ir, 4),
@@ -1034,11 +1235,15 @@ def run_gbm_training(
         ] if shap_importance else [],
         "feature_ics": feature_ics,
         "noise_candidates": noise_candidates,
+        "calibration": calibration_metrics,
     }
 
     # Attach walk-forward detail for email reporting
     if wf_result and not wf_result.get("fallback"):
-        result["walk_forward"] = wf_result
+        # Don't include large numpy arrays in serialized result
+        wf_for_result = {k: v for k, v in wf_result.items()
+                         if k not in ("oos_preds", "oos_actuals")}
+        result["walk_forward"] = wf_for_result
 
     # ── SHAP history: store dated SHAP and compute drift ──────────────────
     if shap_importance and not dry_run:
@@ -1485,12 +1690,26 @@ def main(
     log.info("Price cache refresh: %d tickers updated", n_refreshed)
 
     # Step 2: Train + upload
-    result = run_gbm_training(
-        data_dir=str(tmp_cache),
-        bucket=bucket,
-        date_str=date_str,
-        dry_run=dry_run,
-    )
+    import config as _train_cfg
+    if _train_cfg.MULTI_HORIZON_ENABLED:
+        mh_result = run_multi_horizon_training(
+            data_dir=str(tmp_cache),
+            bucket=bucket,
+            date_str=date_str,
+            dry_run=dry_run,
+        )
+        result = mh_result["primary"]
+        result["multi_horizon"] = {
+            "horizons": mh_result["horizons"],
+            "auxiliary": mh_result["auxiliary"],
+        }
+    else:
+        result = run_gbm_training(
+            data_dir=str(tmp_cache),
+            bucket=bucket,
+            date_str=date_str,
+            dry_run=dry_run,
+        )
 
     # Step 2b: Write slim cache for inference (2-year slice of each ticker)
     # The slim cache lets the daily inference Lambda skip the 2y yfinance fetch
@@ -1563,3 +1782,122 @@ def main(
             log.warning("Data manifest write failed: %s", _me)
 
     return result
+
+
+# ── Multi-horizon training ────────────────────────────────────────────────────
+
+def run_multi_horizon_training(
+    data_dir: str,
+    bucket: str,
+    date_str: str,
+    dry_run: bool = False,
+) -> dict:
+    """
+    Train separate GBM models for each configured horizon (1d, 5d, 10d, 20d).
+
+    The 5d model uses the standard run_gbm_training() pipeline (with full
+    walk-forward, calibrator, CatBoost, etc.). Other horizons train simpler
+    MSE-only models with basic IC validation.
+
+    Returns dict with per-horizon results and a horizon_agreement summary.
+    """
+    import config as cfg
+
+    horizons = cfg.MULTI_HORIZON_LIST
+    log.info("Multi-horizon training: horizons=%s", horizons)
+
+    # Train the primary model using the full pipeline
+    primary_result = run_gbm_training(data_dir, bucket, date_str, dry_run=dry_run)
+
+    # Train auxiliary horizon models
+    aux_results = {}
+    for h in horizons:
+        if h == cfg.FORWARD_DAYS:
+            continue  # already trained as primary
+
+        log.info("Training auxiliary %dd model...", h)
+        try:
+            aux_result = _train_auxiliary_horizon(
+                data_dir, bucket, date_str, h, dry_run=dry_run,
+            )
+            aux_results[h] = aux_result
+            log.info(
+                "Auxiliary %dd model: IC=%.4f  promoted=%s",
+                h, aux_result.get("test_ic", 0.0), aux_result.get("promoted", False),
+            )
+        except Exception as exc:
+            log.warning("Auxiliary %dd training failed: %s", h, exc)
+            aux_results[h] = {"error": str(exc)}
+
+    return {
+        "primary": primary_result,
+        "auxiliary": aux_results,
+        "horizons": horizons,
+    }
+
+
+def _train_auxiliary_horizon(
+    data_dir: str,
+    bucket: str,
+    date_str: str,
+    horizon_days: int,
+    dry_run: bool = False,
+) -> dict:
+    """Train a single auxiliary horizon model (MSE only, no WF)."""
+    import config as cfg
+    from data.dataset import build_regression_arrays
+    from model.gbm_scorer import GBMScorer
+
+    # Temporarily override FORWARD_DAYS to build arrays for this horizon
+    _orig_fwd = cfg.FORWARD_DAYS
+    try:
+        cfg.FORWARD_DAYS = horizon_days
+        X_all, fwd_all, all_dates = build_regression_arrays(
+            data_dir=data_dir,
+            config_module=cfg,
+            feature_list=cfg.GBM_FEATURES,
+        )
+    finally:
+        cfg.FORWARD_DAYS = _orig_fwd
+
+    N = len(fwd_all)
+    n_train = int(N * cfg.TRAIN_FRAC)
+    n_val = int(N * cfg.VAL_FRAC)
+    val_end = min(n_train + n_val, N)
+
+    X_train, y_train = X_all[:n_train], fwd_all[:n_train]
+    X_val, y_val = X_all[n_train:val_end], fwd_all[n_train:val_end]
+    X_test, y_test = X_all[val_end:], fwd_all[val_end:]
+
+    scorer = GBMScorer(
+        params=cfg.GBM_TUNED_PARAMS,
+        n_estimators=cfg.GBM_N_ESTIMATORS,
+        early_stopping_rounds=cfg.GBM_EARLY_STOPPING_ROUNDS,
+    )
+    scorer.fit(X_train, y_train, X_val, y_val, feature_names=cfg.GBM_FEATURES)
+
+    test_preds = scorer.predict(X_test)
+    test_ic = float(np.corrcoef(test_preds, y_test)[0, 1]) if len(test_preds) > 1 else 0.0
+
+    promoted = test_ic >= cfg.MIN_IC
+    if promoted and not dry_run:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / f"gbm_mse_{horizon_days}d.txt"
+            scorer.save(path)
+            import boto3
+            s3 = boto3.client("s3")
+            s3.upload_file(str(path), bucket, f"predictor/weights/gbm_mse_{horizon_days}d_latest.txt")
+            s3.upload_file(
+                str(path) + ".meta.json", bucket,
+                f"predictor/weights/gbm_mse_{horizon_days}d_latest.txt.meta.json",
+            )
+            s3.upload_file(str(path), bucket, f"predictor/weights/gbm_mse_{horizon_days}d_{date_str}.txt")
+            log.info("Auxiliary %dd model uploaded (IC=%.4f)", horizon_days, test_ic)
+
+    return {
+        "horizon": horizon_days,
+        "test_ic": round(test_ic, 6),
+        "promoted": promoted,
+        "n_train": len(y_train),
+        "best_iteration": scorer._best_iteration,
+    }

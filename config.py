@@ -46,6 +46,10 @@ GBM_RANK_WEIGHTS_KEY      = "predictor/weights/gbm_rank_latest.txt"
 GBM_RANK_WEIGHTS_META_KEY = "predictor/weights/gbm_rank_latest.txt.meta.json"
 GBM_MODE_KEY              = "predictor/weights/gbm_mode.json"
 
+# Calibrator weights (Platt scaling / isotonic regression)
+CALIBRATOR_WEIGHTS_KEY      = "predictor/weights/calibrator_latest.pkl"
+CALIBRATOR_WEIGHTS_META_KEY = "predictor/weights/calibrator_latest.pkl.meta.json"
+
 PREDICTIONS_KEY = "predictor/predictions/{date}.json"
 PREDICTIONS_LATEST_KEY = "predictor/predictions/latest.json"
 
@@ -75,11 +79,16 @@ FEATURES = [
     "vol_ratio_10_60",
     "bollinger_pct",
     "sector_vs_spy_5d",
+    "sector_vs_spy_10d",
+    "sector_vs_spy_20d",
     # v1.3 additions — macro regime features
     "yield_10y",
     "yield_curve_slope",
     "gold_mom_5d",
     "oil_mom_5d",
+    # v1.6 additions — investigation upgrades (A2)
+    "vix_term_slope",
+    "xsect_dispersion",
     # v1.4 additions — design doc Appendix A feature completions
     "price_accel",
     "ema_cross_8_21",
@@ -113,7 +122,7 @@ FEATURES = [
     "roe",                       # Return on equity (decimal)
     "current_ratio",             # Current ratio / 3, normalized
 ]
-N_FEATURES = 49
+N_FEATURES = 53
 N_CLASSES = 3  # UP, FLAT, DOWN
 
 # Macro features — identical across all tickers on a given day, cannot predict
@@ -130,7 +139,7 @@ _FUNDAMENTAL_EXCLUDE = {
 }
 
 GBM_FEATURES = [f for f in FEATURES if f not in MACRO_FEATURES and f not in _FUNDAMENTAL_EXCLUDE]
-N_GBM_FEATURES = len(GBM_FEATURES)  # 36 (29 technical + 7 alternative)
+N_GBM_FEATURES = len(GBM_FEATURES)  # 40 (33 technical + 7 alternative)
 
 # Class labels — index matches model output neuron order
 CLASS_LABELS = ["DOWN", "FLAT", "UP"]  # index 0, 1, 2
@@ -173,6 +182,13 @@ GBM_IC_IR_GATE = _gbm_cfg["ic_ir_gate"]
 GBM_TUNED_PARAMS = _gbm_cfg["tuned_params"]
 GBM_ENSEMBLE_LAMBDARANK = _gbm_cfg.get("ensemble_lambdarank", True)
 
+# ── CatBoost ensemble ──────────────────────────────────────────────────────
+_cat_cfg = _cfg.get("catboost", {})
+CATBOOST_ENABLED = _cat_cfg.get("enabled", False)
+CATBOOST_PARAMS = _cat_cfg.get("params", None)
+CATBOOST_WEIGHTS_KEY = "predictor/weights/catboost_latest.cbm"
+CATBOOST_WEIGHTS_META_KEY = "predictor/weights/catboost_latest.cbm.meta.json"
+
 # ── Production gates ─────────────────────────────────────────────────────────
 _gates_cfg = _cfg["gates"]
 MIN_HIT_RATE = _gates_cfg["min_hit_rate"]
@@ -214,6 +230,17 @@ WF_EARLY_STOPPING = _wf_cfg.get("wf_early_stopping", None)  # None → use GBM_E
 _fs_cfg = _cfg.get("feature_selection", {})
 SHAP_NOISE_THRESHOLD_PCT = _fs_cfg.get("shap_noise_threshold_pct", 1.0)
 IC_NOISE_THRESHOLD = _fs_cfg.get("ic_noise_threshold", 0.005)
+AUTO_PRUNE_NOISE_FEATURES = _fs_cfg.get("auto_prune", False)
+
+# ── Calibration ────────────────────────────────────────────────────────────
+_cal_cfg = _cfg.get("calibration", {})
+CALIBRATION_METHOD = _cal_cfg.get("method", "platt")  # "platt" or "isotonic"
+CALIBRATION_ENABLED = _cal_cfg.get("enabled", True)
+
+# ── Multi-horizon prediction ───────────────────────────────────────────────
+_mh_cfg = _cfg.get("multi_horizon", {})
+MULTI_HORIZON_ENABLED = _mh_cfg.get("enabled", False)
+MULTI_HORIZON_LIST = _mh_cfg.get("horizons", [1, 5, 10, 20])
 
 # ── Feature engineering parameters ───────────────────────────────────────────
 FEATURE_CFG: dict = _cfg["features"]

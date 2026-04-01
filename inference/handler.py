@@ -1,21 +1,22 @@
 """
-inference/handler.py — AWS Lambda handler.
+inference/handler.py — AWS Lambda handler (inference only).
 
-Supports two actions via the event payload:
+Lambda runs daily GBM + CatBoost inference. Training has moved to EC2 spot
+instance (infrastructure/spot_train.sh) due to CatBoost + multi-horizon
+training exceeding Lambda's 15-minute timeout.
 
   action == "predict" (default, or omitted):
-    Triggered by EventBridge Mon–Fri at 6:15am PT. Runs daily GBM inference
-    on the research watchlist and writes predictions to S3. Sends predictor email.
+    Triggered by EventBridge Mon–Fri at 6:15am PT. Loads LightGBM + CatBoost
+    models from S3, runs blended inference on the research watchlist, writes
+    predictions to S3. Sends predictor email.
 
   action == "train":
-    Triggered by EventBridge Monday 07:00 UTC (Sun ~11pm PT). Downloads the price cache
-    from S3, retrains GBMScorer, uploads new weights if IC gate passes,
-    and sends a training summary email.
+    DEPRECATED — returns error directing to spot_train.sh.
 
 Lambda configuration:
   - Runtime: container image (public.ecr.aws/lambda/python:3.12)
-  - Memory: 3072 MB  (training needs ~2 GB; inference fine with less but shared config)
-  - Timeout: 900 seconds  (training takes ~8–12 min; inference takes ~2–3 min)
+  - Memory: 3072 MB  (inference with LightGBM + CatBoost + multi-horizon)
+  - Timeout: 900 seconds  (inference takes ~3–4 min)
   - Environment variables:
       S3_BUCKET          — override default bucket (optional)
       EMAIL_SENDER       — from-address for notification emails
@@ -68,30 +69,21 @@ def handler(event: dict, context) -> dict:
 
     bucket = os.environ.get("S3_BUCKET", "alpha-engine-research")
 
-    # ── Train ──────────────────────────────────────────────────────────────────
+    # ── Train (DEPRECATED — moved to EC2 spot instance) ─────────────────────
     if action == "train":
-        try:
-            from training.train_handler import main as train_main
-            result = train_main(bucket=bucket, date_str=date_str, dry_run=dry_run)
-            log.info(
-                "Training complete: test_IC=%.4f  promoted=%s",
-                result.get("test_ic", float("nan")),
-                result.get("promoted", False),
-            )
-            return {
-                "statusCode": 200,
-                "body": (
-                    f"GBM training complete for {date_str or 'today'}: "
-                    f"test_IC={result.get('test_ic', 'n/a')}  "
-                    f"promoted={result.get('promoted', False)}"
-                ),
-            }
-        except Exception as exc:
-            log.exception("Training Lambda failed: %s", exc)
-            return {
-                "statusCode": 500,
-                "body": f"Training Lambda failed: {exc}",
-            }
+        log.warning(
+            "action=train is deprecated on Lambda. Training now runs on EC2 spot "
+            "via infrastructure/spot_train.sh (CatBoost + multi-horizon exceeds "
+            "Lambda's 15-minute timeout)."
+        )
+        return {
+            "statusCode": 400,
+            "body": (
+                "Training has moved to EC2 spot instance. "
+                "Use infrastructure/spot_train.sh or the Saturday cron. "
+                "Lambda is inference-only."
+            ),
+        }
 
     # ── Predict (default) ──────────────────────────────────────────────────────
     try:

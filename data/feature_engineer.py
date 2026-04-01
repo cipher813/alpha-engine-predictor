@@ -158,6 +158,8 @@ def compute_features(
     revision_data: dict | None = None,
     options_data: dict | None = None,
     fundamental_data: dict | None = None,
+    vix3m_series: pd.Series | None = None,
+    xsect_dispersion: pd.Series | None = None,
 ) -> pd.DataFrame:
     """
     Compute all technical, macro, and alternative data features for a full OHLCV DataFrame.
@@ -344,18 +346,27 @@ def compute_features(
     band_width = (upper_bb - lower_bb).replace(0, float("nan"))
     df["bollinger_pct"] = ((close - lower_bb) / band_width).fillna(0.5)
 
-    # Sector ETF vs SPY (5-day): captures sector rotation relative to the market.
+    # Sector ETF vs SPY (5d/10d/20d): captures sector rotation at multiple horizons.
     # Positive = sector outperforming SPY; negative = sector underperforming.
-    if sector_etf_series is not None and spy_mom_5d is not None:
+    if sector_etf_series is not None:
         sec_aligned = sector_etf_series.reindex(df.index)
         sec_mom_5d = (sec_aligned / sec_aligned.shift(_mom_short)) - 1.0
-        df["sector_vs_spy_5d"] = sec_mom_5d - spy_mom_5d
-    elif sector_etf_series is not None:
-        # SPY not available — compute sector momentum only (no relative adjustment)
-        sec_aligned = sector_etf_series.reindex(df.index)
-        df["sector_vs_spy_5d"] = (sec_aligned / sec_aligned.shift(_mom_short)) - 1.0
+        sec_mom_10d = (sec_aligned / sec_aligned.shift(10)) - 1.0
+        sec_mom_20d = (sec_aligned / sec_aligned.shift(_mom_long)) - 1.0
+        if spy_mom_5d is not None:
+            spy_mom_10d = (spy_aligned / spy_aligned.shift(10)) - 1.0
+            spy_mom_20d = (spy_aligned / spy_aligned.shift(_mom_long)) - 1.0
+            df["sector_vs_spy_5d"] = sec_mom_5d - spy_mom_5d
+            df["sector_vs_spy_10d"] = sec_mom_10d - spy_mom_10d
+            df["sector_vs_spy_20d"] = sec_mom_20d - spy_mom_20d
+        else:
+            df["sector_vs_spy_5d"] = sec_mom_5d
+            df["sector_vs_spy_10d"] = sec_mom_10d
+            df["sector_vs_spy_20d"] = sec_mom_20d
     else:
-        df["sector_vs_spy_5d"] = 0.0  # no sector info: neutral signal
+        df["sector_vs_spy_5d"] = 0.0
+        df["sector_vs_spy_10d"] = 0.0
+        df["sector_vs_spy_20d"] = 0.0
 
     # ── v1.3 features — macro regime ──────────────────────────────────────────
 
@@ -402,6 +413,29 @@ def compute_features(
         df["oil_mom_5d"] = df["oil_mom_5d"].fillna(0.0)
     else:
         df["oil_mom_5d"] = 0.0
+
+    # ── v1.6 features — investigation upgrades (A2) ─────────────────────────
+
+    # vix_term_slope: VIX spot vs 3-month VIX term structure.
+    # Positive (backwardation) = elevated near-term fear vs longer-term.
+    # Negative (contango) = complacency, normal term structure.
+    # Normalized by VIX baseline (~20) so typical range is [-0.5, +0.5].
+    if vix_series is not None and vix3m_series is not None:
+        vix3m_aligned = vix3m_series.reindex(df.index, method="ffill")
+        df["vix_term_slope"] = (vix_aligned - vix3m_aligned) / _FC["vix_baseline"]
+        df["vix_term_slope"] = df["vix_term_slope"].fillna(0.0)
+    else:
+        df["vix_term_slope"] = 0.0
+
+    # xsect_dispersion: cross-sectional dispersion of daily returns across the
+    # universe. High dispersion = stock-picking environment (alpha opportunity);
+    # low dispersion = factor-driven (harder to differentiate).
+    # This is a market-wide feature, passed in as a pre-computed Series.
+    if xsect_dispersion is not None:
+        disp_aligned = xsect_dispersion.reindex(df.index, method="ffill")
+        df["xsect_dispersion"] = disp_aligned.fillna(0.0)
+    else:
+        df["xsect_dispersion"] = 0.0
 
     # ── v1.4 features — design doc Appendix A completions ────────────────────
 

@@ -99,7 +99,7 @@ fi
 
 # Check for uncommitted changes
 cd "$REPO_ROOT"
-if ! git diff --quiet HEAD -- config.py config/predictor.sample.yaml training/train_handler.py README.md; then
+if ! git diff --quiet HEAD -- config.py config/predictor.sample.yaml training/train_handler.py model/ data/ README.md; then
   echo "WARNING: You have uncommitted changes in key files."
   echo "         The spot instance clones from origin/$BRANCH."
   echo "         Commit and push first, or changes won't be included."
@@ -230,7 +230,7 @@ $PIP install --upgrade pip -q
 # Filter out private packages (flow-doctor) that aren't on PyPI
 grep -v '^flow-doctor' requirements.txt | $PIP install -q -r /dev/stdin
 echo "Dependencies installed."
-$PIP list --format=columns | grep -iE 'numpy|pandas|lightgbm|scipy|shap|pyyaml' || true
+$PIP list --format=columns | grep -iE 'numpy|pandas|lightgbm|catboost|scikit-learn|scipy|shap|pyyaml' || true
 DEPS
 
 # ── Copy local config + .env to EC2 ──────────────────────────────────────────
@@ -363,3 +363,13 @@ echo ""
 echo "═══════════════════════════════════════════════════════════════"
 echo "  Training complete. Instance will be terminated."
 echo "═══════════════════════════════════════════════════════════════"
+
+# Emit CloudWatch heartbeat on successful completion
+aws cloudwatch put-metric-data \
+  --namespace "AlphaEngine" \
+  --metric-name "Heartbeat" \
+  --dimensions "Process=predictor-training" \
+  --value 1 --unit "Count" \
+  --region "${AWS_REGION:-us-east-1}" 2>/dev/null \
+  && echo "Heartbeat emitted: predictor-training" \
+  || echo "WARNING: Failed to emit heartbeat (non-fatal)"
