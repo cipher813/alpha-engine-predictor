@@ -1873,14 +1873,10 @@ def main(
             "run bootstrap_fetcher.py first to populate the price cache."
         )
 
-    # Step 1b: Refresh any stale parquets with recent data → upload back to S3
-    n_refreshed = refresh_price_cache(
-        bucket=bucket,
-        prefix="predictor/price_cache/",
-        local_dir=tmp_cache,
-        fd=fd,
-    )
-    log.info("Price cache refresh: %d tickers updated", n_refreshed)
+    # Step 1b: Price cache refresh now handled by alpha-engine-data (Phase 1).
+    # The data repo runs weekly_collector.py --phase 1 before training,
+    # so S3 parquets are already current.
+    log.info("Price cache refresh: skipped (handled by alpha-engine-data)")
 
     # Step 2: Train + upload
     import config as _train_cfg
@@ -1912,21 +1908,9 @@ def main(
             dry_run=dry_run,
         )
 
-    # Step 2b: Write slim cache for inference (2-year slice of each ticker)
-    # The slim cache lets the daily inference Lambda skip the 2y yfinance fetch
-    # and instead download ~9 MB of parquets + a few daily_closes delta rows.
-    # Skipped on dry_run since no model upload happened either.
-    if not dry_run:
-        n_slim, n_slim_failed = write_slim_cache(
-            bucket=bucket,
-            full_cache_dir=tmp_cache,
-            fd=fd,
-        )
-        log.info("Slim cache written: %d tickers (%d failed)", n_slim, n_slim_failed)
-        result["slim_cache_tickers"] = n_slim
-        result["slim_cache_failed"] = n_slim_failed
-    else:
-        log.info("[dry-run] Skipping slim cache write")
+    # Step 2b: Slim cache write now handled by alpha-engine-data (Phase 1).
+    # The data repo writes price_cache_slim/ from the full cache after refresh.
+    log.info("Slim cache write: skipped (handled by alpha-engine-data)")
 
     # Step 2c: Feature store — upload registry (best-effort, non-blocking)
     import config as _fs_cfg
