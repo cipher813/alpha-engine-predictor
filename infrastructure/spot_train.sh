@@ -30,21 +30,23 @@
 set -euo pipefail
 
 # ── Load .env ────────────────────────────────────────────────────────────────
+# Master .env lives in alpha-engine-data; fall back to local .env
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-ENV_FILE="$REPO_ROOT/.env"
+ENV_FILE="$(dirname "$REPO_ROOT")/alpha-engine-data/.env"
+if [ ! -f "$ENV_FILE" ]; then
+  ENV_FILE="$REPO_ROOT/.env"
+fi
 if [ -f "$ENV_FILE" ]; then
-  # Export all non-comment, non-empty lines from .env
   set -a
   # shellcheck disable=SC1090
   source "$ENV_FILE"
   set +a
   echo "Loaded .env from $ENV_FILE"
 else
-  echo "WARNING: No .env file found at $ENV_FILE"
-  echo "         Email notifications will be skipped."
-  echo "         Copy .env.example to .env and fill in values."
+  echo "WARNING: No .env file found"
+  echo "         Copy alpha-engine-data/.env.example to .env and fill in values."
   echo ""
 fi
 
