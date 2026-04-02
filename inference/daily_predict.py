@@ -283,7 +283,9 @@ def get_veto_threshold(s3_bucket: str, market_regime: str = "") -> float:
 
 # ── Universe ──────────────────────────────────────────────────────────────────
 
-def get_universe_tickers(s3_bucket: str, date_str: Optional[str] = None) -> list[str]:
+def get_universe_tickers(
+    s3_bucket: str, date_str: Optional[str] = None,
+) -> tuple[list[str], dict]:
     """
     Read the active ticker universe from today's signals.json in S3.
     Falls back to _FALLBACK_TICKERS if signals.json is not available.
@@ -295,7 +297,7 @@ def get_universe_tickers(s3_bucket: str, date_str: Optional[str] = None) -> list
 
     Returns
     -------
-    list of ticker symbols.
+    (tickers, signals_data) — ticker list and full signals payload for email.
     """
     if date_str is None:
         date_str = datetime.now().strftime("%Y-%m-%d")
@@ -314,14 +316,14 @@ def get_universe_tickers(s3_bucket: str, date_str: Optional[str] = None) -> list
 
         if tickers:
             log.info("Universe: %d tickers from %s", len(tickers), signals_key)
-            return tickers
+            return tickers, signals_data
         else:
             log.warning("signals.json found but no tickers extracted — using fallback")
     except Exception as exc:
         log.info("Could not read signals.json (%s) — using fallback universe", exc)
 
     log.info("Using fallback universe: %d tickers", len(_FALLBACK_TICKERS))
-    return _FALLBACK_TICKERS
+    return _FALLBACK_TICKERS, {}
 
 
 # ── Watchlist ─────────────────────────────────────────────────────────────────
@@ -1467,6 +1469,7 @@ def _build_predictor_email(
     model_version = metrics.get("model_version", "unknown")
     val_ic        = metrics.get("ic_30d")        # 30-day information coefficient
     n_total       = len(predictions)
+    is_meta       = metrics.get("inference_mode") == "meta" or "meta" in model_version.lower()
 
     # Single list sorted by combined_rank (best first)
     sorted_preds = sorted(predictions, key=lambda p: p.get("combined_rank") or p.get("mse_rank") or 999)
@@ -1488,7 +1491,7 @@ def _build_predictor_email(
     # ── Research data extraction ───────────────────────────────────────────────
     sd = signals_data or {}
     market_regime    = sd.get("market_regime", "")
-    population       = sd.get("universe", [])
+    population       = sd.get("universe", []) or sd.get("population", [])
     sector_ratings   = sd.get("sector_ratings", {})
     sorted_sectors: list = []
 
@@ -1537,6 +1540,20 @@ def _build_predictor_email(
         colors = {"UP": "#2e7d32", "DOWN": "#c62828"}
         return f'<span style="color:{colors.get(d, "#888")}; font-weight:bold;">{d}</span>'
 
+    def _meta_cols(p: dict) -> str:
+        """Extra columns for meta-model predictions: momentum, vol, regime, research."""
+        mom = p.get("momentum_confirmation")
+        vol = p.get("expected_move")
+        rbull = p.get("regime_bull")
+        rbear = p.get("regime_bear")
+        rscore = p.get("research_calibrator_prob")
+        return (
+            f'<td {TDR}>{f"{mom:+.3f}" if mom is not None else "—"}</td>'
+            f'<td {TDR}>{f"{vol:.3f}" if vol is not None else "—"}</td>'
+            f'<td {TDR}>{f"{rbull:.0%}" if rbull is not None else "—"}</td>'
+            f'<td {TDR}>{f"{rscore:.0%}" if rscore is not None else "—"}</td>'
+        )
+
     def _html_prediction_table(preds: list[dict]) -> str:
         if not preds:
             return '<p style="color:#888; font-style:italic;">No predictions available.</p>'
@@ -1557,18 +1574,28 @@ def _build_predictor_email(
                 f'<td {TD}><b>{p["ticker"]}{_source_tag(p)}</b></td>'
                 f'<td {TDR}>{_alpha_str(p)}</td>'
                 f'<td {TDR}>{cr_str}</td>'
+                f'<td {TDR}>{_conf_pct(p)}</td>'
                 f'<td {TD} style="text-align:center;">{_dir_badge(p)}{veto_tag}</td>'
-                f'<td {TD}>{p.get("watchlist_source", "—")}</td>'
+                + (_meta_cols(p) if is_meta else "")
+                + f'<td {TD}>{p.get("watchlist_source", "—")}</td>'
                 f'</tr>'
             )
+        meta_headers = (
+            f'<th {TH}>Mom</th>'
+            f'<th {TH}>Vol</th>'
+            f'<th {TH}>Regime</th>'
+            f'<th {TH}>Res.Cal</th>'
+        ) if is_meta else ""
         return (
             f'<table {TABLE}>'
             f'<tr>'
             f'<th {TH}>Ticker</th>'
-            f'<th {TH}>α (MSE)</th>'
+            f'<th {TH}>Alpha</th>'
             f'<th {TH}>Rank</th>'
+            f'<th {TH}>Conf</th>'
             f'<th {TH}>Signal</th>'
-            f'<th {TH}>Source</th>'
+            + meta_headers
+            + f'<th {TH}>Source</th>'
             f'</tr>'
             + "\n".join(rows)
             + f'</table>'
@@ -1669,12 +1696,13 @@ def _build_predictor_email(
         f'Universe: <b>{n_total}</b> tickers &nbsp;|&nbsp;'
         f'Run at <b>{run_time}</b></p>'
         f'{research_html}'
-        f'<h3 style="font-size:13px; color:#333; margin-bottom:4px;">GBM Predictions</h3>'
+        f'<h3 style="font-size:13px; color:#333; margin-bottom:4px;">{"Predictions" if is_meta else "GBM Predictions"}</h3>'
         f'{_html_prediction_table(sorted_preds)}'
         f'{veto_section_html}'
         f'<p style="font-size:11px; color:#aaa; margin-top:24px;">'
-        f'★ = buy_candidate from research signals.json &nbsp;|&nbsp;'
-        f'⚠ VETO = negative α + bottom-half rank</p>'
+        f'⚠ VETO = negative α + bottom-half rank'
+        + (' &nbsp;|&nbsp; Mom = momentum &nbsp;|&nbsp; Vol = expected move &nbsp;|&nbsp; Res.Cal = research calibrator P(correct)' if is_meta else '')
+        + f'</p>'
         f'</body></html>'
     )
 
@@ -1695,7 +1723,8 @@ def _build_predictor_email(
             veto = " [VETO]" if is_vetoed else ""
             lines.append(
                 f"  {p['ticker']:<6}  α={_alpha_str(p):>7}  Rank {cr_str:<5}"
-                f"  {p.get('predicted_direction','—'):<4}  {p.get('watchlist_source', '—')}{_source_tag(p)}{veto}"
+                f"  {_conf_pct(p):>4}  {p.get('predicted_direction','—'):<4}"
+                f"  {p.get('watchlist_source', '—')}{_source_tag(p)}{veto}"
             )
         return "\n".join(lines) + "\n"
 
@@ -1733,7 +1762,7 @@ def _build_predictor_email(
         f"Model: {model_version}  IC(val): {ic_str}  Mode: {metrics.get('inference_mode', 'mse')}  Universe: {n_total}  Run: {run_time}\n"
         f"{research_plain}"
         f"\n{'='*60}\n"
-        f"GBM PREDICTIONS\n"
+        f"{'PREDICTIONS' if is_meta else 'GBM PREDICTIONS'}\n"
         f"{'='*60}\n"
         f"\nPredictions (sorted by combined rank, {len(ups)} UP / {len(downs)} DOWN)\n"
         f"{_plain_prediction_list(sorted_preds)}"
@@ -1960,13 +1989,13 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--model-type",
-        default="mlp",
+        default="gbm",
         choices=["mlp", "gbm"],
         help=(
             "Which model to load for inference: "
-            "'mlp' loads checkpoints/best.pt (or S3 predictor/weights/latest.pt), "
-            "'gbm' loads checkpoints/gbm_best.txt (or S3 predictor/weights/gbm_latest.txt). "
-            "Default: mlp"
+            "'gbm' loads GBM weights (or meta-model when META_MODEL_ENABLED=true), "
+            "'mlp' loads legacy MLP checkpoints/best.pt. "
+            "Default: gbm"
         ),
     )
     parser.add_argument(
@@ -2014,7 +2043,7 @@ if __name__ == "__main__":
         # Stub watchlist: 10 sample tickers
         _OFFLINE_TICKERS = ["AAPL", "MSFT", "GOOGL", "AMZN", "META",
                             "JPM", "JNJ", "XOM", "PFE", "HD"]
-        _this.get_universe_tickers = lambda *a, **k: _OFFLINE_TICKERS
+        _this.get_universe_tickers = lambda *a, **k: (_OFFLINE_TICKERS, {})
         _this.load_watchlist = lambda *a, **k: (
             _OFFLINE_TICKERS,
             {t: "population" for t in _OFFLINE_TICKERS},

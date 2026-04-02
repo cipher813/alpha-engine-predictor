@@ -25,7 +25,7 @@ class TestDirectionPredictor:
 
     def test_forward_pass_output_shape(self):
         """Forward pass must return (batch_size, 3) logits."""
-        model = DirectionPredictor()
+        model = DirectionPredictor(n_features=N_FEATURES)
         batch_size = 16
         x = torch.randn(batch_size, N_FEATURES)
         out = model(x)
@@ -38,7 +38,7 @@ class TestDirectionPredictor:
         Model must be in eval mode — BatchNorm1d requires batch_size > 1 in training mode.
         At inference time the model is always in eval mode (predict_proba sets it).
         """
-        model = DirectionPredictor()
+        model = DirectionPredictor(n_features=N_FEATURES)
         model.eval()  # BatchNorm1d needs eval mode for batch_size=1
         x = torch.randn(1, N_FEATURES)
         with torch.no_grad():
@@ -47,7 +47,7 @@ class TestDirectionPredictor:
 
     def test_output_is_logits_not_probs(self):
         """Direct model output (forward) should NOT sum to 1 — these are logits."""
-        model = DirectionPredictor()
+        model = DirectionPredictor(n_features=N_FEATURES)
         x = torch.randn(32, N_FEATURES)
         out = model(x)
         row_sums = out.sum(dim=-1)
@@ -58,7 +58,7 @@ class TestDirectionPredictor:
 
     def test_softmax_output_sums_to_one(self):
         """After softmax, probabilities must sum to 1 for each sample."""
-        model = DirectionPredictor()
+        model = DirectionPredictor(n_features=N_FEATURES)
         x = torch.randn(16, N_FEATURES)
         logits = model(x)
         probs = F.softmax(logits, dim=-1)
@@ -69,7 +69,7 @@ class TestDirectionPredictor:
 
     def test_predict_proba_sums_to_one(self):
         """predict_proba() helper must return probabilities summing to 1."""
-        model = DirectionPredictor()
+        model = DirectionPredictor(n_features=N_FEATURES)
         x = torch.randn(8, N_FEATURES)
         probs = model.predict_proba(x)
         row_sums = probs.sum(dim=-1)
@@ -77,14 +77,14 @@ class TestDirectionPredictor:
 
     def test_predict_proba_non_negative(self):
         """All probability outputs must be >= 0."""
-        model = DirectionPredictor()
+        model = DirectionPredictor(n_features=N_FEATURES)
         x = torch.randn(32, N_FEATURES)
         probs = model.predict_proba(x)
         assert (probs >= 0).all(), "Negative probabilities found"
 
     def test_model_in_eval_mode_after_predict_proba(self):
         """predict_proba() should leave the model in eval mode."""
-        model = DirectionPredictor()
+        model = DirectionPredictor(n_features=N_FEATURES)
         model.train()
         _ = model.predict_proba(torch.randn(4, N_FEATURES))
         assert not model.training, "Model should be in eval mode after predict_proba()"
@@ -105,14 +105,14 @@ class TestDirectionPredictor:
 
     def test_parameter_count_reasonable(self):
         """Default model should have a small, reasonable number of parameters."""
-        model = DirectionPredictor()
+        model = DirectionPredictor(n_features=N_FEATURES)
         n_params = sum(p.numel() for p in model.parameters())
-        # Default: 8→64 (512+64=576) + 64→32 (2048+32=2080) + 32→3 (96+3=99) = ~2800+ BN params
+        # 49→64 (3136+64) + 64→32 (2048+32) + 32→3 (96+3) + BN params ≈ ~5500
         assert 1_000 < n_params < 50_000, f"Unexpected parameter count: {n_params}"
 
     def test_gradient_flows(self):
         """Gradients should flow through the model (no dead branches)."""
-        model = DirectionPredictor()
+        model = DirectionPredictor(n_features=N_FEATURES)
         model.train()
         x = torch.randn(8, N_FEATURES)
         labels = torch.randint(0, N_CLASSES, (8,))
@@ -129,9 +129,9 @@ class TestCheckpoint:
 
     def test_save_and_load_round_trip(self):
         """Loaded model should produce identical output to the original."""
-        model = DirectionPredictor()
+        model = DirectionPredictor(n_features=N_FEATURES)
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
-        norm_stats = {"mean": [0.0] * 8, "std": [1.0] * 8, "features": ["f1"] * 8}
+        norm_stats = {"mean": [0.0] * N_FEATURES, "std": [1.0] * N_FEATURES, "features": [f"f{i}" for i in range(N_FEATURES)]}
 
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "test.pt"
@@ -154,12 +154,12 @@ class TestCheckpoint:
 
     def test_checkpoint_contains_norm_stats(self):
         """Checkpoint must contain norm_stats for inference-time normalization."""
-        model = DirectionPredictor()
+        model = DirectionPredictor(n_features=N_FEATURES)
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
         norm_stats = {
-            "mean": list(range(8)),
-            "std": [1.0, 2.0, 1.5, 0.5, 3.0, 2.5, 1.0, 4.0],
-            "features": ["f"] * 8,
+            "mean": list(range(N_FEATURES)),
+            "std": [1.0 + i * 0.1 for i in range(N_FEATURES)],
+            "features": [f"f{i}" for i in range(N_FEATURES)],
         }
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -173,7 +173,7 @@ class TestCheckpoint:
 
     def test_checkpoint_contains_model_version(self):
         """Checkpoint must contain model_version string."""
-        model = DirectionPredictor()
+        model = DirectionPredictor(n_features=N_FEATURES)
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -186,7 +186,7 @@ class TestCheckpoint:
 
     def test_checkpoint_contains_model_config(self):
         """Checkpoint must store model architecture config for reconstruction."""
-        model = DirectionPredictor(hidden_1=128, hidden_2=64)
+        model = DirectionPredictor(n_features=N_FEATURES, hidden_1=128, hidden_2=64)
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -205,7 +205,7 @@ class TestCheckpoint:
 
     def test_epoch_stored_in_checkpoint(self):
         """The training epoch must be stored in the checkpoint."""
-        model = DirectionPredictor()
+        model = DirectionPredictor(n_features=N_FEATURES)
         optimizer = torch.optim.AdamW(model.parameters())
 
         with tempfile.TemporaryDirectory() as tmpdir:

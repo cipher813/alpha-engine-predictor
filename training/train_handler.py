@@ -1472,7 +1472,8 @@ def send_training_email(result: dict, date_str: str) -> bool:
     mh_data      = result.get("multi_horizon")
 
     subject = (
-        f"Alpha Engine Training | {date_str} | IC {test_ic:.4f} {status_str} | "
+        f"Alpha Engine Training | {date_str} | "
+        f"{'Meta IC' if is_meta else 'IC'} {test_ic:.4f} {status_str} | "
         f"{'Promoted (' + promoted_mode + ')' if promoted else 'Not promoted'}"
     )
 
@@ -1695,8 +1696,11 @@ def send_training_email(result: dict, date_str: str) -> bool:
 
         f'{wf_html}'
 
-        f'<h3 style="margin-bottom:4px;">Top 5 Features by Gain</h3>'
-        f'<table>{feat_rows}</table>'
+        + (
+            f'<h3 style="margin-bottom:4px;">Top 5 Features by Gain</h3>'
+            f'<table>{feat_rows}</table>'
+            if feat_rows else ""
+        ) +
 
         f'{shap_html}'
 
@@ -1733,33 +1737,56 @@ def send_training_email(result: dict, date_str: str) -> bool:
         f'</body></html>'
     )
 
-    _mse_mark  = " ✓" if promoted_mode == "mse" else ""
-    _rank_mark = " ✓" if promoted_mode == "rank" else ""
-    _ens_mark  = " ✓" if promoted_mode == "ensemble" else ""
-    plain_body = (
-        f"Alpha Engine Training — {date_str}\n"
-        f"Model: {version}  Samples: {n_train:,}  Elapsed: {elapsed_s:.0f}s\n"
-        f"\nVal IC:             {val_ic:.4f}"
-        f"\nMSE Model IC:       {mse_ic:.4f}{' — ' + ic_label if promoted_mode == 'mse' else ''}{_mse_mark}"
-        + (
-            f"\nLambdarank Model IC: {rank_ic:.4f}{' — ' + ic_label if promoted_mode == 'rank' else ''}{_rank_mark}"
-            f"\nEnsemble IC:        {ensemble_ic:.4f}{' — ' + ic_label if promoted_mode == 'ensemble' else ''}{_ens_mark}"
-            if ensemble_on and rank_ic is not None and ensemble_ic is not None else
-            f"\nTest IC:            {test_ic:.4f} — {ic_label}"
-        ) +
-        + (
-            f"\nCatBoost IC:        {cat_ic_val:.4f}"
-            f"\nLGB-Cat Blend IC:   {blend_ic_val:.4f} (w_lgb={blend_wts['lgb']:.1f})"
-            if cat_enabled and cat_ic_val is not None else ""
-        ) +
-        f"\nPromoted:           {promoted_mode if promoted else 'none'}"
-        f"\nIC IR:              {ic_ir:.3f} ({ic_pos}/20 positive)"
-        f"\nPromotion:          {promo_label}\n"
-        f"{wf_plain}"
-        f"\nTop features: " + ", ".join(r["feature"] for r in top10[:5])
-        + f"\n{shap_plain}"
-        + f"{feat_health_plain}\n"
-    )
+    if is_meta:
+        meta_ic = result.get("meta_model_ic", test_ic)
+        mom_ic = result.get("momentum_test_ic", mse_ic)
+        vol_ic_val = result.get("volatility_test_ic", 0)
+        regime_acc = result.get("regime_accuracy", 0)
+        plain_body = (
+            f"Alpha Engine Training — {date_str}\n"
+            f"Model: {version}  Samples: {n_train:,}  Elapsed: {elapsed_s:.0f}s\n"
+            f"\nMeta-Model IC:      {meta_ic:.4f} — {ic_label}"
+            f"\nMomentum IC:        {mom_ic:.4f}"
+            f"\nVolatility IC:      {vol_ic_val:.4f}"
+            f"\nRegime Accuracy:    {regime_acc*100:.1f}%"
+            f"\nPromotion:          {promo_label}\n"
+            f"{wf_plain}"
+        )
+        coefs = result.get("meta_coefficients", {})
+        if coefs:
+            plain_body += "\nMeta coefficients:\n" + "\n".join(
+                f"  {k:<28} {v:+.4f}"
+                for k, v in sorted(coefs.items(), key=lambda x: -abs(x[1]))
+                if k != "intercept" and abs(v) > 0.0001
+            ) + "\n"
+    else:
+        _mse_mark  = " ✓" if promoted_mode == "mse" else ""
+        _rank_mark = " ✓" if promoted_mode == "rank" else ""
+        _ens_mark  = " ✓" if promoted_mode == "ensemble" else ""
+        plain_body = (
+            f"Alpha Engine Training — {date_str}\n"
+            f"Model: {version}  Samples: {n_train:,}  Elapsed: {elapsed_s:.0f}s\n"
+            f"\nVal IC:             {val_ic:.4f}"
+            f"\nMSE Model IC:       {mse_ic:.4f}{' — ' + ic_label if promoted_mode == 'mse' else ''}{_mse_mark}"
+            + (
+                f"\nLambdarank Model IC: {rank_ic:.4f}{' — ' + ic_label if promoted_mode == 'rank' else ''}{_rank_mark}"
+                f"\nEnsemble IC:        {ensemble_ic:.4f}{' — ' + ic_label if promoted_mode == 'ensemble' else ''}{_ens_mark}"
+                if ensemble_on and rank_ic is not None and ensemble_ic is not None else
+                f"\nTest IC:            {test_ic:.4f} — {ic_label}"
+            ) +
+            + (
+                f"\nCatBoost IC:        {cat_ic_val:.4f}"
+                f"\nLGB-Cat Blend IC:   {blend_ic_val:.4f} (w_lgb={blend_wts['lgb']:.1f})"
+                if cat_enabled and cat_ic_val is not None else ""
+            ) +
+            f"\nPromoted:           {promoted_mode if promoted else 'none'}"
+            f"\nIC IR:              {ic_ir:.3f} ({ic_pos}/20 positive)"
+            f"\nPromotion:          {promo_label}\n"
+            f"{wf_plain}"
+            f"\nTop features: " + ", ".join(r["feature"] for r in top10[:5])
+            + f"\n{shap_plain}"
+            + f"{feat_health_plain}\n"
+        )
 
     app_password = os.environ.get("GMAIL_APP_PASSWORD", "").strip()
 

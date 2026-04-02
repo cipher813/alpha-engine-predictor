@@ -72,7 +72,7 @@ class TestBuildPredictorEmail:
         assert "2024-06-01" in subject
 
     def test_subject_contains_direction_counts(self):
-        """Subject line should include UP/FLAT/DOWN counts."""
+        """Subject line should include UP and DOWN counts."""
         from inference.daily_predict import _build_predictor_email
 
         preds = self._make_predictions(6)  # 2 UP, 2 FLAT, 2 DOWN
@@ -80,7 +80,6 @@ class TestBuildPredictorEmail:
 
         subject, _, _ = _build_predictor_email(preds, metrics, "2024-06-01")
         assert "UP" in subject
-        assert "FLAT" in subject
         assert "DOWN" in subject
 
     def test_html_contains_tickers(self):
@@ -106,26 +105,38 @@ class TestBuildPredictorEmail:
             assert p["ticker"] in plain
 
     def test_veto_section_appears_for_high_confidence_down(self):
-        """Vetoes should appear when a DOWN prediction exceeds the threshold."""
+        """Vetoes should appear when a DOWN prediction has negative alpha and low rank."""
         from inference.daily_predict import _build_predictor_email
 
+        # Veto logic: predicted_alpha < 0 AND combined_rank > n_preds / 2
         preds = [
+            {
+                "ticker": "GOOD",
+                "predicted_alpha": 0.05,
+                "predicted_direction": "UP",
+                "prediction_confidence": 0.70,
+                "mse_rank": 1,
+                "model_rank": 1,
+                "combined_rank": 1.0,
+                "watchlist_source": "tracked",
+            },
             {
                 "ticker": "VETOME",
                 "predicted_alpha": -0.05,
                 "predicted_direction": "DOWN",
                 "prediction_confidence": 0.95,
-                "mse_rank": 1,
-                "model_rank": 1,
+                "mse_rank": 2,
+                "model_rank": 2,
+                "combined_rank": 2.0,  # > n_preds/2 (2 > 1)
                 "watchlist_source": "tracked",
-            }
+            },
         ]
         metrics = self._make_metrics()
 
         subject, html, plain = _build_predictor_email(
             preds, metrics, "2024-06-01", veto_threshold=0.65
         )
-        assert "VETO" in subject or "veto" in subject.lower()
+        assert "veto" in subject.lower()
         assert "VETOME" in html
         assert "VETO" in plain or "VETOME" in plain
 

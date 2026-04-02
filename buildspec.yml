@@ -9,6 +9,9 @@ env:
 phases:
   pre_build:
     commands:
+      - echo Running tests...
+      - pip install -q -r requirements.txt
+      - pytest tests/ -v --tb=short
       - echo Logging in to Amazon ECR...
       - AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
       - ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"

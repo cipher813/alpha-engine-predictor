@@ -23,7 +23,7 @@ def run(ctx: PipelineContext) -> None:
             date_str=ctx.date_str,
         )
     else:
-        ctx.tickers = get_universe_tickers(ctx.bucket, ctx.date_str)
+        ctx.tickers, ctx.signals_data = get_universe_tickers(ctx.bucket, ctx.date_str)
 
     # ── Sector map ───────────────────────────────────────────────────────────
     sector_map_path = Path("data/cache/sector_map.json")

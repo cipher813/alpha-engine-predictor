@@ -283,6 +283,35 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
     for i, p in enumerate(ctx.predictions):
         p["combined_rank"] = i + 1
 
+    # ── Cross-sectional confidence rescaling ────────────────────────────────
+    # Meta-model ridge outputs cluster in ~[-0.01, +0.01] — far narrower than
+    # LABEL_CLIP (0.15). The linear mapping p_up = 0.5 + alpha/(2*0.15)
+    # compresses all confidences to ~0.48-0.53, disabling the veto gate.
+    # Fix: rescale using the empirical alpha range from THIS batch so the
+    # full [0, 1] confidence range is used.
+    alphas = [p.get("predicted_alpha", 0) or 0 for p in ctx.predictions]
+    if alphas:
+        max_abs = max(abs(a) for a in alphas)
+        meta_clip = max(max_abs, 1e-6)  # floor to avoid div-by-zero
+        log.info(
+            "Meta confidence rescaling: max_abs_alpha=%.6f  meta_clip=%.6f  (LABEL_CLIP=%.3f)",
+            max_abs, meta_clip, max_r,
+        )
+        for p in ctx.predictions:
+            a = p.get("predicted_alpha", 0) or 0
+            p_up = float(np.clip(0.5 + a / (2.0 * meta_clip), 0.0, 1.0))
+            p_down = 1.0 - p_up
+            if a >= 0:
+                direction = "UP"
+                confidence = p_up
+            else:
+                direction = "DOWN"
+                confidence = p_down
+            p["p_up"] = round(p_up, 4)
+            p["p_down"] = round(p_down, 4)
+            p["predicted_direction"] = direction
+            p["prediction_confidence"] = round(confidence, 4)
+
     log.info("Meta-inference complete: %d predictions, %d skipped", len(ctx.predictions), ctx.n_skipped)
 
 

@@ -124,6 +124,28 @@ aws lambda create-alias \
   --function-version "${VERSION}" \
   --region "${AWS_REGION}"
 
+# ── Step 7: Canary invocation ───────────────────────────────────────────────
+echo ""
+echo "==> Running canary invocation (dry_run=true)..."
+CANARY_OUT=$(mktemp)
+aws lambda invoke \
+  --function-name "${LAMBDA_FUNCTION}:live" \
+  --payload '{"dry_run": true}' \
+  --cli-binary-format raw-in-base64-out \
+  --region "${AWS_REGION}" \
+  "$CANARY_OUT" > /dev/null
+
+CANARY_STATUS=$(python3 -c "import json; d=json.load(open('$CANARY_OUT')); print(d.get('statusCode', 0))" 2>/dev/null || echo "0")
+rm -f "$CANARY_OUT"
+
+if [ "$CANARY_STATUS" != "200" ]; then
+  echo ""
+  echo "ERROR: Canary returned status $CANARY_STATUS — auto-rolling back!"
+  bash "$(dirname "$0")/rollback.sh"
+  exit 1
+fi
+echo "  Canary passed (status=$CANARY_STATUS)"
+
 echo ""
 echo "==> Deploy complete!"
 echo "    Function : ${LAMBDA_FUNCTION}"
@@ -131,5 +153,4 @@ echo "    Version  : ${VERSION}"
 echo "    Alias    : live → ${VERSION}"
 echo "    Image    : ${ECR_IMAGE}"
 echo ""
-echo "To test:  aws lambda invoke --function-name ${LAMBDA_FUNCTION}:live --payload '{\"dry_run\": true}' --cli-binary-format raw-in-base64-out /tmp/response.json --region ${AWS_REGION} && cat /tmp/response.json"
 echo "Rollback: bash infrastructure/rollback.sh"
