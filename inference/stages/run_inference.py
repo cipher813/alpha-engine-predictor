@@ -224,34 +224,34 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
             log.warning("Regime prediction failed: %s — using uniform priors", e)
 
     # ── Step 2: Load research signals for calibrator ─────────────────────────
-    # Read signals.json for composite scores and conviction
+    # Read signals.json for composite scores and conviction.
+    # Research runs weekly (Saturday), so search backward up to 7 days.
     research_signals = {}
     try:
         import boto3 as _b3_sig
+        from datetime import datetime as _dt, timedelta as _td
         _s3_sig = _b3_sig.client("s3")
-        sig_key = f"signals/{ctx.date_str}/signals.json"
-        try:
-            sig_obj = _s3_sig.get_object(Bucket=ctx.bucket, Key=sig_key)
-            sig_data = json.loads(sig_obj["Body"].read())
-            for sig in sig_data.get("universe", []):
-                ticker = sig.get("ticker")
-                if ticker:
-                    research_signals[ticker] = sig
-            log.info("Loaded %d research signals for calibrator", len(research_signals))
-        except Exception:
-            # Try previous day
-            from datetime import datetime as _dt, timedelta as _td
-            prev = (_dt.strptime(ctx.date_str, "%Y-%m-%d") - _td(days=1)).strftime("%Y-%m-%d")
+        base_date = _dt.strptime(ctx.date_str, "%Y-%m-%d")
+        for _lookback in range(8):
+            check_date = (base_date - _td(days=_lookback)).strftime("%Y-%m-%d")
             try:
-                sig_obj = _s3_sig.get_object(Bucket=ctx.bucket, Key=f"signals/{prev}/signals.json")
+                sig_obj = _s3_sig.get_object(
+                    Bucket=ctx.bucket, Key=f"signals/{check_date}/signals.json"
+                )
                 sig_data = json.loads(sig_obj["Body"].read())
                 for sig in sig_data.get("universe", []):
                     ticker = sig.get("ticker")
                     if ticker:
                         research_signals[ticker] = sig
-                log.info("Loaded %d research signals (previous day %s)", len(research_signals), prev)
+                log.info(
+                    "Loaded %d research signals from %s (-%dd)",
+                    len(research_signals), check_date, _lookback,
+                )
+                break
             except Exception:
-                log.info("No research signals available for calibrator")
+                continue
+        if not research_signals:
+            log.info("No research signals available for calibrator (searched 8 days)")
     except Exception as e:
         log.warning("Research signal loading failed: %s", e)
 
@@ -343,6 +343,16 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
             # Fallback: weighted average of Layer 1 outputs
             alpha = 0.4 * momentum_score + 0.3 * (research_cal_prob - 0.5) * 0.1 + 0.2 * expected_move * np.sign(momentum_score) + 0.1 * (regime_probs["regime_bull"] - regime_probs["regime_bear"]) * 0.05
 
+        # Research signal adjustment: meta-model was trained without research
+        # data, so its ridge coefficients for research features are zero.
+        # Apply a direct adjustment until the model is retrained with signals.
+        # Scale: research_cal_prob in [0,1] → adjustment in [-0.005, +0.005].
+        # Conviction amplifies: rising=1.5x, declining=0.5x.
+        if sig:
+            _cal_adj = (research_cal_prob - 0.5) * 0.01
+            _conv_mult = {1.0: 1.5, 0.0: 1.0, -1.0: 0.5}.get(research_conviction, 1.0)
+            alpha += _cal_adj * _conv_mult
+
         alpha = float(np.clip(alpha, -max_r, max_r))
 
         # Calibrated confidence
@@ -397,18 +407,18 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
         p["combined_rank"] = i + 1
 
     # ── Cross-sectional confidence rescaling ────────────────────────────────
-    # Meta-model ridge outputs cluster in ~[-0.01, +0.01] — far narrower than
-    # LABEL_CLIP (0.15). The linear mapping p_up = 0.5 + alpha/(2*0.15)
-    # compresses all confidences to ~0.48-0.53, disabling the veto gate.
-    # Fix: rescale using the empirical alpha range from THIS batch so the
-    # full [0, 1] confidence range is used.
+    # Meta-model ridge outputs cluster in ~[-0.01, +0.01] — narrower than
+    # LABEL_CLIP. Use the batch max_abs but with a floor (META_ALPHA_CLIP)
+    # so that tiny, noisy alpha spreads don't get amplified to extreme
+    # confidences (e.g. 100% UP for a 0.3% predicted alpha).
+    _META_ALPHA_CLIP = 0.02  # 2% — reasonable expected range for 5d alpha
     alphas = [p.get("predicted_alpha", 0) or 0 for p in ctx.predictions]
     if alphas:
         max_abs = max(abs(a) for a in alphas)
-        meta_clip = max(max_abs, 1e-6)  # floor to avoid div-by-zero
+        meta_clip = max(max_abs, _META_ALPHA_CLIP)
         log.info(
-            "Meta confidence rescaling: max_abs_alpha=%.6f  meta_clip=%.6f  (LABEL_CLIP=%.3f)",
-            max_abs, meta_clip, max_r,
+            "Meta confidence rescaling: max_abs_alpha=%.6f  meta_clip=%.6f  (floor=%.3f)",
+            max_abs, meta_clip, _META_ALPHA_CLIP,
         )
         for p in ctx.predictions:
             a = p.get("predicted_alpha", 0) or 0
