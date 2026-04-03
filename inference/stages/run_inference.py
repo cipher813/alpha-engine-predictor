@@ -214,35 +214,27 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
             log.warning("Regime prediction failed: %s — using uniform priors", e)
 
     # ── Step 2: Load research signals for calibrator ─────────────────────────
-    # Read signals.json for composite scores and conviction.
-    # Research runs weekly (Saturday), so search backward up to 7 days.
+    # Read signals/latest.json for composite scores and conviction.
     import json
     research_signals = {}
     try:
         import boto3 as _b3_sig
-        from datetime import datetime as _dt, timedelta as _td
         _s3_sig = _b3_sig.client("s3")
-        base_date = _dt.strptime(ctx.date_str, "%Y-%m-%d")
-        for _lookback in range(8):
-            check_date = (base_date - _td(days=_lookback)).strftime("%Y-%m-%d")
-            try:
-                sig_obj = _s3_sig.get_object(
-                    Bucket=ctx.bucket, Key=f"signals/{check_date}/signals.json"
-                )
-                sig_data = json.loads(sig_obj["Body"].read())
-                for sig in sig_data.get("universe", []):
-                    ticker = sig.get("ticker")
-                    if ticker:
-                        research_signals[ticker] = sig
-                log.info(
-                    "Loaded %d research signals from %s (-%dd)",
-                    len(research_signals), check_date, _lookback,
-                )
-                break
-            except Exception:
-                continue
-        if not research_signals:
-            log.info("No research signals available for calibrator (searched 8 days)")
+        try:
+            sig_obj = _s3_sig.get_object(
+                Bucket=ctx.bucket, Key="signals/latest.json"
+            )
+            sig_data = json.loads(sig_obj["Body"].read())
+            for sig in sig_data.get("universe", []):
+                ticker = sig.get("ticker")
+                if ticker:
+                    research_signals[ticker] = sig
+            log.info(
+                "Loaded %d research signals from signals/latest.json (date=%s)",
+                len(research_signals), sig_data.get("date", "?"),
+            )
+        except Exception:
+            log.info("signals/latest.json not found — no research signals for calibrator")
     except Exception as e:
         log.warning("Research signal loading failed: %s", e)
 
