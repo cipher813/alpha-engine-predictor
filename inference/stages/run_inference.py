@@ -238,46 +238,47 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
     except Exception as e:
         log.warning("Research signal loading failed: %s", e)
 
-    # ── Step 3: Load pre-computed features or compute inline ──────────────────
+    # ── Step 3: Load pre-computed features from S3 feature store ────────────────
     max_r = getattr(cfg, "LABEL_CLIP", 0.15)
 
-    # Try reading pre-computed features from S3 feature store
     precomputed: dict[str, pd.Series] = {}
-    if getattr(cfg, "FEATURE_STORE_READ_ON_INFERENCE", False):
-        try:
-            import boto3 as _b3_fs
-            _s3_fs = _b3_fs.client("s3")
+    try:
+        import boto3 as _b3_fs
+        _s3_fs = _b3_fs.client("s3")
 
-            def _read_snapshot(group: str) -> pd.DataFrame | None:
-                try:
-                    _key = f"{cfg.FEATURE_STORE_PREFIX}{ctx.date_str}/{group}.parquet"
-                    _obj = _s3_fs.get_object(Bucket=ctx.bucket, Key=_key)
-                    return pd.read_parquet(io.BytesIO(_obj["Body"].read()))
-                except Exception:
-                    return None
+        def _read_snapshot(group: str) -> pd.DataFrame | None:
+            try:
+                _key = f"{cfg.FEATURE_STORE_PREFIX}{ctx.date_str}/{group}.parquet"
+                _obj = _s3_fs.get_object(Bucket=ctx.bucket, Key=_key)
+                return pd.read_parquet(io.BytesIO(_obj["Body"].read()))
+            except Exception:
+                return None
 
-            _tech_df = _read_snapshot("technical")
-            if _tech_df is not None and "ticker" in _tech_df.columns:
-                _int_df = _read_snapshot("interaction")
-                for _, row in _tech_df.iterrows():
-                    t = row["ticker"]
-                    precomputed[t] = row
-                # Merge interaction features into precomputed rows
-                if _int_df is not None and "ticker" in _int_df.columns:
-                    _int_by_ticker = {r["ticker"]: r for _, r in _int_df.iterrows()}
-                    for t, row in precomputed.items():
-                        if t in _int_by_ticker:
-                            for col in _int_by_ticker[t].index:
-                                if col != "ticker" and col not in row.index:
-                                    row[col] = _int_by_ticker[t][col]
-                log.info(
-                    "Feature store: loaded %d pre-computed tickers for %s",
-                    len(precomputed), ctx.date_str,
-                )
-            else:
-                log.info("Feature store: no snapshot for %s — using inline compute", ctx.date_str)
-        except Exception as _fs_exc:
-            log.info("Feature store read failed — using inline compute: %s", _fs_exc)
+        _tech_df = _read_snapshot("technical")
+        if _tech_df is not None and "ticker" in _tech_df.columns:
+            _int_df = _read_snapshot("interaction")
+            for _, row in _tech_df.iterrows():
+                t = row["ticker"]
+                precomputed[t] = row
+            if _int_df is not None and "ticker" in _int_df.columns:
+                _int_by_ticker = {r["ticker"]: r for _, r in _int_df.iterrows()}
+                for t, row in precomputed.items():
+                    if t in _int_by_ticker:
+                        for col in _int_by_ticker[t].index:
+                            if col != "ticker" and col not in row.index:
+                                row[col] = _int_by_ticker[t][col]
+            log.info(
+                "Feature store: loaded %d pre-computed tickers for %s",
+                len(precomputed), ctx.date_str,
+            )
+        else:
+            log.warning(
+                "Feature store snapshot missing for %s — falling back to inline compute. "
+                "This is degraded mode; check that DailyData/DataPhase1 ran successfully.",
+                ctx.date_str,
+            )
+    except Exception as _fs_exc:
+        log.warning("Feature store read failed — falling back to inline compute: %s", _fs_exc)
 
     for ticker in ctx.tickers:
         # Use pre-computed features if available, else compute inline

@@ -270,9 +270,7 @@ META_MANIFEST_KEY = "predictor/weights/meta/manifest.json"
 FEATURE_CFG: dict = _cfg["features"]
 
 # ── Feature Store (read-only — writes handled by alpha-engine-data) ──────────
-_fs_store_cfg = _cfg.get("feature_store", {})
-FEATURE_STORE_PREFIX = _fs_store_cfg.get("prefix", "features/")
-FEATURE_STORE_READ_ON_INFERENCE = _fs_store_cfg.get("read_on_inference", True)
+FEATURE_STORE_PREFIX = "features/"
 
 # Fundamental features (v3.0 — quarterly FMP data)
 FUNDAMENTAL_FEATURES = [
