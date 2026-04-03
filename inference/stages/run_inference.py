@@ -195,6 +195,10 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
         _run_gbm_inference(ctx)
         return
 
+    _mom_ic = getattr(mom_scorer, "_val_ic", 0) if mom_scorer else 0
+    _mom_mode = "GBM" if _mom_ic >= 0.02 else "direct (GBM IC=%.4f < 0.02)" % _mom_ic
+    log.info("Momentum scoring mode: %s", _mom_mode)
+
     # ── Step 1: Compute regime (once, market-wide) ───────────────────────────
     regime_probs = {"regime_bear": 0.33, "regime_neutral": 0.34, "regime_bull": 0.33}
     if regime_model is not None and regime_model.is_fitted:
@@ -292,11 +296,26 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
         latest = featured_df.iloc[-1]
 
         # Layer 1A: Momentum model
+        # If the momentum GBM has low quality (IC < 0.02 or best_iter <= 1),
+        # fall back to a direct weighted average of raw momentum features.
+        # This avoids a near-constant output from a barely-trained model.
+        _mom_ic = getattr(mom_scorer, "_val_ic", 0) if mom_scorer else 0
         momentum_score = 0.0
-        if mom_scorer is not None:
+        if mom_scorer is not None and _mom_ic >= 0.02:
             try:
                 mom_x = latest[cfg.MOMENTUM_FEATURES].to_numpy(dtype=np.float32).reshape(1, -1)
                 momentum_score = float(mom_scorer.predict(mom_x)[0])
+            except Exception:
+                pass
+        else:
+            try:
+                _m5 = float(latest.get("momentum_5d", 0) or 0)
+                _m20 = float(latest.get("momentum_20d", 0) or 0)
+                _ma50 = float(latest.get("price_vs_ma50", 0) or 0)
+                _rsi = float(latest.get("rsi_14", 50) or 50)
+                momentum_score = (
+                    0.4 * _m5 + 0.3 * _m20 + 0.2 * _ma50 + 0.1 * (_rsi - 50) / 100
+                )
             except Exception:
                 pass
 
