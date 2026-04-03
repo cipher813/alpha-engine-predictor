@@ -316,7 +316,7 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
         sector_modifier = 0.0
         sig = research_signals.get(ticker)
         if sig:
-            raw_score = sig.get("score", 50)
+            raw_score = sig.get("score") or 50
             research_score_norm = raw_score / 100.0
             conv = sig.get("conviction", "stable")
             research_conviction = {"rising": 1.0, "stable": 0.0, "declining": -1.0}.get(conv, 0.0)
