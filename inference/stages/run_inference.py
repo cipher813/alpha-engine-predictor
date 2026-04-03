@@ -226,6 +226,7 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
     # ── Step 2: Load research signals for calibrator ─────────────────────────
     # Read signals.json for composite scores and conviction.
     # Research runs weekly (Saturday), so search backward up to 7 days.
+    import json
     research_signals = {}
     try:
         import boto3 as _b3_sig
@@ -254,8 +255,6 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
             log.info("No research signals available for calibrator (searched 8 days)")
     except Exception as e:
         log.warning("Research signal loading failed: %s", e)
-
-    import json
 
     # ── Step 3: Per-ticker feature computation + Layer 1 inference ────────────
     max_r = getattr(cfg, "LABEL_CLIP", 0.15)
