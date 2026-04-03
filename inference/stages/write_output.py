@@ -577,19 +577,7 @@ def send_predictor_email(
         log.warning("Failed to build predictor email body: %s", exc)
         return False
 
-    # Archive morning briefing HTML to S3
-    try:
-        import boto3 as _boto3_arch
-        _s3_arch = _boto3_arch.client("s3")
-        _s3_arch.put_object(
-            Bucket=cfg.S3_BUCKET,
-            Key=f"consolidated/{date_str}/morning_brief.html",
-            Body=html_body.encode("utf-8"),
-            ContentType="text/html",
-        )
-        log.info("Morning briefing archived: consolidated/%s/morning_brief.html", date_str)
-    except Exception as _ae:
-        log.warning("Morning briefing archival failed (non-fatal): %s", _ae)
+    # Morning briefing HTML archival removed — no consumers read it (email delivers the content).
 
     app_password = os.environ.get("GMAIL_APP_PASSWORD", "").strip()
 
