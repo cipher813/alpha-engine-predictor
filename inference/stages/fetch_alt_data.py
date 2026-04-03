@@ -43,20 +43,34 @@ def run(ctx: PipelineContext) -> None:
     except Exception as exc:
         log.warning("O12: Options features fetch failed (features will use defaults): %s", exc)
 
-    # Fundamentals
+    # Fundamentals — read from S3 cache (written weekly by DataPhase1)
     try:
-        from feature_store.fundamental_fetcher import (
-            fetch_fundamental_data, cache_fundamentals_to_s3, load_fundamentals_from_s3,
-        )
-        ctx.fundamental_all = load_fundamentals_from_s3(ctx.date_str, ctx.bucket) or {}
-        if ctx.fundamental_all:
-            log.info("Fundamentals: Loaded cached data for %d tickers from S3", len(ctx.fundamental_all))
+        import boto3, json
+        _s3_fund = boto3.client("s3")
+        # Try today's date, then scan for most recent
+        _fund_data = None
+        for _fund_key in [f"archive/fundamentals/{ctx.date_str}.json"]:
+            try:
+                _obj = _s3_fund.get_object(Bucket=ctx.bucket, Key=_fund_key)
+                _fund_data = json.loads(_obj["Body"].read())
+                break
+            except Exception:
+                pass
+        if not _fund_data:
+            # Scan for most recent
+            _resp = _s3_fund.list_objects_v2(Bucket=ctx.bucket, Prefix="archive/fundamentals/", MaxKeys=100)
+            _keys = sorted([c["Key"] for c in _resp.get("Contents", []) if c["Key"].endswith(".json")], reverse=True)
+            if _keys:
+                _obj = _s3_fund.get_object(Bucket=ctx.bucket, Key=_keys[0])
+                _fund_data = json.loads(_obj["Body"].read())
+                log.info("Fundamentals: Using cached data from %s", _keys[0])
+        if _fund_data:
+            ctx.fundamental_all = _fund_data
+            log.info("Fundamentals: Loaded cached data for %d tickers from S3", len(_fund_data))
         else:
-            ctx.fundamental_all = fetch_fundamental_data(ctx.tickers)
-            cache_fundamentals_to_s3(ctx.fundamental_all, ctx.date_str, ctx.bucket)
-            log.info("Fundamentals: Fetched data for %d tickers from FMP", len(ctx.fundamental_all))
+            log.info("Fundamentals: No cached data found — features will use defaults")
     except Exception as exc:
-        log.warning("Fundamentals: Fetch failed (features will use defaults): %s", exc)
+        log.warning("Fundamentals: S3 load failed (features will use defaults): %s", exc)
 
     # Aggregate alert
     _alt_data_sources = {

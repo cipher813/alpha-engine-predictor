@@ -1912,14 +1912,7 @@ def main(
     # The data repo writes price_cache_slim/ from the full cache after refresh.
     log.info("Slim cache write: skipped (handled by alpha-engine-data)")
 
-    # Step 2c: Feature store — upload registry (best-effort, non-blocking)
-    import config as _fs_cfg
-    if _fs_cfg.FEATURE_STORE_ENABLED and _fs_cfg.FEATURE_STORE_WRITE_ON_TRAINING and not dry_run:
-        try:
-            from feature_store.registry import upload_registry
-            upload_registry(bucket, prefix=_fs_cfg.FEATURE_STORE_PREFIX)
-        except Exception as _fs_exc:
-            log.warning("Feature store registry upload failed (non-fatal): %s", _fs_exc)
+    # Feature store registry upload removed — alpha-engine-data handles this now.
 
     # Step 2d: Write training summary to S3 (works for all modes)
     if not dry_run:

@@ -269,13 +269,9 @@ META_MANIFEST_KEY = "predictor/weights/meta/manifest.json"
 # ── Feature engineering parameters ───────────────────────────────────────────
 FEATURE_CFG: dict = _cfg["features"]
 
-# ── Feature Store ────────────────────────────────────────────────────────────
+# ── Feature Store (read-only — writes handled by alpha-engine-data) ──────────
 _fs_store_cfg = _cfg.get("feature_store", {})
-FEATURE_STORE_ENABLED = _fs_store_cfg.get("enabled", False)
 FEATURE_STORE_PREFIX = _fs_store_cfg.get("prefix", "features/")
-FEATURE_STORE_WRITE_ON_INFERENCE = False  # alpha-engine-data/features/compute.py handles writes
-FEATURE_STORE_WRITE_ON_TRAINING = False   # alpha-engine-data/features/compute.py handles writes
-FEATURE_STORE_FULL_UNIVERSE = _fs_store_cfg.get("full_universe", True)
 FEATURE_STORE_READ_ON_INFERENCE = _fs_store_cfg.get("read_on_inference", True)
 
 # Fundamental features (v3.0 — quarterly FMP data)

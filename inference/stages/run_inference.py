@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import logging
 from typing import Optional
 
@@ -252,19 +253,20 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
     precomputed: dict[str, pd.Series] = {}
     if getattr(cfg, "FEATURE_STORE_READ_ON_INFERENCE", False):
         try:
-            from feature_store.reader import read_feature_snapshot
             import boto3 as _b3_fs
             _s3_fs = _b3_fs.client("s3")
-            _tech_df = read_feature_snapshot(
-                ctx.date_str, "technical", ctx.bucket,
-                prefix=cfg.FEATURE_STORE_PREFIX, s3_client=_s3_fs,
-            )
+
+            def _read_snapshot(group: str) -> pd.DataFrame | None:
+                try:
+                    _key = f"{cfg.FEATURE_STORE_PREFIX}{ctx.date_str}/{group}.parquet"
+                    _obj = _s3_fs.get_object(Bucket=ctx.bucket, Key=_key)
+                    return pd.read_parquet(io.BytesIO(_obj["Body"].read()))
+                except Exception:
+                    return None
+
+            _tech_df = _read_snapshot("technical")
             if _tech_df is not None and "ticker" in _tech_df.columns:
-                # Also load interaction features (contain sector × trend cross-products)
-                _int_df = read_feature_snapshot(
-                    ctx.date_str, "interaction", ctx.bucket,
-                    prefix=cfg.FEATURE_STORE_PREFIX, s3_client=_s3_fs,
-                )
+                _int_df = _read_snapshot("interaction")
                 for _, row in _tech_df.iterrows():
                     t = row["ticker"]
                     precomputed[t] = row
