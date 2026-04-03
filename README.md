@@ -355,6 +355,12 @@ Key cross-asset opportunities:
 
 ---
 
+## Future Opportunities
+
+- **Shadow model infrastructure:** Run two model versions simultaneously during inference. Write both predictions to S3 (`predictions/{date}.json` with `shadow_predictions` field). Dashboard shows comparison. Promote new model only when shadow outperforms for 4+ weeks. Pre-requisite: meta-model v3.0 needs several weeks of production runtime before building comparison infrastructure.
+
+---
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

@@ -517,9 +517,76 @@ def _run_gbm_inference(ctx: PipelineContext) -> None:
 
     ctx.gbm_feature_cols = gbm_feature_cols
 
-    # Compute features per ticker
+    # ── Load pre-computed features from S3 feature store ──────────────────
+    precomputed_gbm: dict[str, pd.Series] = {}
+    try:
+        import boto3 as _b3_gbm
+        _s3_gbm = _b3_gbm.client("s3")
+
+        def _read_gbm_snapshot(group: str) -> pd.DataFrame | None:
+            try:
+                _key = f"{cfg.FEATURE_STORE_PREFIX}{ctx.date_str}/{group}.parquet"
+                _obj = _s3_gbm.get_object(Bucket=ctx.bucket, Key=_key)
+                return pd.read_parquet(io.BytesIO(_obj["Body"].read()))
+            except Exception:
+                return None
+
+        _tech_gbm = _read_gbm_snapshot("technical")
+        if _tech_gbm is not None and "ticker" in _tech_gbm.columns:
+            _int_gbm = _read_gbm_snapshot("interaction")
+            for _, row in _tech_gbm.iterrows():
+                t = row["ticker"]
+                precomputed_gbm[t] = row
+            if _int_gbm is not None and "ticker" in _int_gbm.columns:
+                _int_by_t = {r["ticker"]: r for _, r in _int_gbm.iterrows()}
+                for t, row in precomputed_gbm.items():
+                    if t in _int_by_t:
+                        for col in _int_by_t[t].index:
+                            if col != "ticker" and col not in row.index:
+                                row[col] = _int_by_t[t][col]
+            log.info(
+                "GBM feature store: loaded %d pre-computed tickers for %s",
+                len(precomputed_gbm), ctx.date_str,
+            )
+        else:
+            log.warning(
+                "GBM feature store snapshot missing for %s — falling back to inline compute",
+                ctx.date_str,
+            )
+    except Exception as _fs_gbm_exc:
+        log.warning("GBM feature store read failed — falling back to inline: %s", _fs_gbm_exc)
+
+    # ── Compute features per ticker (feature store preferred, inline fallback) ──
     raw_vectors: dict[str, np.ndarray] = {}
+    _n_from_store = 0
+    _n_from_inline = 0
     for ticker in ctx.tickers:
+        # Try pre-computed features first
+        if ticker in precomputed_gbm:
+            row = precomputed_gbm[ticker]
+            try:
+                raw_vectors[ticker] = row[gbm_feature_cols].to_numpy(dtype=np.float32)
+                _n_from_store += 1
+                # Feature store row for output
+                try:
+                    sr = {"ticker": ticker}
+                    for f in cfg.FEATURES:
+                        sr[f] = float(row[f]) if f in row.index else 0.0
+                    ctx.store_rows.append(sr)
+                except Exception:
+                    pass
+                if _n_from_store == 1:
+                    _fv = raw_vectors[ticker]
+                    log.info(
+                        "Feature debug (store) %s: rsi=%.4f macd_cross=%.4f mom20d=%.4f hash=%s",
+                        ticker, float(_fv[0]), float(_fv[1]), float(_fv[6]),
+                        hash(_fv.tobytes()),
+                    )
+                continue
+            except KeyError:
+                pass  # Fall through to inline compute
+
+        # Inline fallback
         df = ctx.price_data.get(ticker, pd.DataFrame())
         if df.empty or len(df) < cfg.MIN_ROWS_FOR_FEATURES:
             ctx.n_skipped += 1
@@ -552,14 +619,15 @@ def _run_gbm_inference(ctx: PipelineContext) -> None:
         latest = featured_df.iloc[-1]
         try:
             raw_vectors[ticker] = latest[gbm_feature_cols].to_numpy(dtype=np.float32)
+            _n_from_inline += 1
         except KeyError:
             ctx.n_skipped += 1
             continue
-        # Debug: log first ticker
-        if len(raw_vectors) == 1:
+        # Debug: log first inline ticker
+        if _n_from_inline == 1:
             _fv = raw_vectors[ticker]
             log.info(
-                "Feature debug %s: last_date=%s rsi=%.4f macd_cross=%.4f mom20d=%.4f hash=%s",
+                "Feature debug (inline) %s: last_date=%s rsi=%.4f macd_cross=%.4f mom20d=%.4f hash=%s",
                 ticker, featured_df.index[-1].date(),
                 float(_fv[0]), float(_fv[1]), float(_fv[6]),
                 hash(_fv.tobytes()),
@@ -572,6 +640,11 @@ def _run_gbm_inference(ctx: PipelineContext) -> None:
             ctx.store_rows.append(row)
         except Exception:
             pass
+
+    log.info(
+        "GBM features: %d from store, %d from inline, %d skipped",
+        _n_from_store, _n_from_inline, ctx.n_skipped,
+    )
 
     if not raw_vectors:
         return

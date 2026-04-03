@@ -638,6 +638,17 @@ def run_gbm_training(
 
     start_ts = datetime.now(timezone.utc)
 
+    # Capture git commit hash for experiment tracking
+    _code_commit = None
+    try:
+        import subprocess as _sp
+        _code_commit = _sp.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip() or None
+    except Exception:
+        pass
+
     # ── Build arrays (no PyTorch dependency) ──────────────────────────────────
     log.info("Building regression arrays from %s ...", data_dir)
     X_all, fwd_all, all_dates = build_regression_arrays(
@@ -1211,9 +1222,11 @@ def run_gbm_training(
             training_summary = {
                 "date": date_str,
                 "model_version": model_version,
+                "code_commit": _code_commit,
                 "promoted": promoted,
                 "promoted_mode": best_mode if promoted else None,
                 "elapsed_s": round(elapsed_s, 1),
+                "hyperparameters": getattr(cfg, "GBM_TUNED_PARAMS", None),
                 "n_train": int(len(y_train)),
                 "n_val": int(len(y_val)),
                 "n_test": int(len(y_test)),
@@ -1273,8 +1286,60 @@ def run_gbm_training(
                 ContentType="application/json",
             )
             log.info("Training summary written to S3 (dated + latest)")
+
+            # Append to training history log (JSONL — one line per run)
+            try:
+                _history_entry = json.dumps({
+                    "date": date_str,
+                    "promoted": promoted,
+                    "test_ic": round(float(test_ic), 6),
+                    "ensemble_ic": round(float(ensemble_ic), 6) if rank_scorer is not None else None,
+                    "test_hit_rate": round(test_hit_rate, 4),
+                    "elapsed_s": round(elapsed_s, 1),
+                    "code_commit": _code_commit,
+                    "model_version": model_version,
+                }, default=str) + "\n"
+                _history_key = "predictor/training_logs/history.jsonl"
+                _existing = b""
+                try:
+                    _existing = _s3_sum.get_object(Bucket=bucket, Key=_history_key)["Body"].read()
+                except Exception:
+                    pass  # First run — no history yet
+                _s3_sum.put_object(
+                    Bucket=bucket,
+                    Key=_history_key,
+                    Body=_existing + _history_entry.encode(),
+                    ContentType="application/jsonlines",
+                )
+                log.info("Training history appended to %s", _history_key)
+            except Exception as _hist_err:
+                log.warning("Training history append failed (non-blocking): %s", _hist_err)
         except Exception as _sum_err:
             log.warning("Training summary write failed (non-blocking): %s", _sum_err)
+
+    # ── Write training feature stats for drift detection ───────────────────
+    if not dry_run:
+        try:
+            import boto3 as _boto3_stats
+            _s3_stats = _boto3_stats.client("s3")
+            _feat_means = X_train.mean(axis=0).tolist()
+            _feat_stds = X_train.std(axis=0).tolist()
+            _feat_stats = {
+                "date": date_str,
+                "features": list(cfg.GBM_FEATURES),
+                "mean": _feat_means,
+                "std": _feat_stds,
+                "n_train_samples": int(len(y_train)),
+            }
+            _s3_stats.put_object(
+                Bucket=bucket,
+                Key="predictor/metrics/training_feature_stats.json",
+                Body=json.dumps(_feat_stats, indent=2).encode(),
+                ContentType="application/json",
+            )
+            log.info("Training feature stats written for drift detection")
+        except Exception as _fs_err:
+            log.warning("Training feature stats write failed (non-blocking): %s", _fs_err)
 
     result = {
         "model_version":         model_version,
