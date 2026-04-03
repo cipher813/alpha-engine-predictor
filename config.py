@@ -273,8 +273,8 @@ FEATURE_CFG: dict = _cfg["features"]
 _fs_store_cfg = _cfg.get("feature_store", {})
 FEATURE_STORE_ENABLED = _fs_store_cfg.get("enabled", False)
 FEATURE_STORE_PREFIX = _fs_store_cfg.get("prefix", "features/")
-FEATURE_STORE_WRITE_ON_INFERENCE = False  # Standalone compute.py handles writes now
-FEATURE_STORE_WRITE_ON_TRAINING = _fs_store_cfg.get("write_on_training", True)
+FEATURE_STORE_WRITE_ON_INFERENCE = False  # alpha-engine-data/features/compute.py handles writes
+FEATURE_STORE_WRITE_ON_TRAINING = False   # alpha-engine-data/features/compute.py handles writes
 FEATURE_STORE_FULL_UNIVERSE = _fs_store_cfg.get("full_universe", True)
 FEATURE_STORE_READ_ON_INFERENCE = _fs_store_cfg.get("read_on_inference", True)
 
