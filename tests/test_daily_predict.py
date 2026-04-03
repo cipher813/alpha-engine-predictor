@@ -194,7 +194,7 @@ class TestBuildPredictorEmail:
 class TestGetVetoThreshold:
     """Tests for get_veto_threshold() — regime-adaptive veto threshold."""
 
-    @patch("inference.daily_predict._load_predictor_params_from_s3")
+    @patch("inference.stages.write_output._load_predictor_params_from_s3")
     def test_base_threshold_from_s3(self, mock_load):
         """Should use veto_confidence from S3 params when available."""
         from inference.daily_predict import get_veto_threshold
@@ -203,7 +203,7 @@ class TestGetVetoThreshold:
         result = get_veto_threshold("test-bucket", "neutral")
         assert result == 0.65
 
-    @patch("inference.daily_predict._load_predictor_params_from_s3")
+    @patch("inference.stages.write_output._load_predictor_params_from_s3")
     def test_fallback_to_config(self, mock_load):
         """Should fall back to cfg.MIN_CONFIDENCE when S3 params are None."""
         from inference.daily_predict import get_veto_threshold
@@ -213,7 +213,7 @@ class TestGetVetoThreshold:
         result = get_veto_threshold("test-bucket", "neutral")
         assert result == cfg.MIN_CONFIDENCE
 
-    @patch("inference.daily_predict._load_predictor_params_from_s3")
+    @patch("inference.stages.write_output._load_predictor_params_from_s3")
     def test_bear_regime_lowers_threshold(self, mock_load):
         """Bear regime should lower the threshold by 0.10."""
         from inference.daily_predict import get_veto_threshold
@@ -222,7 +222,7 @@ class TestGetVetoThreshold:
         result = get_veto_threshold("test-bucket", "bear")
         assert result == pytest.approx(0.55)
 
-    @patch("inference.daily_predict._load_predictor_params_from_s3")
+    @patch("inference.stages.write_output._load_predictor_params_from_s3")
     def test_bullish_regime_raises_threshold(self, mock_load):
         """Bullish regime should raise the threshold by 0.05."""
         from inference.daily_predict import get_veto_threshold
@@ -231,7 +231,7 @@ class TestGetVetoThreshold:
         result = get_veto_threshold("test-bucket", "bullish")
         assert result == pytest.approx(0.70)
 
-    @patch("inference.daily_predict._load_predictor_params_from_s3")
+    @patch("inference.stages.write_output._load_predictor_params_from_s3")
     def test_caution_regime(self, mock_load):
         """Caution regime should lower threshold by 0.05."""
         from inference.daily_predict import get_veto_threshold
@@ -240,7 +240,7 @@ class TestGetVetoThreshold:
         result = get_veto_threshold("test-bucket", "caution")
         assert result == pytest.approx(0.60)
 
-    @patch("inference.daily_predict._load_predictor_params_from_s3")
+    @patch("inference.stages.write_output._load_predictor_params_from_s3")
     def test_threshold_clamped_floor(self, mock_load):
         """Threshold should not go below 0.40 even with bear adjustment."""
         from inference.daily_predict import get_veto_threshold
@@ -249,7 +249,7 @@ class TestGetVetoThreshold:
         result = get_veto_threshold("test-bucket", "bear")
         assert result == 0.40
 
-    @patch("inference.daily_predict._load_predictor_params_from_s3")
+    @patch("inference.stages.write_output._load_predictor_params_from_s3")
     def test_threshold_clamped_ceiling(self, mock_load):
         """Threshold should not exceed 0.90 even with bullish adjustment."""
         from inference.daily_predict import get_veto_threshold
@@ -258,7 +258,7 @@ class TestGetVetoThreshold:
         result = get_veto_threshold("test-bucket", "bullish")
         assert result == 0.90
 
-    @patch("inference.daily_predict._load_predictor_params_from_s3")
+    @patch("inference.stages.write_output._load_predictor_params_from_s3")
     def test_empty_regime_string(self, mock_load):
         """Empty regime string should apply no adjustment."""
         from inference.daily_predict import get_veto_threshold
@@ -267,7 +267,7 @@ class TestGetVetoThreshold:
         result = get_veto_threshold("test-bucket", "")
         assert result == 0.65
 
-    @patch("inference.daily_predict._load_predictor_params_from_s3")
+    @patch("inference.stages.write_output._load_predictor_params_from_s3")
     def test_unknown_regime_no_adjustment(self, mock_load):
         """Unknown regime should apply no adjustment."""
         from inference.daily_predict import get_veto_threshold

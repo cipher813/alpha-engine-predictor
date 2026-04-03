@@ -1,6 +1,6 @@
 # Core inference dependencies (Lambda zip deployment)
 numpy>=1.24.0,<2
-pandas>=2.0.0
+pandas>=2.0.0,<3
 yfinance>=0.2.30
 boto3>=1.26.0
 scipy>=1.10.0

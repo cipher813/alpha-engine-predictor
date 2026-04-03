@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import tempfile
 from pathlib import Path
 
 import config as cfg
@@ -12,11 +13,119 @@ from inference.pipeline import PipelineContext
 log = logging.getLogger(__name__)
 
 
+# ── Model loading functions (migrated from daily_predict.py) ─────────────────
+
+def load_model(
+    s3_bucket: str,
+    weights_key: str,
+    device: str = "cpu",
+) -> tuple:
+    """
+    Download model weights from S3 to /tmp and load the checkpoint.
+
+    Parameters
+    ----------
+    s3_bucket :   S3 bucket name.
+    weights_key : S3 key for the weights file (e.g. predictor/weights/latest.pt).
+    device :      Torch device string.
+
+    Returns
+    -------
+    (model, checkpoint_dict)
+    """
+    from model.predictor import load_checkpoint
+
+    try:
+        import boto3
+        s3 = boto3.client("s3")
+        local_path = Path(tempfile.mkdtemp()) / "model_weights.pt"
+        log.info("Downloading model weights from s3://%s/%s", s3_bucket, weights_key)
+        s3.download_file(s3_bucket, weights_key, str(local_path))
+        log.info("Downloaded to %s", local_path)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to download model weights from s3://{s3_bucket}/{weights_key}: {exc}"
+        ) from exc
+
+    model, checkpoint = load_checkpoint(str(local_path), device=device)
+    log.info(
+        "Model loaded: version=%s  epoch=%d  val_loss=%.4f",
+        checkpoint.get("model_version", "unknown"),
+        checkpoint.get("epoch", -1),
+        checkpoint.get("val_loss", float("nan")),
+    )
+    return model, checkpoint
+
+
+def load_model_local(
+    path: str = "checkpoints/best.pt",
+    device: str = "cpu",
+) -> tuple:
+    """Load model weights from a local file path."""
+    from model.predictor import load_checkpoint
+    model, checkpoint = load_checkpoint(path, device=device)
+    log.info(
+        "Model loaded (local): version=%s  epoch=%d",
+        checkpoint.get("model_version", "unknown"),
+        checkpoint.get("epoch", -1),
+    )
+    return model, checkpoint
+
+
+def load_gbm_local(path: str = "checkpoints/gbm_best.txt"):
+    """Load GBMScorer from a local file path."""
+    from model.gbm_scorer import GBMScorer
+    scorer = GBMScorer.load(path)
+    log.info(
+        "GBMScorer loaded (local): val_IC=%.4f  best_iter=%d",
+        scorer._val_ic, scorer._best_iteration,
+    )
+    return scorer
+
+
+def load_gbm_s3(s3_bucket: str, weights_key: str):
+    """
+    Download GBM booster + meta from S3 to /tmp and load.
+
+    Parameters
+    ----------
+    s3_bucket :   S3 bucket name.
+    weights_key : S3 key for the booster text file (e.g. predictor/weights/gbm_latest.txt).
+
+    Returns
+    -------
+    GBMScorer instance with booster loaded.
+    """
+    from model.gbm_scorer import GBMScorer
+    try:
+        import boto3
+        s3 = boto3.client("s3")
+        tmp_dir = Path(tempfile.mkdtemp())
+        local_path = tmp_dir / "gbm_model.txt"
+        meta_path  = tmp_dir / "gbm_model.txt.meta.json"
+        log.info("Downloading GBM booster from s3://%s/%s", s3_bucket, weights_key)
+        s3.download_file(s3_bucket, weights_key, str(local_path))
+        # Meta file is best-effort — GBMScorer.load() handles its absence gracefully
+        try:
+            s3.download_file(s3_bucket, weights_key + ".meta.json", str(meta_path))
+        except Exception:
+            pass
+        scorer = GBMScorer.load(str(local_path))
+        log.info(
+            "GBMScorer loaded from S3: val_IC=%.4f  best_iter=%d",
+            scorer._val_ic, scorer._best_iteration,
+        )
+        return scorer
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to download GBM booster from s3://{s3_bucket}/{weights_key}: {exc}"
+        ) from exc
+
+
+# ── Stage entry point ────────────────────────────────────────────────────────
+
 def run(ctx: PipelineContext) -> None:
     """Load model weights from S3 or local checkpoint."""
-    from inference.daily_predict import (
-        load_gbm_local, load_gbm_s3, load_model, load_model_local,
-    )
 
     if getattr(cfg, "META_MODEL_ENABLED", False) and ctx.model_type == "gbm":
         _load_meta_models(ctx)
@@ -29,8 +138,6 @@ def run(ctx: PipelineContext) -> None:
 
 
 def _load_gbm(ctx: PipelineContext) -> None:
-    from inference.daily_predict import load_gbm_local, load_gbm_s3
-
     # Determine inference mode from gbm_mode.json
     ctx.inference_mode = "mse"
     if getattr(cfg, "GBM_ENSEMBLE_LAMBDARANK", True):
@@ -144,10 +251,8 @@ def _load_gbm(ctx: PipelineContext) -> None:
                 if ctx.local:
                     _h_path = Path(f"checkpoints/gbm_mse_{h}d_best.txt")
                     if _h_path.exists():
-                        from inference.daily_predict import load_gbm_local
                         ctx.horizon_scorers[h] = load_gbm_local(str(_h_path))
                 else:
-                    from inference.daily_predict import load_gbm_s3
                     ctx.horizon_scorers[h] = load_gbm_s3(ctx.bucket, _h_key)
                 log.info("Loaded %dd horizon model", h)
             except Exception as exc:
@@ -270,8 +375,6 @@ def _load_meta_models(ctx: PipelineContext) -> None:
 
 
 def _load_mlp(ctx: PipelineContext) -> None:
-    from inference.daily_predict import load_model, load_model_local
-
     if ctx.local:
         ctx.model, ctx.checkpoint = load_model_local("checkpoints/best.pt")
     else:

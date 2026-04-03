@@ -5,6 +5,8 @@ Each module writes a health JSON to S3 after every run. Downstream modules
 can check upstream health to detect stale or failed dependencies.
 """
 
+from __future__ import annotations
+
 import json
 import logging
 from datetime import datetime, timezone
