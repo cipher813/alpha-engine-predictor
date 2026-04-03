@@ -172,10 +172,14 @@ aws lambda create-alias \
 echo ""
 echo "==> Running canary invocation (dry_run=true)..."
 CANARY_OUT=$(mktemp)
+# Container images have slow cold starts (~30-90s). Set CLI read timeout
+# high enough to avoid false failures. Lambda's own timeout (900s) governs
+# actual execution; this just prevents the CLI from giving up early.
 aws lambda invoke \
   --function-name "${LAMBDA_FUNCTION}:live" \
   --payload '{"dry_run": true}' \
   --cli-binary-format raw-in-base64-out \
+  --cli-read-timeout 300 \
   --region "${AWS_REGION}" \
   "$CANARY_OUT" > /dev/null
 
