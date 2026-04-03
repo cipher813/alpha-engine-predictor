@@ -160,23 +160,8 @@ def run(ctx: PipelineContext) -> None:
     # Sort by combined_rank (ascending = best first), fall back to mse_rank
     ctx.predictions.sort(key=lambda p: p.get("combined_rank") or p.get("mse_rank") or 999)
 
-    # ── Feature store: expand to full universe ───────────────────────────────
-    if (cfg.FEATURE_STORE_ENABLED and cfg.FEATURE_STORE_FULL_UNIVERSE
-            and cfg.FEATURE_STORE_WRITE_ON_INFERENCE
-            and ctx.model_type == "gbm" and not ctx.near_timeout()):
-        _expand_feature_store(ctx)
-
-    # Write feature store snapshot
-    if cfg.FEATURE_STORE_ENABLED and cfg.FEATURE_STORE_WRITE_ON_INFERENCE and ctx.store_rows:
-        try:
-            from feature_store.writer import write_feature_snapshot
-            from feature_store.registry import upload_registry
-
-            _fs_df = pd.DataFrame(ctx.store_rows)
-            write_feature_snapshot(ctx.date_str, _fs_df, ctx.bucket, prefix=cfg.FEATURE_STORE_PREFIX)
-            upload_registry(ctx.bucket, prefix=cfg.FEATURE_STORE_PREFIX)
-        except Exception as _fs_exc:
-            log.warning("Feature store write failed (non-fatal): %s", _fs_exc)
+    # Feature store writes removed — standalone compute.py handles this now.
+    # See feature_store/compute.py and alpha-engine-data-feature-store-260402.md
 
 
 def _run_meta_inference(ctx: PipelineContext) -> None:
@@ -260,40 +245,82 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
     except Exception as e:
         log.warning("Research signal loading failed: %s", e)
 
-    # ── Step 3: Per-ticker feature computation + Layer 1 inference ────────────
+    # ── Step 3: Load pre-computed features or compute inline ──────────────────
     max_r = getattr(cfg, "LABEL_CLIP", 0.15)
 
-    for ticker in ctx.tickers:
-        df = ctx.price_data.get(ticker, pd.DataFrame())
-        if df.empty or len(df) < cfg.MIN_ROWS_FOR_FEATURES:
-            ctx.n_skipped += 1
-            continue
-
-        sector_etf_sym = ctx.sector_map.get(ticker)
-        sector_etf_series = ctx.macro.get(sector_etf_sym) if sector_etf_sym else None
-
+    # Try reading pre-computed features from S3 feature store
+    precomputed: dict[str, pd.Series] = {}
+    if getattr(cfg, "FEATURE_STORE_READ_ON_INFERENCE", False):
         try:
-            featured_df = _compute_features(
-                df,
-                spy_series=ctx.macro.get("SPY") if ctx.macro else None,
-                vix_series=ctx.macro.get("VIX") if ctx.macro else None,
-                sector_etf_series=sector_etf_series,
-                tnx_series=ctx.macro.get("TNX") if ctx.macro else None,
-                irx_series=ctx.macro.get("IRX") if ctx.macro else None,
-                gld_series=ctx.macro.get("GLD") if ctx.macro else None,
-                uso_series=ctx.macro.get("USO") if ctx.macro else None,
-                vix3m_series=ctx.macro.get("VIX3M") if ctx.macro else None,
+            from feature_store.reader import read_feature_snapshot
+            import boto3 as _b3_fs
+            _s3_fs = _b3_fs.client("s3")
+            _tech_df = read_feature_snapshot(
+                ctx.date_str, "technical", ctx.bucket,
+                prefix=cfg.FEATURE_STORE_PREFIX, s3_client=_s3_fs,
             )
-        except Exception as exc:
-            log.warning("Feature computation failed for %s: %s", ticker, exc)
-            ctx.n_skipped += 1
-            continue
+            if _tech_df is not None and "ticker" in _tech_df.columns:
+                # Also load interaction features (contain sector × trend cross-products)
+                _int_df = read_feature_snapshot(
+                    ctx.date_str, "interaction", ctx.bucket,
+                    prefix=cfg.FEATURE_STORE_PREFIX, s3_client=_s3_fs,
+                )
+                for _, row in _tech_df.iterrows():
+                    t = row["ticker"]
+                    precomputed[t] = row
+                # Merge interaction features into precomputed rows
+                if _int_df is not None and "ticker" in _int_df.columns:
+                    _int_by_ticker = {r["ticker"]: r for _, r in _int_df.iterrows()}
+                    for t, row in precomputed.items():
+                        if t in _int_by_ticker:
+                            for col in _int_by_ticker[t].index:
+                                if col != "ticker" and col not in row.index:
+                                    row[col] = _int_by_ticker[t][col]
+                log.info(
+                    "Feature store: loaded %d pre-computed tickers for %s",
+                    len(precomputed), ctx.date_str,
+                )
+            else:
+                log.info("Feature store: no snapshot for %s — using inline compute", ctx.date_str)
+        except Exception as _fs_exc:
+            log.info("Feature store read failed — using inline compute: %s", _fs_exc)
 
-        if featured_df.empty:
-            ctx.n_skipped += 1
-            continue
+    for ticker in ctx.tickers:
+        # Use pre-computed features if available, else compute inline
+        latest = None
+        if ticker in precomputed:
+            latest = precomputed[ticker]
+        else:
+            df = ctx.price_data.get(ticker, pd.DataFrame())
+            if df.empty or len(df) < cfg.MIN_ROWS_FOR_FEATURES:
+                ctx.n_skipped += 1
+                continue
 
-        latest = featured_df.iloc[-1]
+            sector_etf_sym = ctx.sector_map.get(ticker)
+            sector_etf_series = ctx.macro.get(sector_etf_sym) if sector_etf_sym else None
+
+            try:
+                featured_df = _compute_features(
+                    df,
+                    spy_series=ctx.macro.get("SPY") if ctx.macro else None,
+                    vix_series=ctx.macro.get("VIX") if ctx.macro else None,
+                    sector_etf_series=sector_etf_series,
+                    tnx_series=ctx.macro.get("TNX") if ctx.macro else None,
+                    irx_series=ctx.macro.get("IRX") if ctx.macro else None,
+                    gld_series=ctx.macro.get("GLD") if ctx.macro else None,
+                    uso_series=ctx.macro.get("USO") if ctx.macro else None,
+                    vix3m_series=ctx.macro.get("VIX3M") if ctx.macro else None,
+                )
+            except Exception as exc:
+                log.warning("Feature computation failed for %s: %s", ticker, exc)
+                ctx.n_skipped += 1
+                continue
+
+            if featured_df.empty:
+                ctx.n_skipped += 1
+                continue
+
+            latest = featured_df.iloc[-1]
 
         # Layer 1A: Momentum model
         # If the momentum GBM has low quality (IC < 0.02 or best_iter <= 1),
@@ -758,62 +785,4 @@ def _run_mlp_inference(ctx: PipelineContext) -> None:
             ctx.n_skipped += 1
 
 
-def _expand_feature_store(ctx: PipelineContext) -> None:
-    """Compute technical features for non-watchlist tickers in the slim cache."""
-    try:
-        from data.feature_engineer import compute_features as _fs_compute
-
-        _watchlist_set = set(ctx.tickers)
-        _skip_set = {"SPY", "^VIX", "^VIX3M", "^TNX", "^IRX", "GLD", "USO", "VIX3M"}
-        _skip_set.update(s for s in ctx.price_data if s.startswith("XL"))
-
-        _universe_tickers = [
-            t for t in ctx.price_data
-            if t not in _watchlist_set and t not in _skip_set
-            and ctx.price_data[t] is not None and len(ctx.price_data[t]) >= cfg.MIN_ROWS_FOR_FEATURES
-        ]
-        _n_universe = len(_universe_tickers)
-
-        if _n_universe > 0:
-            log.info("Feature store universe expansion: %d non-watchlist tickers", _n_universe)
-            _fs_spy = ctx.macro.get("SPY") if ctx.macro else None
-            _fs_vix = ctx.macro.get("VIX") if ctx.macro else None
-            _fs_tnx = ctx.macro.get("TNX") if ctx.macro else None
-            _fs_irx = ctx.macro.get("IRX") if ctx.macro else None
-            _fs_gld = ctx.macro.get("GLD") if ctx.macro else None
-            _fs_uso = ctx.macro.get("USO") if ctx.macro else None
-            _fs_vix3m = ctx.macro.get("VIX3M") if ctx.macro else None
-
-            _fs_ok = 0
-            _fs_err = 0
-            for _fs_ticker in _universe_tickers:
-                if ctx.near_timeout():
-                    log.warning("Soft timeout during universe expansion — wrote %d/%d", _fs_ok, _n_universe)
-                    break
-                try:
-                    _fs_etf_sym = ctx.sector_map.get(_fs_ticker)
-                    _fs_etf_series = ctx.macro.get(_fs_etf_sym) if _fs_etf_sym else None
-                    _fs_featured = _fs_compute(
-                        ctx.price_data[_fs_ticker],
-                        spy_series=_fs_spy, vix_series=_fs_vix,
-                        sector_etf_series=_fs_etf_series,
-                        tnx_series=_fs_tnx, irx_series=_fs_irx,
-                        gld_series=_fs_gld, uso_series=_fs_uso,
-                        vix3m_series=_fs_vix3m,
-                    )
-                    if not _fs_featured.empty:
-                        _fs_latest = _fs_featured.iloc[-1]
-                        _fs_row = {"ticker": _fs_ticker}
-                        for f in cfg.FEATURES:
-                            _fs_row[f] = float(_fs_latest[f]) if f in _fs_latest.index else 0.0
-                        ctx.store_rows.append(_fs_row)
-                        _fs_ok += 1
-                except Exception:
-                    _fs_err += 1
-
-            log.info(
-                "Feature store universe expansion: %d OK, %d errors, %d total store rows",
-                _fs_ok, _fs_err, len(ctx.store_rows),
-            )
-    except Exception as _fs_univ_exc:
-        log.warning("Feature store universe expansion failed (non-fatal): %s", _fs_univ_exc)
+    # _expand_feature_store removed — standalone compute.py handles full-universe features.
