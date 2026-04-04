@@ -1514,6 +1514,7 @@ def send_training_email(result: dict, date_str: str) -> bool:
     ensemble_on  = result.get("ensemble_enabled", False)
     ic_ir        = result.get("ic_ir", 0.0)
     version      = result.get("model_version", "unknown")
+    is_meta      = "meta" in str(version).lower()
     elapsed_s    = result.get("elapsed_s", 0)
     n_train      = result.get("n_train", 0)
     ic_pos       = result.get("ic_positive_20", 0)
