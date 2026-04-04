@@ -1779,8 +1779,7 @@ def send_training_email(result: dict, date_str: str) -> bool:
             f'ECE: <b>{cal_metrics["ece_before"]:.4f} → {cal_metrics["ece_after"]:.4f}</b> '
             f'({(1 - cal_metrics["ece_after"] / max(cal_metrics["ece_before"], 1e-8)) * 100:.0f}% reduction)</p>'
             if cal_metrics and cal_metrics.get("fitted") else ""
-        ) +
-
+        )
         + (
             f'<h3 style="margin-top:16px; margin-bottom:4px;">Multi-Horizon Models</h3>'
             f'<table style="border-collapse:collapse; font-size:11px;">'
@@ -1839,7 +1838,7 @@ def send_training_email(result: dict, date_str: str) -> bool:
                 f"\nEnsemble IC:        {ensemble_ic:.4f}{' — ' + ic_label if promoted_mode == 'ensemble' else ''}{_ens_mark}"
                 if ensemble_on and rank_ic is not None and ensemble_ic is not None else
                 f"\nTest IC:            {test_ic:.4f} — {ic_label}"
-            ) +
+            )
             + (
                 f"\nCatBoost IC:        {cat_ic_val:.4f}"
                 f"\nLGB-Cat Blend IC:   {blend_ic_val:.4f} (w_lgb={blend_wts['lgb']:.1f})"
