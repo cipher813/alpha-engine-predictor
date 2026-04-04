@@ -29,12 +29,19 @@
 
 set -euo pipefail
 
+# ── Ensure HOME is set (SSM RunCommand does not set it) ──────────────────────
+export HOME="${HOME:-/home/ec2-user}"
+
 # ── Load .env ────────────────────────────────────────────────────────────────
-# Master .env lives in alpha-engine-data; fall back to local .env
+# Master .env lives in alpha-engine-data; fall back to ~/.alpha-engine.env
+# (Step Functions SSM), then local .env
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 ENV_FILE="$(dirname "$REPO_ROOT")/alpha-engine-data/.env"
+if [ ! -f "$ENV_FILE" ]; then
+  ENV_FILE="$HOME/.alpha-engine.env"
+fi
 if [ ! -f "$ENV_FILE" ]; then
   ENV_FILE="$REPO_ROOT/.env"
 fi
