@@ -1524,8 +1524,9 @@ def send_training_email(result: dict, date_str: str) -> bool:
     ic_label    = "PASS ✓" if passes_ic else "FAIL ✗"
     promo_color = "#2e7d32" if promoted else "#c62828"
     promo_label = (
-        f"Promoted → gbm_latest ({promoted_mode}) ✓"
-        if promoted else "NOT promoted (IC gate failed ✗)"
+        f"Promoted → weights/meta/ ✓" if promoted and is_meta
+        else f"Promoted → gbm_latest ({promoted_mode}) ✓" if promoted
+        else "NOT promoted (IC gate failed ✗)"
     )
     status_str  = "PASS" if passes_ic else "FAIL"
 
