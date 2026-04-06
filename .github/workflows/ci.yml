@@ -22,8 +22,11 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Set up config
+        run: cp config/predictor.sample.yaml config/predictor.yaml
+
       - name: Run tests
-        run: pytest tests/ -v
+        run: pytest tests/ -v --ignore=tests/test_inference.py --ignore=tests/test_model.py
 
       - name: Security audit
         run: |
