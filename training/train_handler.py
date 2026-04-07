@@ -1925,18 +1925,29 @@ def main(
 
     log.info("GBM training run: date=%s  bucket=%s  dry_run=%s", date_str, bucket, dry_run)
 
-    # Step 1: Download price cache (Parquets + sector_map.json)
+    # Step 1: Load price cache — try ArcticDB first, fall back to S3 parquets
     tmp_cache = Path(tempfile.mkdtemp()) / "cache"
-    n_files = download_price_cache(
-        bucket=bucket,
-        prefix="predictor/price_cache/",
-        local_dir=tmp_cache,
-    )
+    n_files = 0
+
+    try:
+        from store.arctic_reader import download_from_arctic
+        log.info("[data_source=arcticdb] Loading universe from ArcticDB...")
+        n_files = download_from_arctic(bucket=bucket, local_dir=tmp_cache)
+    except Exception as exc:
+        log.warning("[data_source=arcticdb] ArcticDB load failed — falling back to S3 parquets: %s", exc)
+
+    if n_files == 0:
+        log.info("[data_source=legacy] Downloading price cache from S3...")
+        n_files = download_price_cache(
+            bucket=bucket,
+            prefix="predictor/price_cache/",
+            local_dir=tmp_cache,
+        )
 
     if n_files == 0:
         raise RuntimeError(
-            f"No files found at s3://{bucket}/predictor/price_cache/ — "
-            "run bootstrap_fetcher.py first to populate the price cache."
+            f"No files found from ArcticDB or s3://{bucket}/predictor/price_cache/ — "
+            "run builders/backfill.py or bootstrap_fetcher.py first."
         )
 
     # Step 1b: Price cache refresh now handled by alpha-engine-data (Phase 1).

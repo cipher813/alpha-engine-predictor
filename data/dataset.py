@@ -668,6 +668,9 @@ def build_regression_arrays(
     }
 
     all_rows: list[tuple] = []
+    _feat_cols_needed = feature_list or config_module.FEATURES
+    _arcticdb_skipped_compute = 0
+
     for path in parquet_files:
         ticker_name = path.stem
         if ticker_name in _SKIP:
@@ -678,12 +681,19 @@ def build_regression_arrays(
         sector_etf_sym = sector_map.get(ticker_name)
         sector_etf_series = sector_etf_cache.get(sector_etf_sym) if sector_etf_sym else None
         try:
-            featured_df = compute_features(
-                raw_df, spy_series=spy_series, vix_series=vix_series,
-                sector_etf_series=sector_etf_series, tnx_series=tnx_series,
-                irx_series=irx_series, gld_series=gld_series, uso_series=uso_series,
-                vix3m_series=vix3m_series, xsect_dispersion=xsect_dispersion,
-            )
+            # If the parquet already has pre-computed features (from ArcticDB),
+            # skip compute_features() — just compute labels on the existing data.
+            has_precomputed = all(f in raw_df.columns for f in _feat_cols_needed)
+            if has_precomputed:
+                featured_df = raw_df
+                _arcticdb_skipped_compute += 1
+            else:
+                featured_df = compute_features(
+                    raw_df, spy_series=spy_series, vix_series=vix_series,
+                    sector_etf_series=sector_etf_series, tnx_series=tnx_series,
+                    irx_series=irx_series, gld_series=gld_series, uso_series=uso_series,
+                    vix3m_series=vix3m_series, xsect_dispersion=xsect_dispersion,
+                )
             labeled_df = compute_labels(
                 featured_df,
                 forward_days=config_module.FORWARD_DAYS,
@@ -701,6 +711,9 @@ def build_regression_arrays(
         dates = labeled_df.index
         for j in range(len(dates)):
             all_rows.append((dates[j], features_arr[j], float(fwd_returns_arr[j])))
+
+    if _arcticdb_skipped_compute:
+        log.info("[data_source=arcticdb] %d tickers used pre-computed features — skipped compute_features()", _arcticdb_skipped_compute)
 
     if not all_rows:
         raise ValueError("No valid samples generated.")
