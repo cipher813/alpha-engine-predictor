@@ -544,10 +544,14 @@ def compute_features(
     # rather than price/volume data. They are passed in as scalar values per
     # ticker and broadcast across all rows (constant within a ticker's series).
 
+    def _safe_float(val, default: float = 0.0) -> float:
+        """Coerce to float, treating None as the default."""
+        return float(val) if val is not None else default
+
     # O10: PEAD — earnings surprise magnitude and recency
     if earnings_data:
-        df["earnings_surprise_pct"] = float(earnings_data.get("surprise_pct", 0.0))
-        days_since = float(earnings_data.get("days_since_earnings", 90))
+        df["earnings_surprise_pct"] = _safe_float(earnings_data.get("surprise_pct"), 0.0)
+        days_since = _safe_float(earnings_data.get("days_since_earnings"), 90.0)
         df["days_since_earnings"] = days_since / 90.0  # normalize to [0, 1]
     else:
         df["earnings_surprise_pct"] = 0.0
@@ -555,18 +559,18 @@ def compute_features(
 
     # O11: EPS revision momentum
     if revision_data:
-        df["eps_revision_4w"] = float(revision_data.get("eps_revision_4w", 0.0))
-        df["revision_streak"] = float(revision_data.get("revision_streak", 0))
+        df["eps_revision_4w"] = _safe_float(revision_data.get("eps_revision_4w"), 0.0)
+        df["revision_streak"] = _safe_float(revision_data.get("revision_streak"), 0.0)
     else:
         df["eps_revision_4w"] = 0.0
         df["revision_streak"] = 0.0
 
     # O12: Options-derived signals
     if options_data:
-        df["put_call_ratio"] = float(options_data.get("put_call_ratio", 0.0))
-        df["iv_rank"] = float(options_data.get("iv_rank", 0.5))
+        df["put_call_ratio"] = _safe_float(options_data.get("put_call_ratio"), 0.0)
+        df["iv_rank"] = _safe_float(options_data.get("iv_rank"), 0.5)
         # IV vs realized vol ratio
-        atm_iv = float(options_data.get("atm_iv", 0.0))
+        atm_iv = _safe_float(options_data.get("atm_iv"), 0.0)
         realized_vol = df["realized_vol_20d"].iloc[-1] if "realized_vol_20d" in df.columns else 0.0
         if realized_vol > 0 and atm_iv > 0:
             df["iv_vs_rv"] = atm_iv / realized_vol
@@ -581,14 +585,14 @@ def compute_features(
     # Pre-normalized by fundamental_fetcher.py (P/E / 30, P/B / 5, etc.).
     # Broadcast as constants across all rows (same pattern as earnings_data).
     if fundamental_data:
-        df["pe_ratio"] = float(fundamental_data.get("pe_ratio", 0.0))
-        df["pb_ratio"] = float(fundamental_data.get("pb_ratio", 0.0))
-        df["debt_to_equity"] = float(fundamental_data.get("debt_to_equity", 0.0))
-        df["revenue_growth_yoy"] = float(fundamental_data.get("revenue_growth_yoy", 0.0))
-        df["fcf_yield"] = float(fundamental_data.get("fcf_yield", 0.0))
-        df["gross_margin"] = float(fundamental_data.get("gross_margin", 0.0))
-        df["roe"] = float(fundamental_data.get("roe", 0.0))
-        df["current_ratio"] = float(fundamental_data.get("current_ratio", 0.0))
+        df["pe_ratio"] = _safe_float(fundamental_data.get("pe_ratio"), 0.0)
+        df["pb_ratio"] = _safe_float(fundamental_data.get("pb_ratio"), 0.0)
+        df["debt_to_equity"] = _safe_float(fundamental_data.get("debt_to_equity"), 0.0)
+        df["revenue_growth_yoy"] = _safe_float(fundamental_data.get("revenue_growth_yoy"), 0.0)
+        df["fcf_yield"] = _safe_float(fundamental_data.get("fcf_yield"), 0.0)
+        df["gross_margin"] = _safe_float(fundamental_data.get("gross_margin"), 0.0)
+        df["roe"] = _safe_float(fundamental_data.get("roe"), 0.0)
+        df["current_ratio"] = _safe_float(fundamental_data.get("current_ratio"), 0.0)
     else:
         df["pe_ratio"] = 0.0
         df["pb_ratio"] = 0.0
