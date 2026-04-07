@@ -517,44 +517,77 @@ def _run_gbm_inference(ctx: PipelineContext) -> None:
 
     ctx.gbm_feature_cols = gbm_feature_cols
 
-    # ── Load pre-computed features from S3 feature store ──────────────────
+    # ── Load pre-computed features (ArcticDB preferred, legacy feature store fallback) ──
     precomputed_gbm: dict[str, pd.Series] = {}
+    _feature_source = "none"
+
+    # Try ArcticDB first — read latest row per ticker from universe library
     try:
-        import boto3 as _b3_gbm
-        _s3_gbm = _b3_gbm.client("s3")
+        import os as _os_arctic
+        import arcticdb as _adb
+        _region = _os_arctic.environ.get("AWS_REGION", "us-east-1")
+        _arctic_uri = f"s3s://s3.{_region}.amazonaws.com:{ctx.bucket}?path_prefix=arcticdb&aws_auth=true"
+        _arctic = _adb.Arctic(_arctic_uri)
+        _universe = _arctic.get_library("universe")
 
-        def _read_gbm_snapshot(group: str) -> pd.DataFrame | None:
+        for ticker in ctx.tickers:
             try:
-                _key = f"{cfg.FEATURE_STORE_PREFIX}{ctx.date_str}/{group}.parquet"
-                _obj = _s3_gbm.get_object(Bucket=ctx.bucket, Key=_key)
-                return pd.read_parquet(io.BytesIO(_obj["Body"].read()))
+                _df = _universe.read(ticker, date_range=(ctx.date_str, ctx.date_str)).data
+                if not _df.empty:
+                    precomputed_gbm[ticker] = _df.iloc[-1]
             except Exception:
-                return None
+                pass  # ticker not in ArcticDB — will fall through to inline
 
-        _tech_gbm = _read_gbm_snapshot("technical")
-        if _tech_gbm is not None and "ticker" in _tech_gbm.columns:
-            _int_gbm = _read_gbm_snapshot("interaction")
-            for _, row in _tech_gbm.iterrows():
-                t = row["ticker"]
-                precomputed_gbm[t] = row
-            if _int_gbm is not None and "ticker" in _int_gbm.columns:
-                _int_by_t = {r["ticker"]: r for _, r in _int_gbm.iterrows()}
-                for t, row in precomputed_gbm.items():
-                    if t in _int_by_t:
-                        for col in _int_by_t[t].index:
-                            if col != "ticker" and col not in row.index:
-                                row[col] = _int_by_t[t][col]
+        if precomputed_gbm:
+            _feature_source = "arcticdb"
             log.info(
-                "GBM feature store: loaded %d pre-computed tickers for %s",
-                len(precomputed_gbm), ctx.date_str,
+                "[data_source=arcticdb] Loaded %d/%d pre-computed tickers for %s",
+                len(precomputed_gbm), len(ctx.tickers), ctx.date_str,
             )
-        else:
-            log.warning(
-                "GBM feature store snapshot missing for %s — falling back to inline compute",
-                ctx.date_str,
-            )
-    except Exception as _fs_gbm_exc:
-        log.warning("GBM feature store read failed — falling back to inline: %s", _fs_gbm_exc)
+    except ImportError:
+        log.debug("arcticdb not installed — trying legacy feature store")
+    except Exception as _arctic_exc:
+        log.warning("[data_source=arcticdb] ArcticDB read failed: %s — trying legacy feature store", _arctic_exc)
+
+    # Legacy feature store fallback (S3 parquet snapshots)
+    if not precomputed_gbm:
+        try:
+            import boto3 as _b3_gbm
+            _s3_gbm = _b3_gbm.client("s3")
+
+            def _read_gbm_snapshot(group: str) -> pd.DataFrame | None:
+                try:
+                    _key = f"{cfg.FEATURE_STORE_PREFIX}{ctx.date_str}/{group}.parquet"
+                    _obj = _s3_gbm.get_object(Bucket=ctx.bucket, Key=_key)
+                    return pd.read_parquet(io.BytesIO(_obj["Body"].read()))
+                except Exception:
+                    return None
+
+            _tech_gbm = _read_gbm_snapshot("technical")
+            if _tech_gbm is not None and "ticker" in _tech_gbm.columns:
+                _int_gbm = _read_gbm_snapshot("interaction")
+                for _, row in _tech_gbm.iterrows():
+                    t = row["ticker"]
+                    precomputed_gbm[t] = row
+                if _int_gbm is not None and "ticker" in _int_gbm.columns:
+                    _int_by_t = {r["ticker"]: r for _, r in _int_gbm.iterrows()}
+                    for t, row in precomputed_gbm.items():
+                        if t in _int_by_t:
+                            for col in _int_by_t[t].index:
+                                if col != "ticker" and col not in row.index:
+                                    row[col] = _int_by_t[t][col]
+                _feature_source = "legacy_feature_store"
+                log.info(
+                    "[data_source=legacy] Feature store: loaded %d pre-computed tickers for %s",
+                    len(precomputed_gbm), ctx.date_str,
+                )
+            else:
+                log.warning(
+                    "[data_source=legacy] Feature store snapshot missing for %s — falling back to inline compute",
+                    ctx.date_str,
+                )
+        except Exception as _fs_gbm_exc:
+            log.warning("[data_source=legacy] Feature store read failed — falling back to inline: %s", _fs_gbm_exc)
 
     # ── Compute features per ticker (feature store preferred, inline fallback) ──
     raw_vectors: dict[str, np.ndarray] = {}

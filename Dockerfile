@@ -34,6 +34,7 @@ COPY data/ data/
 COPY model/ model/
 COPY inference/ inference/
 COPY training/ training/
+COPY store/ store/
 
 # Lambda handler entry point
 CMD ["inference.handler.handler"]
