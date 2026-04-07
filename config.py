@@ -15,14 +15,20 @@ import yaml
 
 # ── Load predictor config YAML ────────────────────────────────────────────────
 _CONFIG_DIR = Path(__file__).parent / "config"
-_CONFIG_PATH = _CONFIG_DIR / "predictor.yaml"
+
+_CONFIG_SEARCH = [
+    Path.home() / "alpha-engine-config" / "predictor" / "predictor.yaml",
+    Path(__file__).parent.parent / "alpha-engine-config" / "predictor" / "predictor.yaml",
+    _CONFIG_DIR / "predictor.yaml",
+]
+_CONFIG_PATH = next((p for p in _CONFIG_SEARCH if p.exists()), _CONFIG_DIR / "predictor.yaml")
 
 
 def _load() -> dict:
     if not _CONFIG_PATH.exists():
         raise FileNotFoundError(
-            f"Predictor config not found: {_CONFIG_PATH}\n"
-            "Copy config/predictor.sample.yaml to config/predictor.yaml and customise."
+            f"Predictor config not found. Searched:\n"
+            + "\n".join(f"  {p}" for p in _CONFIG_SEARCH)
         )
     with open(_CONFIG_PATH) as f:
         return yaml.safe_load(f)
