@@ -28,6 +28,7 @@ RUN pip install --no-cache-dir -r requirements-lambda.txt
 # Copy application code
 COPY retry.py .
 COPY health_status.py .
+COPY ssm_secrets.py .
 COPY config.py .
 COPY config/ config/
 COPY data/ data/
