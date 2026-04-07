@@ -58,3 +58,8 @@ logs/
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Gitleaks config (symlink to shared config)
+.gitleaks.toml
+
+.gitleaksbaseline.json
