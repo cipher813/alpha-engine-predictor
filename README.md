@@ -1,8 +1,28 @@
-# Alpha Engine Predictor
+# alpha-engine-predictor
 
-LightGBM model that predicts 5-day market-relative returns for each ticker. Produces directional predictions (UP/FLAT/DOWN) with confidence scores, and provides a veto gate that blocks entry into declining positions.
+[![Python](https://img.shields.io/badge/python-3.11+-blue.svg)]()
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Tests](https://img.shields.io/badge/tests-135_passing-brightgreen.svg)]()
 
-> Part of [Nous Ergon: Alpha Engine](https://github.com/cipher813/alpha-engine).
+> Meta-model (4 specialized GBMs + ridge) predicts 5-day market-relative returns. Produces directional predictions (UP/FLAT/DOWN) with confidence scores, and provides a veto gate that blocks entry into declining positions.
+
+**Part of the [Nous Ergon](https://nousergon.ai) autonomous trading system.**
+See the [system overview](https://github.com/cipher813/alpha-engine#readme) for how all modules connect, or the [full documentation index](https://github.com/cipher813/alpha-engine-docs#readme).
+
+## Table of Contents
+
+- [Role in the System](#role-in-the-system)
+- [Quick Start](#quick-start)
+- [Architecture](#architecture)
+- [How Training Works](#how-training-works)
+- [How Inference Works](#how-inference-works)
+- [Direction Labels and the Veto Gate](#direction-labels-and-the-veto-gate)
+- [Configuration Reference](#configuration-reference)
+- [Key Files](#key-files)
+- [Deployment](#deployment)
+- [S3 Contract](#s3-contract)
+- [Testing](#testing)
+- [Related Modules](#related-modules)
 
 ---
 
@@ -75,27 +95,39 @@ All tests run without network access or AWS credentials.
 
 ```
 ┌────────────────────────────────────────────────────┐
-│          Weekly Retraining (Monday)                 │
-│  bootstrap_fetcher → feature_engineer → dataset    │
-│  → train_gbm.py → checkpoints/gbm_best.txt → S3   │
+│     Weekly Retraining (Saturday, Step Function)     │
+│  ArcticDB prices → feature_engineer → dataset      │
+│  → 4 specialized GBMs (momentum, mean-rev,         │
+│    volatility, regime) + ridge meta-learner         │
+│  → walk-forward validation (5 folds, IC gate)      │
+│  → promote weights to S3 if IC > 0.05              │
+│  → drift detection + retrain alerts                │
 └────────────────────────────────────────────────────┘
                           │
 ┌─────────────────────────▼──────────────────────────┐
-│      Daily Inference — Lambda (6:15 AM PT)          │
-│  → load GBM weights from S3                         │
+│      Daily Inference — Lambda (6:07 AM PT)          │
+│  → load meta-model weights from S3                  │
 │  → read watchlist from signals.json                 │
-│  → fetch OHLCV per ticker (yfinance)                │
-│  → compute features (latest row only)               │
-│  → GBM predict → direction + confidence             │
+│  → load prices (ArcticDB slim + daily_closes delta) │
+│  → compute features (from feature store or inline)  │
+│  → meta-model predict → direction + confidence      │
 │  → write predictions/{date}.json + latest.json      │
+│  → daily health check Lambda (drift, clustering)    │
 └────────────────────────────────────────────────────┘
                           │
 ┌─────────────────────────▼──────────────────────────┐
 │      Downstream Integration                         │
 │  Executor reads predictions (best-effort)           │
 │  Veto gate: DOWN ≥ confidence threshold → HOLD      │
+│  Backtester evaluates: confusion matrix, P/R/F1    │
 └────────────────────────────────────────────────────┘
 ```
+
+**v3.0 Meta-Model** (deployed 2026-04-01): 4 specialized GBMs (momentum, mean-reversion, volatility, regime) combined via ridge meta-learner. Walk-forward validated across 5 folds. IC ~4x single GBM baseline.
+
+**Feedback Loop** (added 2026-04-07): Drift detection (feature z-scores, prediction clustering), ensemble mode evaluation, feature pruning, and retrain alerts (5 trigger conditions → email notification).
+
+**Daily Health Check Lambda**: Verifies prediction freshness, detects feature drift, checks for degenerate clustering. SNS alert on anomaly.
 
 ---
 
@@ -291,73 +323,37 @@ python inference/daily_predict.py --model-type gbm --watchlist auto
 
 ---
 
-## Opportunities for Improvement
+## S3 Contract
 
-### Model Architecture
+### Reads
+| Path | Source | Content |
+|------|--------|---------|
+| `signals/{date}/signals.json` | Research | Watchlist (population tickers) |
+| ArcticDB `universe_slim` | Data | 2y OHLCV for feature computation |
+| `predictor/daily_closes/{date}.parquet` | Data | Daily delta for slim cache |
+| `predictor/feature_store/{date}/` | Data | Pre-computed 54 features (primary) |
+| `config/predictor_params.json` | Backtester | Auto-tuned veto threshold |
 
-1. **3-model stacking ensemble** — add XGBoost and CatBoost alongside LightGBM, combined with a ridge regression meta-learner optimized on IC. MSE + lambdarank ensemble already captures objective-level diversity, so marginal gain from additional tree libraries is uncertain. Training 4 models + SHAP may approach Lambda's 15-minute timeout. **Deferred** — revisit if the temporal ensemble (item 2) doesn't close the accuracy gap, or if training moves to EC2 where compute budget is less constrained.
-
-2. **Temporal ensemble** — currently only predicts 5-day returns. Training on 3, 5, 7, and 10-day horizons and blending predictions captures multi-horizon alpha and reduces label noise sensitivity. Implementation: separate GBM per horizon + learned blend weights. **Highest-value deferred item** — different horizons capture genuinely different market dynamics. Likely adds more value than model-library diversity (item 1).
-
-3. ~~**Ranking loss (lambdarank)**~~ — **Implemented 2026-03-17.** Both MSE and lambdarank LightGBM models train weekly. The system evaluates MSE IC, lambdarank IC, and ensemble IC (rank-normalized average), then promotes whichever achieves the highest IC. Inference reads `gbm_mode.json` from S3 to determine which mode to load. Config: `ensemble_lambdarank: true` (default).
-
-4. **Inactive MLP alternative** — `model/predictor.py` contains a DirectionPredictor MLP (v1.2.0) that could be activated as an ensemble member. Lowest priority — temporal ensemble (item 2) likely adds more value. Interface already exists.
-
-### Feature Engineering Gaps
-
-| Feature Category | Current | Missing |
-|-----------------|---------|---------|
-| Momentum | 7+ variants (RSI, MACD, momentum_5d/20d, price_accel) | VWAP divergence, buying/selling pressure |
-| Volume | rel_volume_ratio, volume_trend, obv_slope | Volume profile, VWAP distance |
-| Volatility | atr_14_pct, realized_vol_20d, vol_ratio_10_60 | Options-implied vol, IV rank |
-| Cross-asset | sector_vs_spy_5d | Beta vs sector, correlation vs peers, breadth |
-| Macro | VIX, yields, gold/oil momentum | Credit spreads, PMI, real rates |
-| Regime interactions | 5 interaction terms (v1.5) | Yield curve x sector sensitivity |
-| Fundamental | None | Earnings surprise, analyst revisions |
-
-Key cross-asset opportunities:
-- **Beta vs sector**: per-ticker rolling beta against sector ETF captures sensitivity to sector moves
-- **Correlation vs peers**: rolling correlation with top-5 holdings in the same sector detects regime shifts
-- **Breadth**: advance/decline ratio, % above 50d MA — confirms or contradicts aggregate index moves
-
-### Training Pipeline Gaps
-
-1. ~~**Walk-forward fold generation mixes calendar and trading days**~~ — **Resolved 2026-03-18.** Config key renamed to `test_window_trading_days` (with backward compat fallback) to clarify that fold windows are in trading days. Walk-forward fast mode added (`wf_n_estimators: 500`, `wf_early_stopping: 20`) to reduce per-fold training time ~4x. Per-fold timing logged. **Note:** WF fast mode uses lighter params than production (500 vs 1000 estimators, 20 vs 30 early stopping). IC estimates from WF may be pessimistic relative to the final model. If WF frequently fails while single-split passes, consider aligning WF params with production (set `wf_n_estimators: null` in predictor.yaml) at the cost of ~4x longer training time.
-
-2. **No automated feature selection** — features are manually curated across 5 generations. SHAP-based noise feature detection now identifies candidates (features with SHAP < 1% of top feature AND |IC| < 0.005), logged as informational warnings in the training email. Auto-pruning (which requires syncing feature lists between training and inference) is deferred.
-
-3. ~~**SHAP feature importance monitoring**~~ — **Implemented 2026-03-17.** Weekly training computes SHAP TreeExplainer values (capped at 500 test rows), writes `shap_{date}.json` to S3, and includes a gain-vs-SHAP rank comparison table in the training email. Week-over-week Spearman rank correlation detects feature drift (warning threshold: 0.80).
-
-4. ~~**Per-feature IC tracking**~~ — **Implemented 2026-03-18.** Pearson IC computed for each of the 36 GBM features against forward returns on the test set. Top 5 and bottom 5 features by |IC| logged. Results included in S3 metadata and training email under "Feature Health".
-
-5. **Macro features excluded from GBM** — VIX, yields, gold/oil momentum are cross-sectional constants (same for all tickers on a given day) and cannot predict cross-sectional alpha. They are excluded from GBM training/inference. Regime interaction terms (e.g., `mom5d_x_vix`) partially address this by capturing macro × ticker signal interactions. Per-feature IC monitoring now tracks their effectiveness.
-
-### Label Construction
-
-1. ~~**Label winsorization at ±15% clips earnings gap alpha**~~ — **Resolved 2026-03-18.** Label clip raised from ±15% to ±25%. Sector-neutral 5d returns >25% are extremely rare, but 15-25% earnings gaps are informative and no longer clipped.
-
-2. **Adaptive thresholds** — now supported via `adaptive_thresholds: true` in config (implemented 2026-03-17). Rolling percentile-based UP/DOWN classification adapts to volatility regime. Needs validation on historical data before enabling in production.
-
-### Operational Notes
-
-- **Data drift from weekly rewrite** (P7): Historical OHLCV is rewritten weekly with new split/dividend adjustments (yfinance `auto_adjust=True`). Model trained on one adjustment basis may be evaluated against a slightly different basis. Impact is minimal for liquid S&P 500 stocks but could cause issues around corporate actions. Consider frozen training windows if IC degrades post-split.
-- **Lambda /tmp 512MB** (P9): Model weights are ~30-50 MB combined (MSE + LambdaRank). Monitor `/tmp` usage via CloudWatch if adding more cached data.
-- **Slim cache boundary** (P10): `slim_df = df[df.index >= cutoff]` uses `>=` (inclusive). If cutoff date has AM trades vs inference PM, boundary row may be included or excluded. Impact is one extra/missing day of history — negligible for 2-year cache.
+### Writes
+| Path | Content |
+|------|---------|
+| `predictor/predictions/{date}.json` | Per-ticker direction, confidence, predicted alpha |
+| `predictor/predictions/latest.json` | Pointer to most recent predictions |
+| `predictor/weights/` | GBM + meta-model weights (weekly) |
+| `predictor/metrics/latest.json` | IC, hit rate, model performance |
+| `predictor/metrics/drift_{date}.json` | Feature drift alerts |
+| `health/predictor_inference.json` | Module health marker |
 
 ---
 
 ## Related Modules
 
-- [`alpha-engine`](https://github.com/cipher813/alpha-engine) — Executor (trade execution + system overview)
+- [`alpha-engine`](https://github.com/cipher813/alpha-engine) — Executor + system overview
 - [`alpha-engine-research`](https://github.com/cipher813/alpha-engine-research) — Autonomous LLM research pipeline
-- [`alpha-engine-backtester`](https://github.com/cipher813/alpha-engine-backtester) — Signal quality analysis and parameter optimization
+- [`alpha-engine-backtester`](https://github.com/cipher813/alpha-engine-backtester) — Evaluation framework and parameter optimization
 - [`alpha-engine-dashboard`](https://github.com/cipher813/alpha-engine-dashboard) — Streamlit monitoring dashboard
-
----
-
-## Future Opportunities
-
-- **Shadow model infrastructure:** Run two model versions simultaneously during inference. Write both predictions to S3 (`predictions/{date}.json` with `shadow_predictions` field). Dashboard shows comparison. Promote new model only when shadow outperforms for 4+ weeks. Pre-requisite: meta-model v3.0 needs several weeks of production runtime before building comparison infrastructure.
+- [`alpha-engine-data`](https://github.com/cipher813/alpha-engine-data) — Centralized data collection and ArcticDB
+- [`alpha-engine-docs`](https://github.com/cipher813/alpha-engine-docs) — Documentation index
 
 ---
 
