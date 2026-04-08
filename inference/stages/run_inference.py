@@ -17,114 +17,6 @@ log = logging.getLogger(__name__)
 
 # ── Per-ticker MLP prediction (migrated from daily_predict.py) ───────────────
 
-def predict_ticker(
-    ticker: str,
-    df: pd.DataFrame,
-    model,  # torch.nn.Module — imported lazily below (not needed for GBM path)
-    norm_stats: dict,
-    macro: dict[str, pd.Series] | None = None,
-    sector_etf_series: pd.Series | None = None,
-) -> Optional[dict]:
-    """
-    Compute features for one ticker and run inference.
-
-    Parameters
-    ----------
-    ticker :           Ticker symbol.
-    df :               2-year OHLCV DataFrame (2y needed for 52w rolling windows).
-    model :            Loaded DirectionPredictor in eval mode.
-    norm_stats :       Dict with 'mean' and 'std' lists for z-score normalization.
-    macro :            Dict of macro Close-price Series from fetch_macro_series().
-                       Keys: SPY, VIX, TNX, IRX, GLD, USO.  None → neutral defaults.
-    sector_etf_series: Sector ETF Close prices for this ticker's sector.  None → 0.0.
-
-    Returns
-    -------
-    Prediction dict or None if insufficient data.
-
-    Output dict schema:
-        {
-            "ticker": "AAPL",
-            "predicted_direction": "UP",
-            "prediction_confidence": 0.74,
-            "p_up": 0.74,
-            "p_flat": 0.18,
-            "p_down": 0.08
-        }
-    """
-    from data.feature_engineer import compute_features
-
-    if df.empty or len(df) < cfg.MIN_ROWS_FOR_FEATURES:
-        # Need 252 rows for 52w rolling windows + buffer; 265 is a safe minimum
-        log.debug("Skipping %s: insufficient data (%d rows)", ticker, len(df))
-        return None
-
-    try:
-        featured_df = compute_features(
-            df,
-            spy_series=macro.get("SPY") if macro else None,
-            vix_series=macro.get("VIX") if macro else None,
-            sector_etf_series=sector_etf_series,
-            tnx_series=macro.get("TNX") if macro else None,
-            irx_series=macro.get("IRX") if macro else None,
-            gld_series=macro.get("GLD") if macro else None,
-            uso_series=macro.get("USO") if macro else None,
-        )
-    except Exception as exc:
-        log.warning("Feature computation failed for %s: %s", ticker, exc)
-        return None
-
-    if featured_df.empty:
-        log.debug("No rows after feature computation for %s", ticker)
-        return None
-
-    # Use the most recent row (today's feature vector)
-    latest = featured_df.iloc[-1]
-
-    feature_cols = cfg.FEATURES
-    x_raw = latest[feature_cols].to_numpy(dtype=np.float32)
-
-    # Z-score normalize using stored training statistics
-    try:
-        mean = np.array(norm_stats["mean"], dtype=np.float32)
-        std = np.array(norm_stats["std"], dtype=np.float32)
-        std = np.where(std == 0, 1.0, std)
-        x_norm = (x_raw - mean) / std
-    except Exception as exc:
-        log.warning("Normalization failed for %s: %s", ticker, exc)
-        return None
-
-    # Inference — lazy-import torch so the module loads without PyTorch when
-    # model_type="gbm" (LightGBM only) is used in the Lambda environment.
-    import torch  # noqa: PLC0415
-    import torch.nn.functional as F  # noqa: PLC0415
-
-    x_tensor = torch.FloatTensor(x_norm).unsqueeze(0)  # shape (1, 8)
-    model.eval()
-    with torch.no_grad():
-        logits = model(x_tensor)
-        probs = F.softmax(logits, dim=-1).squeeze(0).numpy()
-
-    # probs indices: 0=DOWN, 1=FLAT, 2=UP (matches CLASS_LABELS in config)
-    p_down = float(probs[0])
-    p_flat = float(probs[1])
-    p_up = float(probs[2])
-
-    # Predicted class = argmax
-    class_idx = int(np.argmax(probs))
-    predicted_direction = cfg.CLASS_LABELS[class_idx]
-    confidence = float(probs[class_idx])
-
-    return {
-        "ticker": ticker,
-        "predicted_direction": predicted_direction,
-        "prediction_confidence": round(confidence, 4),
-        "p_up": round(p_up, 4),
-        "p_flat": round(p_flat, 4),
-        "p_down": round(p_down, 4),
-    }
-
-
 # ── Stage entry point ────────────────────────────────────────────────────────
 
 def run(ctx: PipelineContext) -> None:
@@ -144,10 +36,8 @@ def run(ctx: PipelineContext) -> None:
 
     if ctx.inference_mode == "meta" and ctx.meta_models:
         _run_meta_inference(ctx)
-    elif ctx.model_type == "gbm":
-        _run_gbm_inference(ctx)
     else:
-        _run_mlp_inference(ctx)
+        _run_gbm_inference(ctx)
 
     log.info("Inference complete: %d predictions  %d skipped", len(ctx.predictions), ctx.n_skipped)
 
@@ -864,26 +754,3 @@ def _run_gbm_inference(ctx: PipelineContext) -> None:
         ctx.predictions.append(result)
 
 
-def _run_mlp_inference(ctx: PipelineContext) -> None:
-    """Per-ticker MLP inference (legacy path)."""
-    norm_stats = ctx.checkpoint.get("norm_stats", {})
-    for ticker in ctx.tickers:
-        df = ctx.price_data.get(ticker, pd.DataFrame())
-        sector_etf_sym = ctx.sector_map.get(ticker)
-        sector_etf_series = ctx.macro.get(sector_etf_sym) if sector_etf_sym else None
-        result = predict_ticker(
-            ticker, df, ctx.model, norm_stats,
-            macro=ctx.macro,
-            sector_etf_series=sector_etf_series,
-        )
-        if result is not None:
-            if ticker in ctx.ticker_data_age:
-                result["price_data_age_days"] = ctx.ticker_data_age[ticker]
-            if ctx.ticker_sources:
-                result["watchlist_source"] = ctx.ticker_sources.get(ticker, "unknown")
-            ctx.predictions.append(result)
-        else:
-            ctx.n_skipped += 1
-
-
-    # _expand_feature_store removed — standalone compute.py handles full-universe features.

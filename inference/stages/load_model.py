@@ -15,62 +15,6 @@ log = logging.getLogger(__name__)
 
 # ── Model loading functions (migrated from daily_predict.py) ─────────────────
 
-def load_model(
-    s3_bucket: str,
-    weights_key: str,
-    device: str = "cpu",
-) -> tuple:
-    """
-    Download model weights from S3 to /tmp and load the checkpoint.
-
-    Parameters
-    ----------
-    s3_bucket :   S3 bucket name.
-    weights_key : S3 key for the weights file (e.g. predictor/weights/latest.pt).
-    device :      Torch device string.
-
-    Returns
-    -------
-    (model, checkpoint_dict)
-    """
-    from model.predictor import load_checkpoint
-
-    try:
-        import boto3
-        s3 = boto3.client("s3")
-        local_path = Path(tempfile.mkdtemp()) / "model_weights.pt"
-        log.info("Downloading model weights from s3://%s/%s", s3_bucket, weights_key)
-        s3.download_file(s3_bucket, weights_key, str(local_path))
-        log.info("Downloaded to %s", local_path)
-    except Exception as exc:
-        raise RuntimeError(
-            f"Failed to download model weights from s3://{s3_bucket}/{weights_key}: {exc}"
-        ) from exc
-
-    model, checkpoint = load_checkpoint(str(local_path), device=device)
-    log.info(
-        "Model loaded: version=%s  epoch=%d  val_loss=%.4f",
-        checkpoint.get("model_version", "unknown"),
-        checkpoint.get("epoch", -1),
-        checkpoint.get("val_loss", float("nan")),
-    )
-    return model, checkpoint
-
-
-def load_model_local(
-    path: str = "checkpoints/best.pt",
-    device: str = "cpu",
-) -> tuple:
-    """Load model weights from a local file path."""
-    from model.predictor import load_checkpoint
-    model, checkpoint = load_checkpoint(path, device=device)
-    log.info(
-        "Model loaded (local): version=%s  epoch=%d",
-        checkpoint.get("model_version", "unknown"),
-        checkpoint.get("epoch", -1),
-    )
-    return model, checkpoint
-
 
 def load_gbm_local(path: str = "checkpoints/gbm_best.txt"):
     """Load GBMScorer from a local file path."""
@@ -131,10 +75,7 @@ def run(ctx: PipelineContext) -> None:
         _load_meta_models(ctx)
         return
 
-    if ctx.model_type == "gbm":
-        _load_gbm(ctx)
-    else:
-        _load_mlp(ctx)
+    _load_gbm(ctx)
 
 
 def _load_gbm(ctx: PipelineContext) -> None:
@@ -374,13 +315,3 @@ def _load_meta_models(ctx: PipelineContext) -> None:
     log.info("Meta-model inference ready: %d models loaded", n_loaded)
 
 
-def _load_mlp(ctx: PipelineContext) -> None:
-    if ctx.local:
-        ctx.model, ctx.checkpoint = load_model_local("checkpoints/best.pt")
-    else:
-        ctx.model, ctx.checkpoint = load_model(ctx.bucket, cfg.MODEL_WEIGHTS_KEY)
-    norm_stats = ctx.checkpoint.get("norm_stats", {})
-    if not norm_stats:
-        log.warning("No norm_stats in checkpoint — features may not normalize correctly")
-    ctx.model_version = ctx.checkpoint.get("model_version", "unknown")
-    ctx.val_loss = ctx.checkpoint.get("val_loss", float("nan"))
