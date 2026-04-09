@@ -47,7 +47,7 @@ log = logging.getLogger(__name__)
 # so that tests, handler.py, and offline mode monkey-patching continue to work.
 
 from inference.stages.load_model import (  # noqa: E402, F401
-    load_model, load_model_local, load_gbm_local, load_gbm_s3,
+    load_gbm_local, load_gbm_s3,
 )
 from inference.stages.load_universe import (  # noqa: E402, F401
     get_universe_tickers, load_watchlist,
@@ -56,7 +56,6 @@ from inference.stages.load_prices import (  # noqa: E402, F401
     _safe_last_date, fetch_today_prices, fetch_macro_series,
     save_daily_closes, load_price_data_from_cache,
 )
-from inference.stages.run_inference import predict_ticker  # noqa: E402, F401
 from inference.stages.write_output import (  # noqa: E402, F401
     _load_predictor_params_from_s3, get_veto_threshold,
     write_predictions, _build_predictor_email, send_predictor_email,

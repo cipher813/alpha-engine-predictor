@@ -645,7 +645,7 @@ def run(ctx: PipelineContext) -> None:
     metrics = {
         "model_version": ctx.model_version,
         "model_type": ctx.model_type,
-        "inference_mode": ctx.inference_mode if ctx.model_type == "gbm" else "mlp",
+        "inference_mode": ctx.inference_mode,
         "last_trained": last_trained,
         "training_samples": gbm_meta.get("n_train") if ctx.model_type == "gbm" else None,
         "val_loss": round(float(ctx.val_loss), 6) if isinstance(ctx.val_loss, (int, float)) else None,
