@@ -146,17 +146,19 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
 
         _tech_df = _read_snapshot("technical")
         if _tech_df is not None and "ticker" in _tech_df.columns:
-            _int_df = _read_snapshot("interaction")
             for _, row in _tech_df.iterrows():
                 t = row["ticker"]
                 precomputed[t] = row
-            if _int_df is not None and "ticker" in _int_df.columns:
-                _int_by_ticker = {r["ticker"]: r for _, r in _int_df.iterrows()}
-                for t, row in precomputed.items():
-                    if t in _int_by_ticker:
-                        for col in _int_by_ticker[t].index:
-                            if col != "ticker" and col not in row.index:
-                                row[col] = _int_by_ticker[t][col]
+            # Merge additional per-ticker groups into precomputed features
+            for group in ("interaction", "alternative", "fundamental"):
+                _grp_df = _read_snapshot(group)
+                if _grp_df is not None and "ticker" in _grp_df.columns:
+                    _grp_by_ticker = {r["ticker"]: r for _, r in _grp_df.iterrows()}
+                    for t, row in precomputed.items():
+                        if t in _grp_by_ticker:
+                            for col in _grp_by_ticker[t].index:
+                                if col != "ticker" and col not in row.index:
+                                    row[col] = _grp_by_ticker[t][col]
             log.info(
                 "Feature store: loaded %d pre-computed tickers for %s",
                 len(precomputed), ctx.date_str,
@@ -237,8 +239,9 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
             try:
                 vol_x = latest[cfg.VOLATILITY_FEATURES].to_numpy(dtype=np.float32).reshape(1, -1)
                 expected_move = float(vol_scorer.predict(vol_x)[0])
-            except Exception:
-                pass
+            except Exception as _vol_exc:
+                if ticker == ctx.tickers[0]:
+                    log.warning("Volatility model predict failed for %s: %s", ticker, _vol_exc)
 
         # Layer 1C: Research calibrator
         research_cal_prob = 0.5  # neutral default
