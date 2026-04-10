@@ -211,29 +211,67 @@ def save_daily_closes(
     dry_run: bool = False,
 ) -> int:
     """
-    Fetch and archive today's OHLCV for all tickers using ``auto_adjust=False``.
+    Fetch and archive today's OHLCV for all tickers.
 
-    Writes one parquet file per trading day:
+    **Primary writer is alpha-engine-data's collectors/daily_closes.py**, which
+    runs as DataPhase1 on the EC2 micro instance before this function is
+    invoked by the inference Lambda. This function exists only as a fallback
+    for the case where DataPhase1 failed or has not run yet — it skips the
+    write if the file already exists so it does not clobber the data module's
+    richer output (full universe coverage + polygon true VWAP).
+
+    Historical context: before alpha-engine-data was extracted as a separate
+    module, this function was the sole writer. The extraction copied the
+    logic into alpha-engine-data but both sides kept writing to the same S3
+    path, with the predictor's lowercase-no-VWAP schema silently overwriting
+    the data module's richer version every day. Caused the 2026-04-10 "no
+    daily_closes with VWAP" incident.
+
+    Writes to:
         predictor/daily_closes/{date_str}.parquet
-    Schema: index=ticker (str), columns=[date, open, high, low, close, adj_close, volume]
+
+    Schema (when this function writes): index=ticker, columns=[date, Open,
+    High, Low, Close, Adj_Close, Volume, VWAP]. Matches the data module's
+    uppercase schema. VWAP uses polygon's true intraday VWAP when available,
+    typical-price proxy (H+L+C)/3 when falling back to yfinance.
 
     Parameters
     ----------
     tickers :   Tickers to capture.
-    date_str :  Trading date label YYYY-MM-DD (file key and 'date' column value).
+    date_str :  Trading date label YYYY-MM-DD.
     s3_bucket : S3 bucket name.
     dry_run :   Log what would be written but skip the S3 put.
 
     Returns
     -------
-    Number of tickers successfully captured (0 on failure).
+    Number of tickers successfully captured (0 if skipped or no data).
     """
     import io
 
     import boto3
 
+    # Skip write if data module already produced this file. Check first so
+    # we don't do any polygon / yfinance work unnecessarily.
+    s3 = boto3.client("s3")
+    key = f"{_CLOSES_PREFIX}{date_str}.parquet"
+    if not dry_run:
+        try:
+            s3.head_object(Bucket=s3_bucket, Key=key)
+            log.info(
+                "daily_closes/%s.parquet already exists — skipping "
+                "(data module DataPhase1 is the primary writer)",
+                date_str,
+            )
+            return 0
+        except Exception:
+            log.info(
+                "daily_closes/%s.parquet not found — predictor will write "
+                "as fallback (data module DataPhase1 may not have run)",
+                date_str,
+            )
+
     log.info(
-        "Capturing daily closes for %d tickers, date=%s …",
+        "Capturing daily closes for %d tickers, date=%s (fallback path)",
         len(tickers), date_str,
     )
 
@@ -252,12 +290,13 @@ def save_daily_closes(
                     records.append({
                         "ticker":    store_ticker,
                         "date":      date_str,
-                        "open":      round(g["open"],   4),
-                        "high":      round(g["high"],   4),
-                        "low":       round(g["low"],    4),
-                        "close":     round(g["close"],  4),
-                        "adj_close": round(g["close"],  4),  # split-adjusted only; negligible diff
-                        "volume":    int(g["volume"]),
+                        "Open":      round(g["open"],   4),
+                        "High":      round(g["high"],   4),
+                        "Low":       round(g["low"],    4),
+                        "Close":     round(g["close"],  4),
+                        "Adj_Close": round(g["close"],  4),  # split-adjusted only; negligible diff
+                        "Volume":    int(g["volume"]),
+                        "VWAP":      round(g["vwap"], 4) if g.get("vwap") else None,
                     })
             log.info("Polygon grouped-daily: %d/%d tickers captured", len(records), len(tickers))
     except Exception as exc:
@@ -298,17 +337,24 @@ def save_daily_closes(
 
                         last = df.iloc[-1]
                         raw_close = float(last["Close"])
+                        raw_high = float(last["High"])
+                        raw_low = float(last["Low"])
                         adj_close = float(last["Adj Close"]) if "Adj Close" in df.columns else raw_close
+                        # Typical-price proxy for VWAP since yfinance does not
+                        # expose true intraday VWAP. Matches the proxy used in
+                        # alpha-engine-data/collectors/daily_closes.py fallback.
+                        vwap_proxy = round((raw_high + raw_low + raw_close) / 3.0, 4)
                         store_ticker = ticker.lstrip("^")
                         records.append({
                             "ticker":    store_ticker,
                             "date":      date_str,
-                            "open":      round(float(last["Open"]),  4),
-                            "high":      round(float(last["High"]),  4),
-                            "low":       round(float(last["Low"]),   4),
-                            "close":     round(raw_close,            4),
-                            "adj_close": round(adj_close,            4),
-                            "volume":    int(last["Volume"]) if pd.notna(last.get("Volume")) else 0,
+                            "Open":      round(float(last["Open"]),  4),
+                            "High":      round(raw_high,             4),
+                            "Low":       round(raw_low,              4),
+                            "Close":     round(raw_close,            4),
+                            "Adj_Close": round(adj_close,            4),
+                            "Volume":    int(last["Volume"]) if pd.notna(last.get("Volume")) else 0,
+                            "VWAP":      vwap_proxy,
                         })
                     except Exception as exc:
                         log.debug("Close extract failed for %s: %s", ticker, exc)
