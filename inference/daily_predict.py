@@ -54,7 +54,7 @@ from inference.stages.load_universe import (  # noqa: E402, F401
 )
 from inference.stages.load_prices import (  # noqa: E402, F401
     _safe_last_date, fetch_today_prices, fetch_macro_series,
-    save_daily_closes, load_price_data_from_cache,
+    load_price_data_from_cache,
 )
 from inference.stages.write_output import (  # noqa: E402, F401
     _load_predictor_params_from_s3, get_veto_threshold,
@@ -258,7 +258,6 @@ if __name__ == "__main__":
 
         _lp.load_price_data_from_cache = lambda tickers, *a, **k: _make_synthetic_prices(tickers)
         _lp.fetch_today_prices = lambda tickers, **k: _make_synthetic_prices(tickers)[0]
-        _lp.save_daily_closes = lambda *a, **k: None
         _lp.fetch_macro_series = lambda *a, **k: {}
 
         # Stub output

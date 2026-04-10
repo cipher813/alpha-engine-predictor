@@ -204,197 +204,6 @@ def fetch_macro_series(
     return keyed
 
 
-def save_daily_closes(
-    tickers: list[str],
-    date_str: str,
-    s3_bucket: str,
-    dry_run: bool = False,
-) -> int:
-    """
-    Fetch and archive today's OHLCV for all tickers.
-
-    **Primary writer is alpha-engine-data's collectors/daily_closes.py**, which
-    runs as DataPhase1 on the EC2 micro instance before this function is
-    invoked by the inference Lambda. This function exists only as a fallback
-    for the case where DataPhase1 failed or has not run yet — it skips the
-    write if the file already exists so it does not clobber the data module's
-    richer output (full universe coverage + polygon true VWAP).
-
-    Historical context: before alpha-engine-data was extracted as a separate
-    module, this function was the sole writer. The extraction copied the
-    logic into alpha-engine-data but both sides kept writing to the same S3
-    path, with the predictor's lowercase-no-VWAP schema silently overwriting
-    the data module's richer version every day. Caused the 2026-04-10 "no
-    daily_closes with VWAP" incident.
-
-    Writes to:
-        predictor/daily_closes/{date_str}.parquet
-
-    Schema (when this function writes): index=ticker, columns=[date, Open,
-    High, Low, Close, Adj_Close, Volume, VWAP]. Matches the data module's
-    uppercase schema. VWAP uses polygon's true intraday VWAP when available,
-    typical-price proxy (H+L+C)/3 when falling back to yfinance.
-
-    Parameters
-    ----------
-    tickers :   Tickers to capture.
-    date_str :  Trading date label YYYY-MM-DD.
-    s3_bucket : S3 bucket name.
-    dry_run :   Log what would be written but skip the S3 put.
-
-    Returns
-    -------
-    Number of tickers successfully captured (0 if skipped or no data).
-    """
-    import io
-
-    import boto3
-
-    # Skip write if data module already produced this file. Check first so
-    # we don't do any polygon / yfinance work unnecessarily.
-    s3 = boto3.client("s3")
-    key = f"{_CLOSES_PREFIX}{date_str}.parquet"
-    if not dry_run:
-        try:
-            s3.head_object(Bucket=s3_bucket, Key=key)
-            log.info(
-                "daily_closes/%s.parquet already exists — skipping "
-                "(data module DataPhase1 is the primary writer)",
-                date_str,
-            )
-            return 0
-        except Exception:
-            log.info(
-                "daily_closes/%s.parquet not found — predictor will write "
-                "as fallback (data module DataPhase1 may not have run)",
-                date_str,
-            )
-
-    log.info(
-        "Capturing daily closes for %d tickers, date=%s (fallback path)",
-        len(tickers), date_str,
-    )
-
-    records: list[dict] = []
-
-    # Try polygon grouped-daily first (all US stocks in 1 API call)
-    try:
-        from polygon_client import polygon_client
-        grouped = polygon_client().get_grouped_daily(date_str)
-        if grouped:
-            ticker_set = set(tickers) | {t.lstrip("^") for t in tickers}
-            for ticker in tickers:
-                store_ticker = ticker.lstrip("^")
-                g = grouped.get(store_ticker)
-                if g:
-                    records.append({
-                        "ticker":    store_ticker,
-                        "date":      date_str,
-                        "Open":      round(g["open"],   4),
-                        "High":      round(g["high"],   4),
-                        "Low":       round(g["low"],    4),
-                        "Close":     round(g["close"],  4),
-                        "Adj_Close": round(g["close"],  4),  # split-adjusted only; negligible diff
-                        "Volume":    int(g["volume"]),
-                        "VWAP":      round(g["vwap"], 4) if g.get("vwap") else None,
-                    })
-            log.info("Polygon grouped-daily: %d/%d tickers captured", len(records), len(tickers))
-    except Exception as exc:
-        log.warning("Polygon grouped-daily failed, falling back to yfinance: %s", exc)
-
-    # Fallback to yfinance for any tickers polygon missed
-    captured_tickers = {r["ticker"] for r in records}
-    missing_tickers = [t for t in tickers if t.lstrip("^") not in captured_tickers]
-    if missing_tickers:
-        import yfinance as yf
-        log.info("Fetching %d remaining tickers from yfinance…", len(missing_tickers))
-        batch_size = cfg.INFERENCE_BATCH_SIZE
-        batches = [missing_tickers[i : i + batch_size] for i in range(0, len(missing_tickers), batch_size)]
-
-        for batch in batches:
-            try:
-                tickers_arg = batch[0] if len(batch) == 1 else batch
-                raw = yf.download(
-                    tickers=tickers_arg,
-                    period=cfg.DAILY_CLOSES_PERIOD,
-                    interval="1d",
-                    auto_adjust=False,
-                    progress=False,
-                    group_by="ticker",
-                    threads=True,
-                )
-                is_multi = isinstance(raw.columns, pd.MultiIndex)
-
-                for ticker in batch:
-                    try:
-                        df = (raw[ticker] if is_multi else raw).copy()
-                        df.index = pd.to_datetime(df.index)
-                        if df.index.tz is not None:
-                            df.index = df.index.tz_convert("UTC").tz_localize(None)
-                        df = df.dropna(subset=["Close"])
-                        if df.empty:
-                            continue
-
-                        last = df.iloc[-1]
-                        raw_close = float(last["Close"])
-                        raw_high = float(last["High"])
-                        raw_low = float(last["Low"])
-                        adj_close = float(last["Adj Close"]) if "Adj Close" in df.columns else raw_close
-                        # Typical-price proxy for VWAP since yfinance does not
-                        # expose true intraday VWAP. Matches the proxy used in
-                        # alpha-engine-data/collectors/daily_closes.py fallback.
-                        vwap_proxy = round((raw_high + raw_low + raw_close) / 3.0, 4)
-                        store_ticker = ticker.lstrip("^")
-                        records.append({
-                            "ticker":    store_ticker,
-                            "date":      date_str,
-                            "Open":      round(float(last["Open"]),  4),
-                            "High":      round(raw_high,             4),
-                            "Low":       round(raw_low,              4),
-                            "Close":     round(raw_close,            4),
-                            "Adj_Close": round(adj_close,            4),
-                            "Volume":    int(last["Volume"]) if pd.notna(last.get("Volume")) else 0,
-                            "VWAP":      vwap_proxy,
-                        })
-                    except Exception as exc:
-                        log.debug("Close extract failed for %s: %s", ticker, exc)
-
-            except Exception as exc:
-                log.warning("Raw price batch failed: %s", exc)
-
-    if not records:
-        log.warning("No raw closes captured for %s — skipping S3 write", date_str)
-        return 0
-
-    closes_df = pd.DataFrame(records).set_index("ticker")
-    log.info(
-        "Raw closes captured: %d / %d tickers for %s",
-        len(closes_df), len(tickers), date_str,
-    )
-
-    if dry_run:
-        log.info(
-            "[dry-run] Would write %d closes to s3://%s/predictor/daily_closes/%s.parquet",
-            len(closes_df), s3_bucket, date_str,
-        )
-        return len(closes_df)
-
-    try:
-        s3  = boto3.client("s3")
-        buf = io.BytesIO()
-        closes_df.to_parquet(buf, engine="pyarrow", compression="snappy", index=True)
-        buf.seek(0)
-        key = f"predictor/daily_closes/{date_str}.parquet"
-        _s3_put_bytes(s3, s3_bucket, key, buf.getvalue())
-        log.info(
-            "Daily closes written to s3://%s/%s  (%d tickers)",
-            s3_bucket, key, len(closes_df),
-        )
-        return len(closes_df)
-    except Exception as exc:
-        log.error("Failed to write daily closes to S3: %s", exc)
-        return 0
-
 
 def _download_slim_cache(s3_bucket: str, local_dir: Path) -> int:
     """
@@ -757,13 +566,31 @@ def run(ctx: PipelineContext) -> None:
         extra = fetch_macro_series(extra_tickers=missing_etfs)
         ctx.macro.update({k: v for k, v in extra.items() if k not in ctx.macro})
 
-    # ── Persist daily closes to S3 ───────────────────────────────────────────
-    _MACRO_YFINANCE = {"SPY": "SPY", "^VIX": "VIX", "^TNX": "TNX", "^IRX": "IRX", "GLD": "GLD", "USO": "USO"}
-    _slim_source = ctx.price_data if ctx.price_data is not None else {}
-    _sector_etfs = [s for s in _slim_source if s.startswith("XL")]
-    _macro_yf_tickers = list(_MACRO_YFINANCE.keys()) + _sector_etfs
-    _all_daily_tickers = sorted(set(ctx.tickers + _macro_yf_tickers))
-    save_daily_closes(_all_daily_tickers, ctx.date_str, ctx.bucket, dry_run=ctx.dry_run)
+    # ── Verify daily closes exist (written by DataPhase1 / alpha-engine-data) ─
+    # As of the 2026-04-10 architectural cleanup, this predictor no longer
+    # writes daily_closes itself. The authoritative writer is
+    # alpha-engine-data/collectors/daily_closes.py, which runs as DataPhase1
+    # in the weekday Step Function before this inference Lambda. If DataPhase1
+    # failed or has not run, the file will be missing — fail loud so the
+    # operator sees a clear error instead of the predictor silently producing
+    # empty predictions from missing price history downstream.
+    if not ctx.dry_run:
+        import boto3
+        _s3 = boto3.client("s3")
+        _key = f"{_CLOSES_PREFIX}{ctx.date_str}.parquet"
+        try:
+            _s3.head_object(Bucket=ctx.bucket, Key=_key)
+        except Exception as _exc:
+            log.error(
+                "daily_closes/%s.parquet is missing from s3://%s. "
+                "DataPhase1 (alpha-engine-data) must run before the predictor "
+                "inference Lambda — check the Step Function execution.",
+                ctx.date_str, ctx.bucket,
+            )
+            raise PipelineAbort(
+                f"daily_closes/{ctx.date_str}.parquet not found — DataPhase1 "
+                f"did not run or failed. Cannot proceed with inference."
+            ) from _exc
 
     # ── Timeout gate ─────────────────────────────────────────────────────────
     if ctx.near_timeout():

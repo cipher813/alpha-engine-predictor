@@ -24,11 +24,12 @@ S3 layout:
   predictor/weights/gbm_{date}.txt      — (output) dated backup
 
   predictor/daily_closes/{date}.parquet — Backward-split-adjusted OHLCV snapshot per
-                                          trading day (auto_adjust=False; yfinance has no
-                                          truly-raw mode — all modes apply retroactive split
-                                          adjustment).  Written by save_daily_closes() each
-                                          morning.  Used as the Mon–Fri delta source by
-                                          load_price_data_from_cache(), reducing daily yfinance
+                                          trading day.  Written by DataPhase1 in
+                                          alpha-engine-data/collectors/daily_closes.py
+                                          as the first step of the weekday Step Function,
+                                          before the predictor inference Lambda runs.
+                                          Used as the Mon–Fri delta source by
+                                          load_price_data_from_cache(), reducing daily
                                           fetches to only the ~1-2 split tickers per week.
   predictor/price_cache_slim/*.parquet  — 2-year slice of each ticker (written by
                                           write_slim_cache() after each weekly training run).
