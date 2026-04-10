@@ -1,0 +1,62 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      # Only rebuild + redeploy when code or infra that actually lands in the
+      # Docker image changes. Training-only code does not trigger redeploy
+      # because training runs on a spot instance that clones fresh on boot.
+      - 'inference/**'
+      - 'model/**'
+      - 'data/**'
+      - 'config.py'
+      - 'requirements*.txt'
+      - 'Dockerfile*'
+      - 'infrastructure/deploy.sh'
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-main
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: Build + deploy inference Lambda
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::711398986525:role/github-actions-lambda-deploy
+          aws-region: us-east-1
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Deploy inference Lambda (alpha-engine-predictor-inference)
+        run: bash infrastructure/deploy.sh
+
+      - name: Report deployed version
+        run: |
+          echo "Deployed commit: ${{ github.sha }}"
+          aws lambda get-function \
+            --function-name alpha-engine-predictor-inference \
+            --query "Configuration.[LastModified,CodeSha256]" \
+            --output text
