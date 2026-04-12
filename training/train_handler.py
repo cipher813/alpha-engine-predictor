@@ -1524,10 +1524,34 @@ def send_training_email(result: dict, date_str: str) -> bool:
     ic_color    = "#2e7d32" if passes_ic else "#c62828"
     ic_label    = "PASS ✓" if passes_ic else "FAIL ✗"
     promo_color = "#2e7d32" if promoted else "#c62828"
+
+    # Build the promotion label. Previously this was hardcoded to
+    # "NOT promoted (IC gate failed ✗)" for all non-promotion cases, which
+    # was actively misleading: the 2026-04-11 v3.0-meta run produced
+    # Meta-Model IC 0.0525 (well above the 0.03 gate) but was blocked by
+    # the walk-forward validation on the momentum base model. The email
+    # said "IC gate failed" when the IC gate actually passed.
+    def _build_failure_reason() -> str:
+        wf = result.get("walk_forward") or {}
+        if not wf:
+            return "IC gate failed"  # fallback — no wf info available
+        mom = wf.get("momentum_median_ic")
+        vol = wf.get("volatility_median_ic")
+        reasons: list[str] = []
+        if mom is not None and mom <= 0:
+            reasons.append(f"momentum median IC {mom:+.4f}")
+        if vol is not None and vol <= 0:
+            reasons.append(f"volatility median IC {vol:+.4f}")
+        if reasons:
+            return "walk-forward failed: " + ", ".join(reasons)
+        # wf section present but no negative medians — must be the
+        # in-sample IC gate that failed
+        return "IC gate failed"
+
     promo_label = (
         f"Promoted → weights/meta/ ✓" if promoted and is_meta
         else f"Promoted → gbm_latest ({promoted_mode}) ✓" if promoted
-        else "NOT promoted (IC gate failed ✗)"
+        else f"NOT promoted ({_build_failure_reason()}) ✗"
     )
     status_str  = "PASS" if passes_ic else "FAIL"
 
@@ -1800,8 +1824,20 @@ def send_training_email(result: dict, date_str: str) -> bool:
         ) +
 
         f'<p style="font-size:11px; color:#aaa; margin-top:20px;">'
-        f'IC gate: ≥{cfg.MIN_IC:.2f} to promote &nbsp;|&nbsp; Walk-forward: median IC ≥{cfg.WF_MEDIAN_IC_GATE:.2f}, {cfg.WF_MIN_FOLDS_POSITIVE*100:.0f}%+ positive folds</p>'
-        f'</body></html>'
+        # Meta (v3.0) trainer uses a simpler walk-forward gate:
+        # both base models must have strictly positive median IC.
+        # See meta_trainer.py:483. The v2 single-model path uses
+        # cfg.WF_MEDIAN_IC_GATE + WF_MIN_FOLDS_POSITIVE. Describe
+        # whichever one actually gates this run.
+        + (
+            f'IC gate: ≥{cfg.MIN_IC:.2f} meta IC to promote &nbsp;|&nbsp; '
+            f'Walk-forward: momentum &amp; volatility median IC both &gt; 0</p>'
+            if is_meta else
+            f'IC gate: ≥{cfg.MIN_IC:.2f} to promote &nbsp;|&nbsp; '
+            f'Walk-forward: median IC ≥{cfg.WF_MEDIAN_IC_GATE:.2f}, '
+            f'{cfg.WF_MIN_FOLDS_POSITIVE*100:.0f}%+ positive folds</p>'
+        )
+        + f'</body></html>'
     )
 
     if is_meta:
