@@ -394,7 +394,31 @@ def run_meta_training(
                  len(research_scores))
 
     # ── Step 9: Upload to S3 ─────────────────────────────────────────────────
-    promoted = mom_median_ic > 0 and vol_median_ic > 0  # both models show positive signal
+    # Gate promotion on the meta-model composite IC rather than requiring
+    # each base model's walk-forward median to be strictly positive. The
+    # meta blend's validation IC already reflects how momentum + volatility
+    # combine out-of-sample; double-gating on per-base-model walk-forward
+    # blocks legitimate promotions when one base is weak but the blend is
+    # strong.
+    #
+    # 2026-04-11 regression the new gate fixes: meta-model IC was 0.0525
+    # (well above the 0.02 gate), volatility walk-forward 0.33 median with
+    # 12/12 positive folds, but momentum walk-forward was -0.0017. The old
+    # strict-positive gate blocked promotion, leaving gbm_latest.txt at a
+    # 2026-03-28 snapshot for 16+ days while two weekly cycles produced
+    # passing candidates. Silent alpha cap on every daily inference.
+    #
+    # Threshold matches the v2 single-model path (cfg.WF_MEDIAN_IC_GATE,
+    # default 0.02 per config.py, configurable via predictor.yaml).
+    _meta_ic_gate = cfg.WF_MEDIAN_IC_GATE
+    promoted = meta_model._val_ic >= _meta_ic_gate
+    log.info(
+        "Meta-model promotion gate: meta_IC=%.4f %s %.4f → %s "
+        "(walk-forward for reference: mom_median=%.4f, vol_median=%.4f)",
+        meta_model._val_ic, ">=" if promoted else "<", _meta_ic_gate,
+        "PROMOTE" if promoted else "BLOCK",
+        mom_median_ic, vol_median_ic,
+    )
     elapsed_s = (datetime.now(timezone.utc) - start_ts).total_seconds()
 
     if not dry_run:
