@@ -264,6 +264,11 @@ class GBMScorer:
     # Inference
     # ------------------------------------------------------------------
 
+    @property
+    def feature_names(self) -> list[str]:
+        """Feature names the model was trained on (in column order)."""
+        return list(self._feature_names)
+
     def predict(self, X: np.ndarray) -> np.ndarray:
         """
         Predict continuous alpha scores.
@@ -282,8 +287,11 @@ class GBMScorer:
         if X.shape[1] != expected_features:
             raise ValueError(
                 f"Feature count mismatch at inference: input has {X.shape[1]} features "
-                f"but model expects {expected_features}. Check that feature engineering "
-                f"and GBM_FEATURES config match the trained model."
+                f"but model expects {expected_features}. The trained model's features "
+                f"are accessible via scorer.feature_names; slice the input DataFrame "
+                f"by that list so drift between GBM_FEATURES config and the deployed "
+                f"weights doesn't crash inference. Trained feature names: "
+                f"{self._feature_names}"
             )
         return self._booster.predict(X, num_iteration=self._best_iteration)
 
