@@ -49,6 +49,47 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 echo "Working directory: $REPO_ROOT"
 
+# ── Stage proprietary config from alpha-engine-config ────────────────────────
+# predictor.yaml is gitignored in this repo and lives in the private
+# cipher813/alpha-engine-config repo alongside the configs for the other
+# modules. Without staging it into the build context, the Dockerfile's
+# `COPY config/ config/` only captures predictor.sample.yaml and the Lambda
+# fails at import with FileNotFoundError — the silent 2026-04-13 regression.
+# Falling back to the sample is explicitly rejected: shipping placeholder
+# hyperparameters to production is worse than refusing to deploy.
+#
+# Local dev workflow is preserved: if config/predictor.yaml already exists
+# (the dev has it in place in their laptop checkout), we use it as-is.
+CONFIG_REPO_DIR="${CONFIG_REPO_DIR:-$(dirname "$REPO_ROOT")/alpha-engine-config}"
+CONFIG_STAGED_FROM_REPO=0
+
+if [ -f "config/predictor.yaml" ]; then
+  echo "Using existing config/predictor.yaml (local dev workflow)"
+else
+  src="$CONFIG_REPO_DIR/predictor/predictor.yaml"
+  if [ -f "$src" ]; then
+    echo "Staging config/predictor.yaml from $src"
+    cp "$src" config/predictor.yaml
+    CONFIG_STAGED_FROM_REPO=1
+  else
+    echo "ERROR: config/predictor.yaml not found — tried:"
+    echo "  config/predictor.yaml (local dev)"
+    echo "  $src (config repo sibling)"
+    echo "Hint: clone cipher813/alpha-engine-config as a sibling directory,"
+    echo "      or set CONFIG_REPO_DIR=/path/to/alpha-engine-config"
+    exit 1
+  fi
+fi
+
+# Cleanup staged config on exit so a failed deploy doesn't leave a stray
+# file in a dev laptop checkout.
+cleanup_staged_config() {
+  if [ "$CONFIG_STAGED_FROM_REPO" = "1" ] && [ -f config/predictor.yaml ]; then
+    rm -f config/predictor.yaml
+  fi
+}
+trap cleanup_staged_config EXIT
+
 # ── Step 1: Build Docker image ────────────────────────────────────────────────
 echo ""
 echo "==> Building Docker image..."
