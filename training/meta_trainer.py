@@ -30,6 +30,35 @@ import pandas as pd
 log = logging.getLogger(__name__)
 
 
+_MOMENTUM_PARAMS_S3_KEY = "config/predictor_momentum_params.json"
+
+
+def _load_momentum_params_from_s3(bucket: str) -> dict | None:
+    """Read momentum GBM params from S3 if present.
+
+    Written by the backtester's hyperparam sweep (future). Schema:
+      {"n_estimators": int, "early_stopping_rounds": int,
+       "tuned_params": {"num_leaves": int, ...}}
+
+    Returns None when the key is absent or unreadable — callers fall back
+    to YAML defaults (config.MOMENTUM_GBM_*).
+    """
+    try:
+        import boto3
+        s3 = boto3.client("s3")
+        obj = s3.get_object(Bucket=bucket, Key=_MOMENTUM_PARAMS_S3_KEY)
+        data = json.loads(obj["Body"].read())
+        if not isinstance(data, dict):
+            log.warning("Momentum params S3 override is not a dict — ignoring")
+            return None
+        return data
+    except Exception as e:
+        # NoSuchKey / AccessDenied / parse errors all fall back silently
+        log.debug("No momentum params override on S3 (%s): %s",
+                  _MOMENTUM_PARAMS_S3_KEY, e)
+        return None
+
+
 def run_meta_training(
     data_dir: str,
     bucket: str,
@@ -262,26 +291,21 @@ def run_meta_training(
     wf_n_est = getattr(cfg, "WF_N_ESTIMATORS", None) or cfg.GBM_N_ESTIMATORS
     wf_es = getattr(cfg, "WF_EARLY_STOPPING", None) or cfg.GBM_EARLY_STOPPING_ROUNDS
 
-    # Momentum-specific low-capacity GBM params. The shared params above are
-    # tuned for the strong volatility signal (IC ~0.33); on the weak momentum
-    # target (IC < 0.02) those trees memorize validation noise and fail walk-
-    # forward. A near-linear config extracts the small real signal the six TA
-    # features have, flipping WF median IC from -0.002 → +0.004 and raising
-    # positive-fold count from 4/12 → 7/12 without changing features or the
-    # volatility base.
-    mom_tuned_params = dict(tuned_params or {})
-    mom_tuned_params.update({
-        "num_leaves": 7,
-        "max_depth": 2,
-        "min_child_samples": 500,
-        "learning_rate": 0.02,
-        "feature_fraction": 1.0,
-        "bagging_fraction": 0.8,
-        "lambda_l1": 1.0,
-        "lambda_l2": 1.0,
-    })
-    mom_n_est = 300
-    mom_es = 30
+    # Momentum base params: YAML defaults from config.MOMENTUM_GBM_* with
+    # optional S3 override from config/predictor_momentum_params.json (written
+    # by the backtester's hyperparam sweep). Volatility base keeps the shared
+    # GBM params — only momentum has the weak-signal / overfitting issue.
+    mom_tuned_params = dict(cfg.MOMENTUM_GBM_TUNED_PARAMS)
+    mom_n_est = cfg.MOMENTUM_GBM_N_ESTIMATORS
+    mom_es = cfg.MOMENTUM_GBM_EARLY_STOPPING_ROUNDS
+    _s3_override = _load_momentum_params_from_s3(bucket)
+    if _s3_override:
+        if "tuned_params" in _s3_override:
+            mom_tuned_params.update(_s3_override["tuned_params"])
+        mom_n_est = _s3_override.get("n_estimators", mom_n_est)
+        mom_es = _s3_override.get("early_stopping_rounds", mom_es)
+        log.info("Momentum params overridden from S3: n_est=%d es=%d keys=%s",
+                 mom_n_est, mom_es, list(_s3_override.get("tuned_params", {}).keys()))
 
     # Collect OOS predictions for meta-model training
     oos_meta_rows = []  # list of dicts with meta-features + actual outcome

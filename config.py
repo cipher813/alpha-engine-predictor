@@ -192,6 +192,41 @@ GBM_IC_IR_GATE = _gbm_cfg["ic_ir_gate"]
 GBM_TUNED_PARAMS = _gbm_cfg["tuned_params"]
 GBM_ENSEMBLE_LAMBDARANK = _gbm_cfg.get("ensemble_lambdarank", True)
 
+# Momentum base model — the shared GBM params above are tuned for the strong
+# volatility signal (IC ~0.33). On the weak momentum target (IC < 0.02) those
+# trees memorize validation noise and fail walk-forward. The defaults below
+# are a near-linear config that extracts the small real signal the six TA
+# features have. A deploy is expected to carry these in predictor.yaml under
+# gbm.momentum, but if the section is missing we still apply low-capacity
+# defaults rather than the overfitting shared params. Backtester can further
+# override via s3://{bucket}/config/predictor_momentum_params.json.
+_MOMENTUM_GBM_DEFAULTS = {
+    "n_estimators": 300,
+    "early_stopping_rounds": 30,
+    "tuned_params": {
+        "num_leaves": 7,
+        "max_depth": 2,
+        "min_child_samples": 500,
+        "learning_rate": 0.02,
+        "feature_fraction": 1.0,
+        "bagging_fraction": 0.8,
+        "lambda_l1": 1.0,
+        "lambda_l2": 1.0,
+    },
+}
+_gbm_mom_cfg = _gbm_cfg.get("momentum", {})
+MOMENTUM_GBM_N_ESTIMATORS = _gbm_mom_cfg.get(
+    "n_estimators", _MOMENTUM_GBM_DEFAULTS["n_estimators"],
+)
+MOMENTUM_GBM_EARLY_STOPPING_ROUNDS = _gbm_mom_cfg.get(
+    "early_stopping_rounds", _MOMENTUM_GBM_DEFAULTS["early_stopping_rounds"],
+)
+MOMENTUM_GBM_TUNED_PARAMS = {
+    **GBM_TUNED_PARAMS,
+    **_MOMENTUM_GBM_DEFAULTS["tuned_params"],
+    **_gbm_mom_cfg.get("tuned_params", {}),
+}
+
 # ── CatBoost ensemble ──────────────────────────────────────────────────────
 _cat_cfg = _cfg.get("catboost", {})
 CATBOOST_ENABLED = _cat_cfg.get("enabled", False)

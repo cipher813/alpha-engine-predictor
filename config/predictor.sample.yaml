@@ -53,6 +53,23 @@ gbm:
     verbosity: -1
     seed: 42
 
+  # Momentum base override — fields here take precedence over the shared
+  # tuned_params above for the momentum base only. Volatility base keeps
+  # the shared params. Rationale: volatility has IC ~0.33 and benefits
+  # from high-capacity trees; momentum has IC < 0.02 and overfits.
+  momentum:
+    n_estimators: 300              # lower cap for a weak-signal target
+    early_stopping_rounds: 30
+    tuned_params:
+      num_leaves: 7                # near-linear
+      max_depth: 2
+      min_child_samples: 500       # force broad splits
+      learning_rate: 0.02
+      feature_fraction: 1.0        # 6 features — no need to subsample
+      bagging_fraction: 0.8
+      lambda_l1: 1.0               # strong regularization
+      lambda_l2: 1.0
+
 # ── CatBoost ensemble ────────────────────────────────────────────────────────
 # Train CatBoost alongside LightGBM and blend predictions.
 # Different inductive biases (ordered boosting) produce complementary predictions.
