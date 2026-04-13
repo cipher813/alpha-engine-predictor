@@ -32,8 +32,24 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      - name: Checkout
+      - name: Checkout predictor repo
         uses: actions/checkout@v4
+        with:
+          path: alpha-engine-predictor
+
+      # deploy.sh stages predictor.yaml from cipher813/alpha-engine-config
+      # into the build context. The real config is gitignored in this repo,
+      # so a fresh GitHub runner has none of it — without this step the
+      # Dockerfile's `COPY config/ config/` would ship an image missing
+      # predictor.yaml and every invocation would FileNotFoundError at
+      # import. Fine-grained PAT with read-only Contents access on
+      # alpha-engine-config is stored as ALPHA_ENGINE_CONFIG_TOKEN.
+      - name: Checkout alpha-engine-config
+        uses: actions/checkout@v4
+        with:
+          repository: cipher813/alpha-engine-config
+          path: alpha-engine-config
+          token: ${{ secrets.ALPHA_ENGINE_CONFIG_TOKEN }}
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -51,6 +67,13 @@ jobs:
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Deploy inference Lambda (alpha-engine-predictor-inference)
+        working-directory: alpha-engine-predictor
+        env:
+          # deploy.sh defaults CONFIG_REPO_DIR to $(dirname $(pwd))/alpha-engine-config,
+          # which resolves to $GITHUB_WORKSPACE/alpha-engine-config — exactly
+          # where the checkout step above placed it. Explicit export here
+          # makes the dependency readable.
+          CONFIG_REPO_DIR: ${{ github.workspace }}/alpha-engine-config
         run: bash infrastructure/deploy.sh
 
       - name: Report deployed version

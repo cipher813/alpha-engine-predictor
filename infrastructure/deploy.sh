@@ -49,6 +49,47 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 echo "Working directory: $REPO_ROOT"
 
+# ── Stage proprietary config from alpha-engine-config ────────────────────────
+# predictor.yaml is gitignored in this repo and lives in the private
+# cipher813/alpha-engine-config repo alongside the configs for the other
+# modules. Without staging it into the build context, the Dockerfile's
+# `COPY config/ config/` only captures predictor.sample.yaml and the Lambda
+# fails at import with FileNotFoundError — the silent 2026-04-13 regression.
+# Falling back to the sample is explicitly rejected: shipping placeholder
+# hyperparameters to production is worse than refusing to deploy.
+#
+# Local dev workflow is preserved: if config/predictor.yaml already exists
+# (the dev has it in place in their laptop checkout), we use it as-is.
+CONFIG_REPO_DIR="${CONFIG_REPO_DIR:-$(dirname "$REPO_ROOT")/alpha-engine-config}"
+CONFIG_STAGED_FROM_REPO=0
+
+if [ -f "config/predictor.yaml" ]; then
+  echo "Using existing config/predictor.yaml (local dev workflow)"
+else
+  src="$CONFIG_REPO_DIR/predictor/predictor.yaml"
+  if [ -f "$src" ]; then
+    echo "Staging config/predictor.yaml from $src"
+    cp "$src" config/predictor.yaml
+    CONFIG_STAGED_FROM_REPO=1
+  else
+    echo "ERROR: config/predictor.yaml not found — tried:"
+    echo "  config/predictor.yaml (local dev)"
+    echo "  $src (config repo sibling)"
+    echo "Hint: clone cipher813/alpha-engine-config as a sibling directory,"
+    echo "      or set CONFIG_REPO_DIR=/path/to/alpha-engine-config"
+    exit 1
+  fi
+fi
+
+# Cleanup staged config on exit so a failed deploy doesn't leave a stray
+# file in a dev laptop checkout.
+cleanup_staged_config() {
+  if [ "$CONFIG_STAGED_FROM_REPO" = "1" ] && [ -f config/predictor.yaml ]; then
+    rm -f config/predictor.yaml
+  fi
+}
+trap cleanup_staged_config EXIT
+
 # ── Step 1: Build Docker image ────────────────────────────────────────────────
 echo ""
 echo "==> Building Docker image..."
@@ -147,7 +188,7 @@ aws lambda wait function-updated \
   --function-name "${LAMBDA_FUNCTION}" \
   --region "${AWS_REGION}"
 
-# ── Step 6: Publish version and update 'live' alias ──────────────────────────
+# ── Step 6: Publish version ──────────────────────────────────────────────────
 echo ""
 echo "==> Publishing Lambda version..."
 VERSION=$(aws lambda publish-version \
@@ -156,6 +197,33 @@ VERSION=$(aws lambda publish-version \
   --region "${AWS_REGION}")
 echo "  Published version: ${VERSION}"
 
+# ── Step 7: Canary against the new version (NOT live) ────────────────────────
+# Invoke the version directly so a broken image cannot reach the live alias.
+# If the canary fails, live keeps pointing at the prior good version.
+echo ""
+echo "==> Running canary invocation against :${VERSION} (dry_run=true)..."
+CANARY_OUT=$(mktemp)
+aws lambda invoke \
+  --function-name "${LAMBDA_FUNCTION}:${VERSION}" \
+  --payload '{"dry_run": true}' \
+  --cli-binary-format raw-in-base64-out \
+  --cli-read-timeout 300 \
+  --region "${AWS_REGION}" \
+  "$CANARY_OUT" > /dev/null
+
+CANARY_STATUS=$(python3 -c "import json; d=json.load(open('$CANARY_OUT')); print(d.get('statusCode', 0))" 2>/dev/null || echo "0")
+CANARY_ERR=$(python3 -c "import json; d=json.load(open('$CANARY_OUT')); print(d.get('FunctionError',''))" 2>/dev/null || echo "")
+rm -f "$CANARY_OUT"
+
+if [ "$CANARY_STATUS" != "200" ] || [ -n "$CANARY_ERR" ]; then
+  echo ""
+  echo "ERROR: Canary failed (statusCode=$CANARY_STATUS, FunctionError=$CANARY_ERR) — refusing to promote :${VERSION} to live."
+  echo "       Live alias is unchanged. Investigate logs for function:${LAMBDA_FUNCTION} version ${VERSION}."
+  exit 1
+fi
+echo "  Canary passed (status=$CANARY_STATUS)"
+
+# ── Step 8: Promote version to 'live' (only after canary passes) ─────────────
 echo "==> Updating 'live' alias → version ${VERSION}"
 aws lambda update-alias \
   --function-name "${LAMBDA_FUNCTION}" \
@@ -167,32 +235,6 @@ aws lambda create-alias \
   --name live \
   --function-version "${VERSION}" \
   --region "${AWS_REGION}"
-
-# ── Step 7: Canary invocation ───────────────────────────────────────────────
-echo ""
-echo "==> Running canary invocation (dry_run=true)..."
-CANARY_OUT=$(mktemp)
-# Container images have slow cold starts (~30-90s). Set CLI read timeout
-# high enough to avoid false failures. Lambda's own timeout (900s) governs
-# actual execution; this just prevents the CLI from giving up early.
-aws lambda invoke \
-  --function-name "${LAMBDA_FUNCTION}:live" \
-  --payload '{"dry_run": true}' \
-  --cli-binary-format raw-in-base64-out \
-  --cli-read-timeout 300 \
-  --region "${AWS_REGION}" \
-  "$CANARY_OUT" > /dev/null
-
-CANARY_STATUS=$(python3 -c "import json; d=json.load(open('$CANARY_OUT')); print(d.get('statusCode', 0))" 2>/dev/null || echo "0")
-rm -f "$CANARY_OUT"
-
-if [ "$CANARY_STATUS" != "200" ]; then
-  echo ""
-  echo "ERROR: Canary returned status $CANARY_STATUS — auto-rolling back!"
-  bash "$(dirname "$0")/rollback.sh"
-  exit 1
-fi
-echo "  Canary passed (status=$CANARY_STATUS)"
 
 echo ""
 echo "==> Deploy complete!"
