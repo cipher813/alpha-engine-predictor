@@ -33,22 +33,27 @@ labeling:
   adaptive_down_pct: 35            # percentile for DOWN threshold (bottom 35% → DOWN)
 
 # ── GBM hyperparameters ──────────────────────────────────────────────────────
+# Values below are LightGBM library defaults (publicly documented — see
+# https://lightgbm.readthedocs.io/), NOT production-tuned values. Real
+# tuned values live in the private alpha-engine-config/predictor/predictor.yaml
+# and take precedence via the config search path. Tune against your own data
+# if standing up a new deployment.
 gbm:
-  n_estimators: 1000               # max boosting rounds
-  early_stopping_rounds: 30        # stop if no improvement for N rounds
+  n_estimators: 100                # LightGBM default
+  early_stopping_rounds: 20
   ic_ir_gate: 0.20                 # IC IR threshold for model promotion
-  ensemble_lambdarank: true      # train both MSE + lambdarank and ensemble predictions
+  ensemble_lambdarank: true        # train both MSE + lambdarank and ensemble predictions
   tuned_params:
     objective: regression
     metric: mse
-    num_leaves: 127                # more leaf nodes for non-linear interactions
-    min_child_samples: 50          # finer-grained leaf predictions
-    max_depth: 5                   # allows deeper feature interactions
-    learning_rate: 0.05            # slower learning compensates for increased capacity
-    feature_fraction: 0.8          # fraction of features per tree
-    bagging_fraction: 0.8          # fraction of rows per tree
-    lambda_l1: 0.10                # mild L1 regularization
-    lambda_l2: 0.05                # mild L2 regularization
+    num_leaves: 31                 # LightGBM default
+    min_child_samples: 20          # LightGBM default
+    max_depth: -1                  # LightGBM default (no limit)
+    learning_rate: 0.1             # LightGBM default
+    feature_fraction: 1.0          # LightGBM default
+    bagging_fraction: 1.0          # LightGBM default
+    lambda_l1: 0.0                 # LightGBM default
+    lambda_l2: 0.0                 # LightGBM default
     num_threads: 4
     verbosity: -1
     seed: 42
