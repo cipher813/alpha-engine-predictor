@@ -54,6 +54,10 @@ from email.mime.text import MIMEText
 from pathlib import Path
 from typing import Optional
 
+from ssm_secrets import load_secrets
+
+load_secrets()
+
 import numpy as np
 
 log = logging.getLogger(__name__)
