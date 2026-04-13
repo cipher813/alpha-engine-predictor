@@ -6,19 +6,20 @@ import json
 from unittest.mock import MagicMock, patch
 
 
-def test_config_exposes_momentum_defaults():
+def test_config_exposes_momentum_params_from_yaml():
+    """Production values come from alpha-engine-config/predictor/predictor.yaml;
+    this test just asserts the keys are populated (not the specific values,
+    which are proprietary and live in the private config repo)."""
     import config as cfg
 
-    assert cfg.MOMENTUM_GBM_N_ESTIMATORS == 300
-    assert cfg.MOMENTUM_GBM_EARLY_STOPPING_ROUNDS == 30
-    assert cfg.MOMENTUM_GBM_TUNED_PARAMS["num_leaves"] == 7
-    assert cfg.MOMENTUM_GBM_TUNED_PARAMS["max_depth"] == 2
-    assert cfg.MOMENTUM_GBM_TUNED_PARAMS["min_child_samples"] == 500
-    assert cfg.MOMENTUM_GBM_TUNED_PARAMS["lambda_l1"] == 1.0
-    assert cfg.MOMENTUM_GBM_TUNED_PARAMS["lambda_l2"] == 1.0
+    assert isinstance(cfg.MOMENTUM_GBM_N_ESTIMATORS, int)
+    assert cfg.MOMENTUM_GBM_N_ESTIMATORS > 0
+    assert isinstance(cfg.MOMENTUM_GBM_EARLY_STOPPING_ROUNDS, int)
+    for key in ("num_leaves", "max_depth", "min_child_samples", "learning_rate"):
+        assert key in cfg.MOMENTUM_GBM_TUNED_PARAMS
 
 
-def test_momentum_defaults_inherit_shared_non_overridden_keys():
+def test_momentum_params_inherit_shared_non_overridden_keys():
     """Momentum params should carry over shared keys like objective/metric
     that are not in the momentum-specific override."""
     import config as cfg
