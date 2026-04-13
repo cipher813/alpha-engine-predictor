@@ -192,6 +192,23 @@ GBM_IC_IR_GATE = _gbm_cfg["ic_ir_gate"]
 GBM_TUNED_PARAMS = _gbm_cfg["tuned_params"]
 GBM_ENSEMBLE_LAMBDARANK = _gbm_cfg.get("ensemble_lambdarank", True)
 
+# Momentum base model — the shared GBM params above are tuned for the strong
+# volatility signal. On the weak momentum target they overfit; the momentum
+# base needs its own capacity config. Real values live in the private
+# alpha-engine-config/predictor/predictor.yaml under gbm.momentum. Backtester
+# can further override via s3://{bucket}/config/predictor_momentum_params.json.
+# Missing section hard-fails — we never silently fall back to shared params.
+_gbm_mom_cfg = _gbm_cfg.get("momentum")
+if not _gbm_mom_cfg or "tuned_params" not in _gbm_mom_cfg:
+    raise RuntimeError(
+        "predictor.yaml is missing the required gbm.momentum section. "
+        "Production values live in alpha-engine-config/predictor/predictor.yaml. "
+        "See config/predictor.sample.yaml for the required schema."
+    )
+MOMENTUM_GBM_N_ESTIMATORS = _gbm_mom_cfg["n_estimators"]
+MOMENTUM_GBM_EARLY_STOPPING_ROUNDS = _gbm_mom_cfg["early_stopping_rounds"]
+MOMENTUM_GBM_TUNED_PARAMS = {**GBM_TUNED_PARAMS, **_gbm_mom_cfg["tuned_params"]}
+
 # ── CatBoost ensemble ──────────────────────────────────────────────────────
 _cat_cfg = _cfg.get("catboost", {})
 CATBOOST_ENABLED = _cat_cfg.get("enabled", False)

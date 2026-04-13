@@ -30,6 +30,35 @@ import pandas as pd
 log = logging.getLogger(__name__)
 
 
+_MOMENTUM_PARAMS_S3_KEY = "config/predictor_momentum_params.json"
+
+
+def _load_momentum_params_from_s3(bucket: str) -> dict | None:
+    """Read momentum GBM params from S3 if present.
+
+    Written by the backtester's hyperparam sweep (future). Schema:
+      {"n_estimators": int, "early_stopping_rounds": int,
+       "tuned_params": {"num_leaves": int, ...}}
+
+    Returns None when the key is absent or unreadable — callers fall back
+    to YAML defaults (config.MOMENTUM_GBM_*).
+    """
+    try:
+        import boto3
+        s3 = boto3.client("s3")
+        obj = s3.get_object(Bucket=bucket, Key=_MOMENTUM_PARAMS_S3_KEY)
+        data = json.loads(obj["Body"].read())
+        if not isinstance(data, dict):
+            log.warning("Momentum params S3 override is not a dict — ignoring")
+            return None
+        return data
+    except Exception as e:
+        # NoSuchKey / AccessDenied / parse errors all fall back silently
+        log.debug("No momentum params override on S3 (%s): %s",
+                  _MOMENTUM_PARAMS_S3_KEY, e)
+        return None
+
+
 def run_meta_training(
     data_dir: str,
     bucket: str,
@@ -262,6 +291,22 @@ def run_meta_training(
     wf_n_est = getattr(cfg, "WF_N_ESTIMATORS", None) or cfg.GBM_N_ESTIMATORS
     wf_es = getattr(cfg, "WF_EARLY_STOPPING", None) or cfg.GBM_EARLY_STOPPING_ROUNDS
 
+    # Momentum base params: YAML defaults from config.MOMENTUM_GBM_* with
+    # optional S3 override from config/predictor_momentum_params.json (written
+    # by the backtester's hyperparam sweep). Volatility base keeps the shared
+    # GBM params — only momentum has the weak-signal / overfitting issue.
+    mom_tuned_params = dict(cfg.MOMENTUM_GBM_TUNED_PARAMS)
+    mom_n_est = cfg.MOMENTUM_GBM_N_ESTIMATORS
+    mom_es = cfg.MOMENTUM_GBM_EARLY_STOPPING_ROUNDS
+    _s3_override = _load_momentum_params_from_s3(bucket)
+    if _s3_override:
+        if "tuned_params" in _s3_override:
+            mom_tuned_params.update(_s3_override["tuned_params"])
+        mom_n_est = _s3_override.get("n_estimators", mom_n_est)
+        mom_es = _s3_override.get("early_stopping_rounds", mom_es)
+        log.info("Momentum params overridden from S3: n_est=%d es=%d keys=%s",
+                 mom_n_est, mom_es, list(_s3_override.get("tuned_params", {}).keys()))
+
     # Collect OOS predictions for meta-model training
     oos_meta_rows = []  # list of dicts with meta-features + actual outcome
     fold_results = []
@@ -273,10 +318,10 @@ def run_meta_training(
         tr = fold["train_idx"]
         te = fold["test_idx"]
 
-        # Train momentum model
+        # Train momentum model (low-capacity — see mom_tuned_params above)
         n_sub = int(len(tr) * 0.85)
-        mom_scorer = GBMScorer(params=tuned_params, n_estimators=wf_n_est,
-                               early_stopping_rounds=wf_es)
+        mom_scorer = GBMScorer(params=mom_tuned_params, n_estimators=mom_n_est,
+                               early_stopping_rounds=mom_es)
         mom_scorer.fit(X_mom[tr[:n_sub]], y_fwd[tr[:n_sub]],
                        X_mom[tr[n_sub:]], y_fwd[tr[n_sub:]],
                        feature_names=cfg.MOMENTUM_FEATURES)
@@ -361,9 +406,9 @@ def run_meta_training(
     n_val_raw = int(N * cfg.VAL_FRAC)
     val_end = min(n_train + n_val_raw, N)
 
-    # Momentum production model
-    prod_mom = GBMScorer(params=tuned_params, n_estimators=cfg.GBM_N_ESTIMATORS,
-                         early_stopping_rounds=cfg.GBM_EARLY_STOPPING_ROUNDS)
+    # Momentum production model (low-capacity — see mom_tuned_params above)
+    prod_mom = GBMScorer(params=mom_tuned_params, n_estimators=mom_n_est,
+                         early_stopping_rounds=mom_es)
     prod_mom.fit(X_mom[:n_train], y_fwd[:n_train],
                  X_mom[n_train:val_end], y_fwd[n_train:val_end],
                  feature_names=cfg.MOMENTUM_FEATURES)

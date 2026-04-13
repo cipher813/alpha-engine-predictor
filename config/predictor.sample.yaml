@@ -53,6 +53,26 @@ gbm:
     verbosity: -1
     seed: 42
 
+  # Momentum base override (required) — fields here take precedence over the
+  # shared tuned_params above for the momentum base only. Volatility base
+  # keeps the shared params. Values below are LightGBM library defaults
+  # (publicly documented, not our tuning) to keep the sample runnable and
+  # CI green; real tuned values live in the private
+  # alpha-engine-config/predictor/predictor.yaml. Missing section hard-fails
+  # at config load — do not silently fall back to shared params.
+  momentum:
+    n_estimators: 100              # LightGBM default
+    early_stopping_rounds: 20
+    tuned_params:
+      num_leaves: 31               # LightGBM default
+      max_depth: -1                # LightGBM default (no limit)
+      min_child_samples: 20        # LightGBM default
+      learning_rate: 0.1           # LightGBM default
+      feature_fraction: 1.0        # LightGBM default
+      bagging_fraction: 1.0        # LightGBM default
+      lambda_l1: 0.0               # LightGBM default
+      lambda_l2: 0.0               # LightGBM default
+
 # ── CatBoost ensemble ────────────────────────────────────────────────────────
 # Train CatBoost alongside LightGBM and blend predictions.
 # Different inductive biases (ordered boosting) produce complementary predictions.
