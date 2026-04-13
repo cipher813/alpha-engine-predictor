@@ -35,6 +35,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Materialize runtime config
+        # The real predictor.yaml is gitignored (it lives in the private
+        # alpha-engine-config repo). GitHub runners don't have it, so the
+        # Dockerfile's `COPY config/ config/` would ship only the sample.
+        # Copy sample → real so the image has a valid YAML at the expected
+        # path; sensitive values come from Lambda env vars at runtime.
+        # Mirrors the step ci.yml already uses for tests.
+        run: cp config/predictor.sample.yaml config/predictor.yaml
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 

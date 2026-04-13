@@ -92,24 +92,21 @@ def handler(event: dict, context) -> dict:
         }
 
     # ── Predict (default) ──────────────────────────────────────────────────────
-    try:
-        from inference.daily_predict import main
-        main(
-            date_str=date_str,
-            dry_run=dry_run,
-            local=False,
-            model_type="gbm",
-            watchlist_path="auto",
-        )
-        log.info("Predictor Lambda completed successfully")
-        return {
-            "statusCode": 200,
-            "body": f"Predictions written for {date_str or 'today'}",
-        }
-
-    except Exception as exc:
-        log.exception("Predictor Lambda failed: %s", exc)
-        return {
-            "statusCode": 500,
-            "body": f"Predictor Lambda failed: {exc}",
-        }
+    # Any failure must raise so Step Functions sees a real task failure and the
+    # Catch branch blocks downstream executor. Returning statusCode:500 would
+    # look like a successful Lambda response and let executor proceed on stale
+    # predictions — the exact silent-failure mode that hit production on
+    # 2026-04-13.
+    from inference.daily_predict import main
+    main(
+        date_str=date_str,
+        dry_run=dry_run,
+        local=False,
+        model_type="gbm",
+        watchlist_path="auto",
+    )
+    log.info("Predictor Lambda completed successfully")
+    return {
+        "statusCode": 200,
+        "body": f"Predictions written for {date_str or 'today'}",
+    }
