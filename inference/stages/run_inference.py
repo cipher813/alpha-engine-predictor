@@ -4,8 +4,13 @@ from __future__ import annotations
 
 import io
 import logging
+import os
 from typing import Optional
 
+import arcticdb as adb  # Hard dep: PR #5 removed the try/except ImportError
+                        # fallback that masked a missing Lambda layer for a
+                        # week before detection. If arcticdb isn't in the
+                        # deploy image, the Lambda must fail at cold start.
 import numpy as np
 import pandas as pd
 
@@ -13,6 +18,57 @@ import config as cfg
 from inference.pipeline import PipelineContext, PipelineAbort
 
 log = logging.getLogger(__name__)
+
+
+def _load_precomputed_features_from_arcticdb(
+    ctx: PipelineContext,
+) -> dict[str, pd.Series]:
+    """Read the latest feature row per ticker from ArcticDB's ``universe`` library.
+
+    Raises RuntimeError on ArcticDB-wide failure (library unreachable,
+    zero tickers readable). Individual missing/unreadable tickers are
+    logged at WARNING and skipped — the meta-inference loop below filters
+    them out. A ≥5% per-ticker error rate short-circuits with a raise.
+
+    Replaces the prior three-tier read: S3 parquet feature store →
+    inline compute_features. Those fallbacks masked a ``_run_gbm_inference``
+    miswiring where ArcticDB was never actually consulted in production.
+    """
+    region = os.environ.get("AWS_REGION", "us-east-1")
+    uri = f"s3s://s3.{region}.amazonaws.com:{ctx.bucket}?path_prefix=arcticdb&aws_auth=true"
+    try:
+        universe = adb.Arctic(uri).get_library("universe")
+    except Exception as exc:
+        raise RuntimeError(
+            f"ArcticDB universe library unreachable at {uri}: {exc}"
+        ) from exc
+
+    precomputed: dict[str, pd.Series] = {}
+    n_err = 0
+    for ticker in ctx.tickers:
+        try:
+            df = universe.read(ticker).data
+        except Exception as exc:
+            log.warning("ArcticDB read failed for %s: %s", ticker, exc)
+            n_err += 1
+            continue
+        if df.empty:
+            log.warning("ArcticDB returned empty frame for %s", ticker)
+            n_err += 1
+            continue
+        precomputed[ticker] = df.iloc[-1]
+
+    err_rate = n_err / max(len(ctx.tickers), 1)
+    if err_rate > 0.05:
+        raise RuntimeError(
+            f"ArcticDB read error rate {err_rate:.1%} exceeds 5% threshold "
+            f"({n_err} failed of {len(ctx.tickers)}) — treating as pipeline failure"
+        )
+    log.info(
+        "[data_source=arcticdb] Loaded %d/%d pre-computed tickers for %s",
+        len(precomputed), len(ctx.tickers), ctx.date_str,
+    )
+    return precomputed
 
 
 # ── Per-ticker MLP prediction (migrated from daily_predict.py) ───────────────
@@ -57,7 +113,10 @@ def run(ctx: PipelineContext) -> None:
 
 def _run_meta_inference(ctx: PipelineContext) -> None:
     """Run Layer 1 specialized models → meta-model → predictions."""
-    from data.feature_engineer import compute_features as _compute_features
+    # Note: `data.feature_engineer.compute_features` is no longer imported here
+    # after PR #5 removed the per-ticker inline compute fallback. Features now
+    # come exclusively from ArcticDB via _load_precomputed_features_from_arcticdb.
+    # Training still imports it — only inference was migrated.
     from model.meta_model import META_FEATURES
 
     mom_scorer = ctx.meta_models.get("momentum")
@@ -128,86 +187,30 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
     except Exception as e:
         log.warning("Research signal loading failed: %s", e)
 
-    # ── Step 3: Load pre-computed features from S3 feature store ────────────────
+    # ── Step 3: Load pre-computed features from ArcticDB ──────────────────────
+    # PR #5 cutover: ArcticDB is the single feature source. The prior
+    # three-tier read (S3 parquet feature store → inline compute) was
+    # deleted because:
+    # (1) It was also living inside the dead `_run_gbm_inference` function,
+    #     which PR #3 meant to target but never actually reached production.
+    # (2) Silent fallbacks turned a broken feature source into "degraded
+    #     mode" warnings that no one saw, which is exactly the pattern
+    #     that masked the 2026-04-14 ArcticDB outage.
+    # Preflight (inference/preflight.py) verifies macro/SPY freshness
+    # before we get here. If ArcticDB is broken, cold start fails loud.
     max_r = getattr(cfg, "LABEL_CLIP", 0.15)
-
-    precomputed: dict[str, pd.Series] = {}
-    try:
-        import boto3 as _b3_fs
-        _s3_fs = _b3_fs.client("s3")
-
-        def _read_snapshot(group: str) -> pd.DataFrame | None:
-            try:
-                _key = f"{cfg.FEATURE_STORE_PREFIX}{ctx.date_str}/{group}.parquet"
-                _obj = _s3_fs.get_object(Bucket=ctx.bucket, Key=_key)
-                return pd.read_parquet(io.BytesIO(_obj["Body"].read()))
-            except Exception:
-                return None
-
-        _tech_df = _read_snapshot("technical")
-        if _tech_df is not None and "ticker" in _tech_df.columns:
-            for _, row in _tech_df.iterrows():
-                t = row["ticker"]
-                precomputed[t] = row
-            # Merge additional per-ticker groups into precomputed features
-            for group in ("interaction", "alternative", "fundamental"):
-                _grp_df = _read_snapshot(group)
-                if _grp_df is not None and "ticker" in _grp_df.columns:
-                    _grp_by_ticker = {r["ticker"]: r for _, r in _grp_df.iterrows()}
-                    for t, row in precomputed.items():
-                        if t in _grp_by_ticker:
-                            for col in _grp_by_ticker[t].index:
-                                if col != "ticker" and col not in row.index:
-                                    row[col] = _grp_by_ticker[t][col]
-            log.info(
-                "Feature store: loaded %d pre-computed tickers for %s",
-                len(precomputed), ctx.date_str,
-            )
-        else:
-            log.warning(
-                "Feature store snapshot missing for %s — falling back to inline compute. "
-                "This is degraded mode; check that DailyData/DataPhase1 ran successfully.",
-                ctx.date_str,
-            )
-    except Exception as _fs_exc:
-        log.warning("Feature store read failed — falling back to inline compute: %s", _fs_exc)
+    precomputed = _load_precomputed_features_from_arcticdb(ctx)
 
     for ticker in ctx.tickers:
-        # Use pre-computed features if available, else compute inline
-        latest = None
-        if ticker in precomputed:
-            latest = precomputed[ticker]
-        else:
-            df = ctx.price_data.get(ticker, pd.DataFrame())
-            if df.empty or len(df) < cfg.MIN_ROWS_FOR_FEATURES:
-                ctx.n_skipped += 1
-                continue
-
-            sector_etf_sym = ctx.sector_map.get(ticker)
-            sector_etf_series = ctx.macro.get(sector_etf_sym) if sector_etf_sym else None
-
-            try:
-                featured_df = _compute_features(
-                    df,
-                    spy_series=ctx.macro.get("SPY") if ctx.macro else None,
-                    vix_series=ctx.macro.get("VIX") if ctx.macro else None,
-                    sector_etf_series=sector_etf_series,
-                    tnx_series=ctx.macro.get("TNX") if ctx.macro else None,
-                    irx_series=ctx.macro.get("IRX") if ctx.macro else None,
-                    gld_series=ctx.macro.get("GLD") if ctx.macro else None,
-                    uso_series=ctx.macro.get("USO") if ctx.macro else None,
-                    vix3m_series=ctx.macro.get("VIX3M") if ctx.macro else None,
-                )
-            except Exception as exc:
-                log.warning("Feature computation failed for %s: %s", ticker, exc)
-                ctx.n_skipped += 1
-                continue
-
-            if featured_df.empty:
-                ctx.n_skipped += 1
-                continue
-
-            latest = featured_df.iloc[-1]
+        latest = precomputed.get(ticker)
+        if latest is None:
+            # Ticker not in ArcticDB (new constituent not yet backfilled, or
+            # transient per-ticker read failure below the 5% threshold).
+            # Inline compute fallback was removed in PR #5 — a production
+            # feature store with per-ticker holes is the upstream team's
+            # job to fix, not ours to mask.
+            ctx.n_skipped += 1
+            continue
 
         # Layer 1A: Momentum model
         # If the momentum GBM has low quality (IC < 0.02 or best_iter <= 1),
@@ -372,7 +375,28 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
 
 
 def _run_gbm_inference(ctx: PipelineContext) -> None:
-    """Batch GBM inference with cross-sectional rank normalization."""
+    """Batch GBM inference with cross-sectional rank normalization.
+
+    DEAD CODE — flagged 2026-04-14 (PR #5).
+
+    This is the v2 single-model GBM inference path. It was deprecated when
+    the v3.0 meta-model shipped 2026-04-01 and replaced by
+    ``_run_meta_inference``. The only remaining caller is a now-defensive
+    fallback at ``_run_meta_inference:127`` that fires only if every
+    meta-model (momentum, volatility, research_calibrator, meta) fails to
+    load — which doesn't happen in production.
+
+    PR #3 (2026-04-07) accidentally wired the ArcticDB feature read into
+    THIS function instead of ``_run_meta_inference``, which is why
+    production ran on legacy S3 parquet for a week with no one noticing.
+    PR #5 moved the real ArcticDB read into ``_run_meta_inference`` where
+    it belongs. The ArcticDB block below this comment is now redundant
+    with the production path.
+
+    Slated for deletion in a follow-up cleanup PR once PR #5's ArcticDB
+    cutover has soaked in production and the meta-model-unloadable
+    fallback is proven to be truly unreachable.
+    """
     from data.feature_engineer import compute_features as _compute_features
     from scipy.stats import rankdata as _rankdata_inf
 

@@ -30,6 +30,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+from pathlib import Path
 
 # Load secrets from SSM Parameter Store (must run before any os.environ.get)
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
@@ -51,13 +52,20 @@ def handler(event: dict, context) -> dict:
     os.environ.setdefault("S3_BUCKET", "alpha-engine-research")
     os.environ.setdefault("XDG_CACHE_HOME", "/tmp")
 
-    # Structured logging: JSON on EC2/Lambda (ALPHA_ENGINE_JSON_LOGS=1), text locally.
-    try:
-        from log_config import setup_logging
-        setup_logging("predictor")
-    except ImportError:
-        logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)-8s  %(message)s")
+    # Structured logging + flow-doctor via alpha-engine-lib (shared with
+    # alpha-engine-data). Replaces the duplicated local log_config.py.
+    from alpha_engine_lib.logging import setup_logging
+    setup_logging(
+        "predictor",
+        flow_doctor_yaml=str(Path(__file__).parent.parent / "flow-doctor.yaml"),
+    )
     logging.getLogger().setLevel(logging.INFO)
+
+    # Preflight — fail fast on env / connectivity / ArcticDB freshness
+    # before loading models or touching inference. See PR #5 and
+    # inference/preflight.py.
+    from inference.preflight import PredictorPreflight
+    PredictorPreflight(bucket=os.environ.get("S3_BUCKET", "alpha-engine-research")).run()
 
     fd = None
 

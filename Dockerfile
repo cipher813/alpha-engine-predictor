@@ -20,10 +20,19 @@ FROM public.ecr.aws/lambda/python:3.12
 # Install libgomp (OpenMP runtime required by LightGBM).
 RUN dnf install -y libgomp && dnf clean all
 
+# Stage alpha-engine-lib from a local vendor directory. deploy.sh (or a
+# local sibling clone) populates vendor/alpha-engine-lib before the
+# Docker build. This mirrors the alpha-engine-config staging pattern —
+# both private repos reach the build context without the Dockerfile
+# needing a GitHub PAT or Docker build secret.
+COPY vendor/alpha-engine-lib /tmp/alpha-engine-lib
+
 # Copy and install Python requirements first for better layer caching.
 COPY requirements-lambda.txt .
 
-RUN pip install --no-cache-dir -r requirements-lambda.txt
+RUN pip install --no-cache-dir /tmp/alpha-engine-lib[arcticdb,flow_doctor] && \
+    pip install --no-cache-dir -r requirements-lambda.txt && \
+    rm -rf /root/.cache/pip /tmp/alpha-engine-lib
 
 # Copy application code
 COPY retry.py .
