@@ -17,6 +17,16 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Configure git auth for private alpha-engine-lib
+        env:
+          ALPHA_ENGINE_LIB_TOKEN: ${{ secrets.ALPHA_ENGINE_LIB_TOKEN }}
+        run: |
+          if [ -z "$ALPHA_ENGINE_LIB_TOKEN" ]; then
+            echo "::error::ALPHA_ENGINE_LIB_TOKEN secret not set — required to install private alpha-engine-lib"
+            exit 1
+          fi
+          git config --global url."https://x-access-token:${ALPHA_ENGINE_LIB_TOKEN}@github.com/cipher813/alpha-engine-lib".insteadOf "https://github.com/cipher813/alpha-engine-lib"
+
       - name: Install dependencies
         run: |
           pip install --upgrade pip

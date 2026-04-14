@@ -1,3 +1,8 @@
+# Vendored private dep — staged from alpha-engine-lib sibling repo by
+# deploy.sh before `docker build`. Must not be committed; real source is
+# github.com/cipher813/alpha-engine-lib.
+vendor/
+
 # Python
 __pycache__/
 *.py[cod]

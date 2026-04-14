@@ -11,6 +11,12 @@ lxml>=4.9.0
 lightgbm>=4.0.0
 scikit-learn>=1.3.0
 
+# Shared lib (used by inference + training entrypoints)
+# Lambda build installs from local path (deploy.sh stages vendor/alpha-engine-lib).
+# CI + EC2 install via git URL using ALPHA_ENGINE_LIB_TOKEN for auth
+# (see .github/workflows/ci.yml git URL rewrite step).
+alpha-engine-lib[arcticdb,flow_doctor] @ git+https://github.com/cipher813/alpha-engine-lib@v0.1.1
+
 # Training dependencies (not needed in Lambda)
 arcticdb>=6.11
 catboost>=1.2.0
