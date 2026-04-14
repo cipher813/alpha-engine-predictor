@@ -69,6 +69,17 @@ def download_price_cache(bucket: str, prefix: str, local_dir: Path) -> int:
     """
     Download all objects under S3 prefix (Parquets + sector_map.json) to local_dir.
     Returns number of files downloaded.
+
+    DEAD CODE — flagged 2026-04-14 (PR #6).
+
+    This was the S3-parquet fallback path used by ``main()`` when ArcticDB
+    was unavailable. PR #6 removed that fallback — ArcticDB is now the
+    single source of training data. Zero callers remain after this PR;
+    ``store/arctic_reader.py`` docstring still references the signature
+    but doesn't invoke it.
+
+    Slated for deletion in a follow-up cleanup PR once PR #6's training
+    cutover has soaked for 2+ Saturday runs against live ArcticDB.
     """
     import boto3
     s3 = boto3.client("s3")
@@ -1689,31 +1700,38 @@ def main(
 
     fd = None
 
+    # Structured logging + flow-doctor via alpha-engine-lib (same as
+    # inference handler). Training runs on EC2 spot which doesn't
+    # configure logging elsewhere, so this needs to happen at entry.
+    from alpha_engine_lib.logging import setup_logging
+    setup_logging(
+        "predictor-training",
+        flow_doctor_yaml=str(Path(__file__).parent.parent / "flow-doctor-training.yaml"),
+    )
+    logging.getLogger().setLevel(logging.INFO)
+
+    # Preflight — fail fast on env / connectivity / ArcticDB staleness
+    # before a 90-minute training run commits to stale data. See PR #6
+    # and training/preflight.py.
+    from training.preflight import TrainingPreflight
+    TrainingPreflight(bucket=bucket).run()
+
     log.info("GBM training run: date=%s  bucket=%s  dry_run=%s", date_str, bucket, dry_run)
 
-    # Step 1: Load price cache — try ArcticDB first, fall back to S3 parquets
+    # Step 1: Load price cache from ArcticDB. PR #6 removed the S3 parquet
+    # fallback — it masked the PR #3 miswiring for a week (same root cause
+    # as the inference-path issue fixed in PR #5). Preflight above already
+    # verified macro/SPY freshness, so ArcticDB is known reachable here.
     tmp_cache = Path(tempfile.mkdtemp()) / "cache"
-    n_files = 0
-
-    try:
-        from store.arctic_reader import download_from_arctic
-        log.info("[data_source=arcticdb] Loading universe from ArcticDB...")
-        n_files = download_from_arctic(bucket=bucket, local_dir=tmp_cache)
-    except Exception as exc:
-        log.warning("[data_source=arcticdb] ArcticDB load failed — falling back to S3 parquets: %s", exc)
-
-    if n_files == 0:
-        log.info("[data_source=legacy] Downloading price cache from S3...")
-        n_files = download_price_cache(
-            bucket=bucket,
-            prefix="predictor/price_cache/",
-            local_dir=tmp_cache,
-        )
+    from store.arctic_reader import download_from_arctic
+    log.info("[data_source=arcticdb] Loading universe from ArcticDB...")
+    n_files = download_from_arctic(bucket=bucket, local_dir=tmp_cache)
 
     if n_files == 0:
         raise RuntimeError(
-            f"No files found from ArcticDB or s3://{bucket}/predictor/price_cache/ — "
-            "run builders/backfill.py or bootstrap_fetcher.py first."
+            f"ArcticDB returned zero files for training — "
+            f"universe library is empty or unreachable at bucket={bucket}. "
+            "Check Saturday DataPhase1 + weekly backfill ran cleanly."
         )
 
     # Step 1b: Price cache refresh now handled by alpha-engine-data (Phase 1).
