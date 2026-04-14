@@ -224,6 +224,27 @@ ssh -A $SSH_OPTS -i "$KEY_FILE" ec2-user@"$PUBLIC_IP" \
   run_remote "git clone --depth 1 --branch $BRANCH $HTTPS_URL /home/ec2-user/predictor"
 }
 
+# ── Copy local config + .env to EC2 ──────────────────────────────────────────
+# Must happen BEFORE `pip install` because requirements.txt now includes a
+# private-repo dep (alpha-engine-lib @ git+https://...) that needs the
+# ALPHA_ENGINE_LIB_TOKEN from .env to clone. Previously .env was uploaded
+# after pip install, which worked when all deps were public. Moving it
+# up in the sequence is the fix for the 2026-04-14 smoke failure:
+# "could not read Username for 'https://github.com'".
+echo "==> Uploading config/predictor.yaml and .env..."
+scp $SSH_OPTS -i "$KEY_FILE" \
+  "$REPO_ROOT/config/predictor.yaml" \
+  ec2-user@"$PUBLIC_IP":/home/ec2-user/predictor/config/predictor.yaml
+
+if [ -f "$ENV_FILE" ]; then
+  scp $SSH_OPTS -i "$KEY_FILE" \
+    "$ENV_FILE" \
+    ec2-user@"$PUBLIC_IP":/home/ec2-user/predictor/.env
+else
+  echo "ERROR: .env not found at $ENV_FILE — required for ALPHA_ENGINE_LIB_TOKEN"
+  exit 1
+fi
+
 echo "==> Installing Python dependencies..."
 run_remote bash -s <<'DEPS'
 set -euo pipefail
@@ -236,23 +257,27 @@ else
 fi
 
 $PIP install --upgrade pip -q
-# Filter out private packages (flow-doctor) that aren't on PyPI
+
+# Configure git auth for the private alpha-engine-lib dep. Token is read
+# from the .env that was SCP'd in the step above.
+set -a
+source /home/ec2-user/predictor/.env
+set +a
+
+if [ -z "${ALPHA_ENGINE_LIB_TOKEN:-}" ]; then
+  echo "ERROR: ALPHA_ENGINE_LIB_TOKEN missing from .env — required for private alpha-engine-lib install"
+  exit 1
+fi
+
+git config --global url."https://x-access-token:${ALPHA_ENGINE_LIB_TOKEN}@github.com/cipher813/alpha-engine-lib".insteadOf "https://github.com/cipher813/alpha-engine-lib"
+
+# Filter out private packages (flow-doctor) that aren't on PyPI. alpha-engine-lib
+# is a git+https URL in requirements.txt and is resolved via the URL rewrite
+# above (private repo, no PyPI).
 grep -v '^flow-doctor' requirements.txt | $PIP install -q -r /dev/stdin
 echo "Dependencies installed."
-$PIP list --format=columns | grep -iE 'numpy|pandas|lightgbm|catboost|scikit-learn|scipy|shap|pyyaml' || true
+$PIP list --format=columns | grep -iE 'numpy|pandas|lightgbm|catboost|scikit-learn|scipy|shap|pyyaml|alpha-engine-lib' || true
 DEPS
-
-# ── Copy local config + .env to EC2 ──────────────────────────────────────────
-echo "==> Uploading config/predictor.yaml and .env..."
-scp $SSH_OPTS -i "$KEY_FILE" \
-  "$REPO_ROOT/config/predictor.yaml" \
-  ec2-user@"$PUBLIC_IP":/home/ec2-user/predictor/config/predictor.yaml
-
-if [ -f "$ENV_FILE" ]; then
-  scp $SSH_OPTS -i "$KEY_FILE" \
-    "$ENV_FILE" \
-    ec2-user@"$PUBLIC_IP":/home/ec2-user/predictor/.env
-fi
 
 # ── Build env export command for remote shells ────────────────────────────────
 # Source .env on the remote side so all training/email code sees the vars
