@@ -1721,35 +1721,16 @@ def main(
     # so S3 parquets are already current.
     log.info("Price cache refresh: skipped (handled by alpha-engine-data)")
 
-    # Step 2: Train + upload
-    import config as _train_cfg
-    if _train_cfg.META_MODEL_ENABLED:
-        from training.meta_trainer import run_meta_training
-        result = run_meta_training(
-            data_dir=str(tmp_cache),
-            bucket=bucket,
-            date_str=date_str,
-            dry_run=dry_run,
-        )
-    elif _train_cfg.MULTI_HORIZON_ENABLED:
-        mh_result = run_multi_horizon_training(
-            data_dir=str(tmp_cache),
-            bucket=bucket,
-            date_str=date_str,
-            dry_run=dry_run,
-        )
-        result = mh_result["primary"]
-        result["multi_horizon"] = {
-            "horizons": mh_result["horizons"],
-            "auxiliary": mh_result["auxiliary"],
-        }
-    else:
-        result = run_gbm_training(
-            data_dir=str(tmp_cache),
-            bucket=bucket,
-            date_str=date_str,
-            dry_run=dry_run,
-        )
+    # Step 2: Train + upload (v3 meta-model only — v2 single-GBM and
+    # multi-horizon dispatch branches removed 2026-04-13; v2 machinery
+    # itself still in-tree, full rip-out tracked in ROADMAP).
+    from training.meta_trainer import run_meta_training
+    result = run_meta_training(
+        data_dir=str(tmp_cache),
+        bucket=bucket,
+        date_str=date_str,
+        dry_run=dry_run,
+    )
 
     # Step 2b: Slim cache write now handled by alpha-engine-data (Phase 1).
     # The data repo writes price_cache_slim/ from the full cache after refresh.
