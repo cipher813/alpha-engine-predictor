@@ -92,8 +92,13 @@ def run_meta_training(
     data_path = Path(data_dir)
 
     from data.dataset import _load_ticker_parquet, cross_sectional_rank_normalize
-    from data.feature_engineer import compute_features
     from data.label_generator import compute_labels
+    # compute_features is intentionally NOT imported — training reads
+    # pre-computed features from ArcticDB via the parquet cache written
+    # by store/arctic_reader.py:download_from_arctic. Source of truth is
+    # alpha-engine-data (features/feature_engineer.py). Inline compute
+    # was deleted 2026-04-15 per ROADMAP P2 to eliminate the predictor/
+    # data-module feature logic duplication. See PR #NN.
 
     # Load reference series
     def _load_close(fn):
@@ -136,22 +141,34 @@ def run_meta_training(
     all_close_prices = {}
     all_parquets = sorted(data_path.glob("*.parquet"))
 
-    # ── Step 2: Build per-ticker feature arrays ──────────────────────────────
-    # Per feedback_no_silent_fails + feedback_hard_fail_until_stable: count
-    # every reject bucket and surface it. 2026-04-15 smoke test produced
-    # "Feature computation complete: 0 tickers" followed by a cryptic
-    # np.stack crash because this loop quietly discarded 909/909 tickers
-    # across two silent-fail sites (len<265 skip, except-Exception-continue).
-    # First 5 rejects in each bucket are retained for diagnostics so a
-    # rerun tells us *what* is wrong, not just *that* nothing survived.
-    log.info("Computing features for all tickers...")
+    # ── Step 2: Read pre-computed features from ArcticDB-populated parquets ──
+    # alpha-engine-data's features/feature_engineer.py writes 53 features
+    # to ArcticDB's universe library (per ticker, per date). store/
+    # arctic_reader.py:download_from_arctic has already materialized those
+    # to the local parquet cache at data_dir. We read them directly here
+    # and compute labels. No inline feature compute — the predictor owns
+    # labels (future-looking, not in ArcticDB), the data module owns
+    # features (point-in-time, in ArcticDB).
+    #
+    # Per feedback_hard_fail_until_stable: any ticker missing required
+    # feature columns is counted and, if the total accepted is zero, the
+    # error surfaces with a full reject summary. Compare to pre-2026-04-15
+    # behavior where compute_features was called inline and silent
+    # except-Exception-continue discarded 909/909 tickers.
+    _required_features = list(set(cfg.MOMENTUM_FEATURES) | set(cfg.VOLATILITY_FEATURES))
+    log.info(
+        "Reading pre-computed features from ArcticDB-populated parquets "
+        "(required: %d columns)...",
+        len(_required_features),
+    )
     ticker_features: dict[str, pd.DataFrame] = {}
     reject_too_short: list[tuple[str, int]] = []
     reject_empty_raw: list[str] = []
-    reject_feature_error: list[tuple[str, str]] = []
+    reject_missing_features: list[tuple[str, str]] = []
+    reject_label_error: list[tuple[str, str]] = []
     reject_empty_labeled: list[str] = []
     n_candidates = 0
-    _MIN_HISTORY_ROWS = 265  # ~1 year of trading days — required for feature windows
+    _MIN_HISTORY_ROWS = 265  # ~1 year of trading days — required for walk-forward folds
 
     for path in all_parquets:
         ticker = path.stem
@@ -167,22 +184,20 @@ def run_meta_training(
             continue
         if "Close" in raw_df.columns:
             all_close_prices[ticker] = raw_df["Close"].astype(float)
+        missing = [c for c in _required_features if c not in raw_df.columns]
+        if missing:
+            reject_missing_features.append((ticker, ",".join(missing[:3])))
+            continue
         sector_etf_sym = sector_map.get(ticker)
         sector_etf_s = sector_etf_cache.get(sector_etf_sym) if sector_etf_sym else None
         try:
-            featured = compute_features(
-                raw_df, spy_series=spy_series, vix_series=vix_series,
-                sector_etf_series=sector_etf_s, tnx_series=tnx_series,
-                irx_series=irx_series, gld_series=gld_series, uso_series=uso_series,
-                vix3m_series=vix3m_series,
-            )
             labeled = compute_labels(
-                featured, forward_days=cfg.FORWARD_DAYS,
+                raw_df, forward_days=cfg.FORWARD_DAYS,
                 up_threshold=cfg.UP_THRESHOLD, down_threshold=cfg.DOWN_THRESHOLD,
                 benchmark_returns=sector_etf_s if sector_etf_s is not None else spy_series,
             )
         except Exception as exc:
-            reject_feature_error.append((ticker, f"{type(exc).__name__}: {exc}"))
+            reject_label_error.append((ticker, f"{type(exc).__name__}: {exc}"))
             continue
         if labeled.empty:
             reject_empty_labeled.append(ticker)
@@ -190,11 +205,12 @@ def run_meta_training(
         ticker_features[ticker] = labeled
 
     log.info(
-        "Feature computation complete: %d accepted / %d candidates  "
-        "(rejected: too_short=%d  empty_raw=%d  feature_error=%d  empty_labeled=%d)",
+        "Feature read complete: %d accepted / %d candidates  "
+        "(rejected: too_short=%d  empty_raw=%d  missing_features=%d  "
+        "label_error=%d  empty_labeled=%d)",
         len(ticker_features), n_candidates,
         len(reject_too_short), len(reject_empty_raw),
-        len(reject_feature_error), len(reject_empty_labeled),
+        len(reject_missing_features), len(reject_label_error), len(reject_empty_labeled),
     )
 
     if len(ticker_features) == 0:
@@ -206,13 +222,17 @@ def run_meta_training(
             )
         raise RuntimeError(
             f"All {n_candidates} candidate tickers were rejected during feature "
-            f"computation. Training cannot proceed on an empty dataset. "
+            f"read. Training cannot proceed on an empty dataset. "
+            f"If missing_features > 0, alpha-engine-data's backfill must be "
+            f"re-run against ArcticDB to populate the required columns. "
             f"Rejects — "
             f"too_short (<{_MIN_HISTORY_ROWS} rows): {len(reject_too_short)} "
             f"[{_preview(reject_too_short)}]  "
             f"empty_raw: {len(reject_empty_raw)} [{_preview(reject_empty_raw)}]  "
-            f"feature_error: {len(reject_feature_error)} "
-            f"[{_preview(reject_feature_error)}]  "
+            f"missing_features: {len(reject_missing_features)} "
+            f"[{_preview(reject_missing_features)}]  "
+            f"label_error: {len(reject_label_error)} "
+            f"[{_preview(reject_label_error)}]  "
             f"empty_labeled: {len(reject_empty_labeled)} "
             f"[{_preview(reject_empty_labeled)}]"
         )
