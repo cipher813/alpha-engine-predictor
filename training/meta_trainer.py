@@ -32,6 +32,14 @@ log = logging.getLogger(__name__)
 
 _MOMENTUM_PARAMS_S3_KEY = "config/predictor_momentum_params.json"
 
+# Horizons for the post-training Spearman IC diagnostic. Training still
+# uses cfg.FORWARD_DAYS (5d today) as the label; these are *sidecar*
+# metrics that measure how well the trained model's rank-ordering
+# predicts alpha at alternative horizons. Answers "is 5d the right
+# horizon for this signal?" autonomously. 40d is included as a sanity
+# cap — if IC peaks there, we'd be looking at a different regime.
+_DIAGNOSTIC_HORIZONS = [5, 10, 15, 21, 40]
+
 
 def _load_momentum_params_from_s3(bucket: str) -> dict | None:
     """Read momentum GBM params from S3 if present.
@@ -203,25 +211,29 @@ def run_meta_training(
             reject_empty_labeled.append(ticker)
             continue
 
-        # v3.1 diagnostic (ROADMAP Predictor P2): compute 21d forward
-        # sector-neutral alpha alongside the 5d label. Used ONLY to
-        # evaluate the trained meta-model's IC at a longer horizon —
-        # tells us whether the 5d forward label is the right horizon
-        # (if 21d IC >> 5d IC, we should consider a parallel 21d
-        # training stack). Not used for training; pure sidecar metric.
+        # v3.1 diagnostic (ROADMAP Predictor P2): compute multi-horizon
+        # forward sector-neutral alpha alongside the 5d training label.
+        # Used ONLY to evaluate the trained meta-model's IC across
+        # horizons — tells us autonomously where the rank signal is
+        # strongest. 2026-04-15 first measurement showed 21d IC was 2.2×
+        # 5d IC; this sidecar extends to 10d / 15d / 21d / 40d so we
+        # can see the full curve rather than two endpoints. Not used
+        # for training.
         #
-        # Shift -21 means "close 21 rows ahead". At the tail of the
+        # Shift -N means "close N rows ahead". At the tail of the
         # history the value is NaN; rows with NaN are excluded from
-        # the 21d IC computation only (they still train on 5d).
-        close_for_21d = raw_df["Close"].astype(float)
-        bench_21d = sector_etf_s if sector_etf_s is not None else spy_series
-        if bench_21d is not None:
-            bench_aligned_21d = bench_21d.reindex(close_for_21d.index, method="ffill")
-            stock_fwd_21d = (close_for_21d.shift(-21) / close_for_21d) - 1.0
-            bench_fwd_21d = (bench_aligned_21d.shift(-21) / bench_aligned_21d) - 1.0
-            labeled["forward_return_21d"] = (stock_fwd_21d - bench_fwd_21d).reindex(labeled.index)
+        # the corresponding-horizon IC only.
+        close_for_horizon = raw_df["Close"].astype(float)
+        bench_for_horizon = sector_etf_s if sector_etf_s is not None else spy_series
+        if bench_for_horizon is not None:
+            bench_aligned = bench_for_horizon.reindex(close_for_horizon.index, method="ffill")
+            for h in _DIAGNOSTIC_HORIZONS:
+                stock_fwd = (close_for_horizon.shift(-h) / close_for_horizon) - 1.0
+                bench_fwd = (bench_aligned.shift(-h) / bench_aligned) - 1.0
+                labeled[f"forward_return_{h}d"] = (stock_fwd - bench_fwd).reindex(labeled.index)
         else:
-            labeled["forward_return_21d"] = float("nan")
+            for h in _DIAGNOSTIC_HORIZONS:
+                labeled[f"forward_return_{h}d"] = float("nan")
 
         ticker_features[ticker] = labeled
 
@@ -259,20 +271,26 @@ def run_meta_training(
         )
 
     # ── Step 3: Build arrays for momentum + volatility models ────────────────
-    # Flatten per-ticker DataFrames into (X, y, dates) arrays
+    # Flatten per-ticker DataFrames into (X, y, dates) arrays. Multi-horizon
+    # forward returns are carried as a parallel column array for the
+    # post-training IC diagnostic; not used by training itself.
     all_rows = []
     for ticker, df in ticker_features.items():
         mom_vals = df[cfg.MOMENTUM_FEATURES].to_numpy(dtype=np.float32)
         vol_vals = df[cfg.VOLATILITY_FEATURES].to_numpy(dtype=np.float32)
         fwd = df["forward_return_5d"].to_numpy(dtype=np.float32)
-        fwd_21d = df.get("forward_return_21d", pd.Series(float("nan"), index=df.index)).to_numpy(dtype=np.float32)
+        fwd_horizons = np.column_stack([
+            df.get(f"forward_return_{h}d", pd.Series(float("nan"), index=df.index))
+              .to_numpy(dtype=np.float32)
+            for h in _DIAGNOSTIC_HORIZONS
+        ])
         dates = df.index
         for j in range(len(dates)):
             all_rows.append((
                 dates[j], ticker,
                 mom_vals[j], vol_vals[j],
                 float(fwd[j]),
-                float(fwd_21d[j]),
+                fwd_horizons[j],  # shape = (len(_DIAGNOSTIC_HORIZONS),)
             ))
 
     all_rows.sort(key=lambda r: r[0])
@@ -281,7 +299,7 @@ def run_meta_training(
     X_mom = np.stack([r[2] for r in all_rows])
     X_vol = np.stack([r[3] for r in all_rows])
     y_fwd = np.array([r[4] for r in all_rows], dtype=np.float32)
-    y_fwd_21d = np.array([r[5] for r in all_rows], dtype=np.float32)  # diagnostic only
+    y_fwd_horizons = np.stack([r[5] for r in all_rows])  # shape = (N, n_horizons) — diagnostic only
 
     # Winsorize
     if cfg.LABEL_CLIP:
@@ -458,7 +476,7 @@ def run_meta_training(
 
             for idx in date_indices:
                 local_idx = np.where(te == idx)[0][0]
-                oos_meta_rows.append({
+                row = {
                     "momentum_score": float(mom_preds[local_idx]),
                     "expected_move": float(vol_preds[local_idx]),
                     "regime_bull": float(regime_probs[2]),
@@ -468,8 +486,11 @@ def run_meta_training(
                     "research_conviction": 0.0,
                     "sector_macro_modifier": 0.0,
                     "actual_fwd": float(y_fwd[idx]),
-                    "actual_fwd_21d": float(y_fwd_21d[idx]),  # diagnostic only
-                })
+                }
+                # Multi-horizon labels (diagnostic only)
+                for hi, h in enumerate(_DIAGNOSTIC_HORIZONS):
+                    row[f"actual_fwd_{h}d"] = float(y_fwd_horizons[idx, hi])
+                oos_meta_rows.append(row)
 
         elapsed = time.time() - fold_start
         fold_results.append({
@@ -487,30 +508,42 @@ def run_meta_training(
     meta_model = MetaModel(alpha=1.0)
     meta_model.fit(meta_X, meta_y, feature_names=META_FEATURES)
 
-    # ── Step 7.1: 21d forward IC diagnostic (ROADMAP Predictor P2) ───────────
-    # Evaluate whether the 5d-trained meta-model ranks tickers well at a
-    # 21d horizon. If 21d Spearman IC >> 5d IC, the 5d label is the
-    # wrong horizon (monthly momentum regime) and a parallel 21d stack
-    # is worth building. If 21d ≈ 5d, horizon isn't the issue — feature
-    # quality is. Either way the diagnostic is free: just a correlation
-    # against an already-collected label column. Not used for training.
+    # ── Step 7.1: Multi-horizon forward IC diagnostic (ROADMAP Predictor P2) ─
+    # Evaluate how well the 5d-trained meta-model ranks tickers at multiple
+    # forward horizons. 2026-04-15 first measurement (5d vs 21d only) showed
+    # 21d Spearman IC 2.2× 5d IC — suggested 5d was the wrong horizon.
+    # Extended to 5d / 10d / 15d / 21d / 40d so the data (not intuition)
+    # reveals where the signal peaks. Autonomous: system shouldn't be
+    # tuned to match current trader behavior; label horizon should track
+    # strongest signal. Pure sidecar — model still trained/promoted on 5d.
     from scipy.stats import spearmanr
-    meta_y_21d = np.array([r["actual_fwd_21d"] for r in oos_meta_rows])
     meta_preds_oos_insample = meta_model.predict(meta_X).ravel()
-    mask_5d = np.isfinite(meta_y)
-    mask_21d = np.isfinite(meta_y_21d)
-    spearman_5d_res = spearmanr(meta_preds_oos_insample[mask_5d], meta_y[mask_5d])
-    spearman_5d = float(spearman_5d_res.correlation) if np.isfinite(spearman_5d_res.correlation) else 0.0
-    if mask_21d.sum() >= 100:
-        spearman_21d_res = spearmanr(meta_preds_oos_insample[mask_21d], meta_y_21d[mask_21d])
-        spearman_21d = float(spearman_21d_res.correlation) if np.isfinite(spearman_21d_res.correlation) else 0.0
-    else:
-        spearman_21d = float("nan")
-    log.info(
-        "Horizon IC diagnostic: meta preds vs 5d fwd Spearman=%.4f (n=%d)  "
-        "vs 21d fwd Spearman=%.4f (n=%d)",
-        spearman_5d, int(mask_5d.sum()), spearman_21d, int(mask_21d.sum()),
+    horizon_ics: dict[str, dict] = {}
+    for h in _DIAGNOSTIC_HORIZONS:
+        y_h = np.array([r[f"actual_fwd_{h}d"] for r in oos_meta_rows])
+        mask = np.isfinite(y_h)
+        if mask.sum() >= 100:
+            sp = spearmanr(meta_preds_oos_insample[mask], y_h[mask])
+            ic = float(sp.correlation) if np.isfinite(sp.correlation) else 0.0
+        else:
+            ic = float("nan")
+        horizon_ics[f"{h}d"] = {"spearman": ic, "n": int(mask.sum())}
+
+    # Backwards-compat: keep spearman_5d / spearman_21d scalars for the
+    # existing result-dict field consumers (email, dashboard, etc.).
+    spearman_5d = horizon_ics["5d"]["spearman"]
+    spearman_21d = horizon_ics["21d"]["spearman"]
+    mask_5d_count = horizon_ics["5d"]["n"]
+    mask_21d_count = horizon_ics["21d"]["n"]
+
+    _ic_line = "  ".join(
+        f"{k}={v['spearman']:+.4f} (n={v['n']})" for k, v in horizon_ics.items()
     )
+    log.info("Horizon IC curve: %s", _ic_line)
+    # Flag peak horizon for quick visual in logs/email.
+    _peak = max(horizon_ics.items(),
+                key=lambda kv: abs(kv[1]["spearman"]) if np.isfinite(kv[1]["spearman"]) else -1)
+    log.info("Peak IC horizon: %s (Spearman=%+.4f)", _peak[0], _peak[1]["spearman"])
 
     # ── Step 7b: Fit isotonic calibrator on meta OOS predictions ─────────────
     # ROADMAP P1: collapse FLAT, use calibrated P(UP) as confidence.
@@ -714,10 +747,21 @@ def run_meta_training(
         "meta_model_ic": round(meta_model._val_ic, 6),
         "meta_coefficients": meta_model._coefficients,
         "horizon_diagnostic": {
+            # Backwards-compat scalars (existing consumers):
             "spearman_5d": round(spearman_5d, 6),
             "spearman_21d": round(spearman_21d, 6) if np.isfinite(spearman_21d) else None,
-            "n_5d": int(mask_5d.sum()),
-            "n_21d": int(mask_21d.sum()),
+            "n_5d": mask_5d_count,
+            "n_21d": mask_21d_count,
+            # v3.2: full curve across _DIAGNOSTIC_HORIZONS.
+            "curve": {
+                k: {
+                    "spearman": round(v["spearman"], 6) if np.isfinite(v["spearman"]) else None,
+                    "n": v["n"],
+                }
+                for k, v in horizon_ics.items()
+            },
+            "peak_horizon": _peak[0],
+            "peak_spearman": round(_peak[1]["spearman"], 6) if np.isfinite(_peak[1]["spearman"]) else None,
         },
         "walk_forward": {
             "momentum_median_ic": round(mom_median_ic, 6),
