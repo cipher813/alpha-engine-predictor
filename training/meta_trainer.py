@@ -36,9 +36,15 @@ _MOMENTUM_PARAMS_S3_KEY = "config/predictor_momentum_params.json"
 # uses cfg.FORWARD_DAYS (5d today) as the label; these are *sidecar*
 # metrics that measure how well the trained model's rank-ordering
 # predicts alpha at alternative horizons. Answers "is 5d the right
-# horizon for this signal?" autonomously. 40d is included as a sanity
-# cap — if IC peaks there, we'd be looking at a different regime.
-_DIAGNOSTIC_HORIZONS = [5, 10, 15, 21, 40]
+# horizon for this signal?" autonomously.
+#
+# 2026-04-15 extension: added 60d and 90d. First diagnostic run showed
+# IC climbing monotonically 5d → 40d (0.0099 → 0.0300, 3.0× lift, no
+# peak in range). Extending to 60d/90d to find where the curve stops
+# rising — that peak is the target horizon for any parallel training
+# stack we build next. If IC continues climbing past 90d we're looking
+# at a multi-month momentum regime and should consider longer still.
+_DIAGNOSTIC_HORIZONS = [5, 10, 15, 21, 40, 60, 90]
 
 
 def _load_momentum_params_from_s3(bucket: str) -> dict | None:
