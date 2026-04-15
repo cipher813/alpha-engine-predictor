@@ -137,14 +137,33 @@ def run_meta_training(
     all_parquets = sorted(data_path.glob("*.parquet"))
 
     # ── Step 2: Build per-ticker feature arrays ──────────────────────────────
+    # Per feedback_no_silent_fails + feedback_hard_fail_until_stable: count
+    # every reject bucket and surface it. 2026-04-15 smoke test produced
+    # "Feature computation complete: 0 tickers" followed by a cryptic
+    # np.stack crash because this loop quietly discarded 909/909 tickers
+    # across two silent-fail sites (len<265 skip, except-Exception-continue).
+    # First 5 rejects in each bucket are retained for diagnostics so a
+    # rerun tells us *what* is wrong, not just *that* nothing survived.
     log.info("Computing features for all tickers...")
-    ticker_features: dict[str, pd.DataFrame] = {}  # ticker → featured+labeled DataFrame
+    ticker_features: dict[str, pd.DataFrame] = {}
+    reject_too_short: list[tuple[str, int]] = []
+    reject_empty_raw: list[str] = []
+    reject_feature_error: list[tuple[str, str]] = []
+    reject_empty_labeled: list[str] = []
+    n_candidates = 0
+    _MIN_HISTORY_ROWS = 265  # ~1 year of trading days — required for feature windows
+
     for path in all_parquets:
         ticker = path.stem
         if ticker in _SKIP:
             continue
+        n_candidates += 1
         raw_df = _load_ticker_parquet(path)
-        if raw_df.empty or len(raw_df) < 265:
+        if raw_df.empty:
+            reject_empty_raw.append(ticker)
+            continue
+        if len(raw_df) < _MIN_HISTORY_ROWS:
+            reject_too_short.append((ticker, len(raw_df)))
             continue
         if "Close" in raw_df.columns:
             all_close_prices[ticker] = raw_df["Close"].astype(float)
@@ -162,12 +181,41 @@ def run_meta_training(
                 up_threshold=cfg.UP_THRESHOLD, down_threshold=cfg.DOWN_THRESHOLD,
                 benchmark_returns=sector_etf_s if sector_etf_s is not None else spy_series,
             )
-            if not labeled.empty:
-                ticker_features[ticker] = labeled
-        except Exception:
+        except Exception as exc:
+            reject_feature_error.append((ticker, f"{type(exc).__name__}: {exc}"))
             continue
+        if labeled.empty:
+            reject_empty_labeled.append(ticker)
+            continue
+        ticker_features[ticker] = labeled
 
-    log.info("Feature computation complete: %d tickers", len(ticker_features))
+    log.info(
+        "Feature computation complete: %d accepted / %d candidates  "
+        "(rejected: too_short=%d  empty_raw=%d  feature_error=%d  empty_labeled=%d)",
+        len(ticker_features), n_candidates,
+        len(reject_too_short), len(reject_empty_raw),
+        len(reject_feature_error), len(reject_empty_labeled),
+    )
+
+    if len(ticker_features) == 0:
+        # Hard-fail with diagnostics rather than letting np.stack emit its
+        # cryptic "need at least one array to stack" on the empty list.
+        def _preview(rows, limit=5):
+            return ", ".join(str(r) for r in rows[:limit]) + (
+                f"  ... (+{len(rows) - limit} more)" if len(rows) > limit else ""
+            )
+        raise RuntimeError(
+            f"All {n_candidates} candidate tickers were rejected during feature "
+            f"computation. Training cannot proceed on an empty dataset. "
+            f"Rejects — "
+            f"too_short (<{_MIN_HISTORY_ROWS} rows): {len(reject_too_short)} "
+            f"[{_preview(reject_too_short)}]  "
+            f"empty_raw: {len(reject_empty_raw)} [{_preview(reject_empty_raw)}]  "
+            f"feature_error: {len(reject_feature_error)} "
+            f"[{_preview(reject_feature_error)}]  "
+            f"empty_labeled: {len(reject_empty_labeled)} "
+            f"[{_preview(reject_empty_labeled)}]"
+        )
 
     # ── Step 3: Build arrays for momentum + volatility models ────────────────
     # Flatten per-ticker DataFrames into (X, y, dates) arrays
