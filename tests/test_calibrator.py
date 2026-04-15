@@ -152,6 +152,22 @@ class TestPlattCalibrator:
         with pytest.raises(ValueError, match="Unknown calibration method"):
             PlattCalibrator(method="invalid")
 
+    def test_save_writes_deployed_at_sidecar(self, synthetic_data):
+        """save() stamps the sidecar with deployed_at for backtester grace gate."""
+        import json
+        from model.calibrator import PlattCalibrator
+        alpha, actual_up = synthetic_data
+        cal = PlattCalibrator(method="isotonic")
+        cal.fit(alpha, actual_up)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "isotonic_calibrator.pkl"
+            cal.save(path)
+            sidecar = json.loads(Path(str(path) + ".meta.json").read_text())
+            assert "deployed_at" in sidecar
+            # ISO-8601 shape
+            assert "T" in sidecar["deployed_at"]
+            assert sidecar["method"] == "isotonic"
+
 
 class TestExpectedCalibrationError:
     def test_perfect_calibration(self):

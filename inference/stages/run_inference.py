@@ -342,36 +342,65 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
     for i, p in enumerate(ctx.predictions):
         p["combined_rank"] = i + 1
 
-    # ── Cross-sectional confidence rescaling ────────────────────────────────
-    # Meta-model ridge outputs cluster in ~[-0.01, +0.01] — narrower than
-    # LABEL_CLIP. Use the batch max_abs but with a floor (META_ALPHA_CLIP)
-    # so that tiny, noisy alpha spreads don't get amplified to extreme
-    # confidences (e.g. 100% UP for a 0.3% predicted alpha).
+    _rescale_cross_sectional(ctx)
+    log.info("Meta-inference complete: %d predictions, %d skipped", len(ctx.predictions), ctx.n_skipped)
+
+
+def _rescale_cross_sectional(ctx: "PipelineContext") -> None:
+    """Heuristic cross-sectional confidence rescaling (calibrator-guarded).
+
+    When the isotonic calibrator is loaded (post-2026-04-15 binary UP/DOWN
+    migration), per-ticker calls to ``calibrator.calibrate_prediction`` in
+    ``_run_meta_inference`` produce properly-calibrated, absolute-scale
+    probabilities. Rescaling here would overwrite those with a linear
+    heuristic — a silent regression of the calibration work. In that case
+    this function is a no-op.
+
+    Without a calibrator (legacy fallback path), rescaling is mandatory:
+    meta ridge outputs cluster in ~[-0.01, +0.01], narrower than
+    LABEL_CLIP (±0.15). Linear p_up values collapse toward 0.5 for
+    everything. META_ALPHA_CLIP floors the batch max_abs so tiny, noisy
+    alpha spreads don't inflate to extreme confidences.
+    """
+    _cal = getattr(ctx, "calibrator", None)
+    _calibrated = _cal is not None and getattr(_cal, "is_fitted", False)
+    if _calibrated:
+        log.info(
+            "Skipping cross-sectional rescaling — isotonic calibrator active "
+            "(method=%s, ECE_after=%.4f)",
+            _cal.method, _cal._ece_after or 0.0,
+        )
+        return
+
+    log.warning(
+        "No calibrator loaded — applying linear heuristic cross-sectional "
+        "rescaling. This path should only fire before the first post-migration "
+        "retrain ships an isotonic calibrator to S3."
+    )
     _META_ALPHA_CLIP = 0.02  # 2% — reasonable expected range for 5d alpha
     alphas = [p.get("predicted_alpha", 0) or 0 for p in ctx.predictions]
-    if alphas:
-        max_abs = max(abs(a) for a in alphas)
-        meta_clip = max(max_abs, _META_ALPHA_CLIP)
-        log.info(
-            "Meta confidence rescaling: max_abs_alpha=%.6f  meta_clip=%.6f  (floor=%.3f)",
-            max_abs, meta_clip, _META_ALPHA_CLIP,
-        )
-        for p in ctx.predictions:
-            a = p.get("predicted_alpha", 0) or 0
-            p_up = float(np.clip(0.5 + a / (2.0 * meta_clip), 0.0, 1.0))
-            p_down = 1.0 - p_up
-            if a >= 0:
-                direction = "UP"
-                confidence = p_up
-            else:
-                direction = "DOWN"
-                confidence = p_down
-            p["p_up"] = round(p_up, 4)
-            p["p_down"] = round(p_down, 4)
-            p["predicted_direction"] = direction
-            p["prediction_confidence"] = round(confidence, 4)
-
-    log.info("Meta-inference complete: %d predictions, %d skipped", len(ctx.predictions), ctx.n_skipped)
+    if not alphas:
+        return
+    max_abs = max(abs(a) for a in alphas)
+    meta_clip = max(max_abs, _META_ALPHA_CLIP)
+    log.info(
+        "Meta confidence rescaling: max_abs_alpha=%.6f  meta_clip=%.6f  (floor=%.3f)",
+        max_abs, meta_clip, _META_ALPHA_CLIP,
+    )
+    for p in ctx.predictions:
+        a = p.get("predicted_alpha", 0) or 0
+        p_up = float(np.clip(0.5 + a / (2.0 * meta_clip), 0.0, 1.0))
+        p_down = 1.0 - p_up
+        if a >= 0:
+            direction = "UP"
+            confidence = p_up
+        else:
+            direction = "DOWN"
+            confidence = p_down
+        p["p_up"] = round(p_up, 4)
+        p["p_down"] = round(p_down, 4)
+        p["predicted_direction"] = direction
+        p["prediction_confidence"] = round(confidence, 4)
 
 
 def _run_gbm_inference(ctx: PipelineContext) -> None:

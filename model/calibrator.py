@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import pickle
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -160,7 +161,13 @@ class PlattCalibrator:
         }
 
     def save(self, path: str | Path) -> None:
-        """Save calibrator to pickle + metadata JSON."""
+        """Save calibrator to pickle + metadata JSON.
+
+        The sidecar includes ``deployed_at`` (ISO-8601 UTC). The backtester's
+        retrain_alert uses this to apply a grace period after a fresh
+        calibrator lands — during that window predictor_outcomes holds
+        mixed pre/post calibrator semantics and ECE is structurally noisy.
+        """
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -168,8 +175,9 @@ class PlattCalibrator:
             pickle.dump(self._model, f)
 
         meta = self.metrics()
+        meta["deployed_at"] = datetime.now(timezone.utc).isoformat()
         Path(str(path) + ".meta.json").write_text(json.dumps(meta, indent=2))
-        log.info("Calibrator saved to %s", path)
+        log.info("Calibrator saved to %s (deployed_at=%s)", path, meta["deployed_at"])
 
     @classmethod
     def load(cls, path: str | Path) -> "PlattCalibrator":

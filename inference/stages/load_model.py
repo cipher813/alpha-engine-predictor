@@ -199,33 +199,61 @@ def _load_gbm(ctx: PipelineContext) -> None:
             except Exception as exc:
                 log.info("Horizon %dd model not available: %s", h, exc)
 
-    # Load Platt calibrator (optional — graceful degradation to linear)
+    # Load isotonic calibrator. Distinguish two failure modes:
+    #   1. Calibrator file absent (S3 NoSuchKey / local file missing) —
+    #      expected during the pre-first-retrain window after the 2026-04-15
+    #      binary UP/DOWN migration. Log WARNING; inference falls back to the
+    #      linear heuristic rescaling in run_inference.py.
+    #   2. Calibrator file present but corrupted / incompatible — this is a
+    #      silent-quality regression if swallowed. Raise.
+    # Per feedback_no_silent_fails + feedback_hard_fail_until_stable.
     ctx.calibrator = None
     if getattr(cfg, "CALIBRATION_ENABLED", True):
-        try:
-            from model.calibrator import PlattCalibrator
-            if ctx.local:
-                cal_path = Path("checkpoints/calibrator.pkl")
-                if cal_path.exists():
-                    ctx.calibrator = PlattCalibrator.load(cal_path)
+        from model.calibrator import PlattCalibrator
+        if ctx.local:
+            cal_path = Path("checkpoints/calibrator.pkl")
+            if cal_path.exists():
+                ctx.calibrator = PlattCalibrator.load(cal_path)
             else:
-                import boto3 as _boto3_cal
-                _s3_cal = _boto3_cal.client("s3")
-                import tempfile as _tmpmod
-                _cal_tmp = Path(_tmpmod.gettempdir()) / "calibrator_latest.pkl"
-                _cal_meta_tmp = Path(str(_cal_tmp) + ".meta.json")
+                log.warning(
+                    "Local calibrator missing at %s — falling back to linear "
+                    "heuristic. Expected only before first post-migration retrain.",
+                    cal_path,
+                )
+        else:
+            import boto3 as _boto3_cal
+            from botocore.exceptions import ClientError
+            _s3_cal = _boto3_cal.client("s3")
+            import tempfile as _tmpmod
+            _cal_tmp = Path(_tmpmod.gettempdir()) / "isotonic_calibrator.pkl"
+            _cal_meta_tmp = Path(str(_cal_tmp) + ".meta.json")
+            try:
                 _s3_cal.download_file(ctx.bucket, cfg.CALIBRATOR_WEIGHTS_KEY, str(_cal_tmp))
+            except ClientError as exc:
+                if exc.response.get("Error", {}).get("Code") in ("404", "NoSuchKey"):
+                    log.warning(
+                        "S3 calibrator missing at s3://%s/%s — falling back to "
+                        "linear heuristic. Expected only before first "
+                        "post-migration retrain writes the calibrator.",
+                        ctx.bucket, cfg.CALIBRATOR_WEIGHTS_KEY,
+                    )
+                else:
+                    raise
+            else:
+                # Sidecar is best-effort — calibrator pickle is authoritative
                 try:
                     _s3_cal.download_file(ctx.bucket, cfg.CALIBRATOR_WEIGHTS_META_KEY, str(_cal_meta_tmp))
-                except Exception:
-                    pass  # meta is optional for loading
+                except ClientError as exc:
+                    if exc.response.get("Error", {}).get("Code") in ("404", "NoSuchKey"):
+                        log.warning("Calibrator sidecar missing: %s", cfg.CALIBRATOR_WEIGHTS_META_KEY)
+                    else:
+                        raise
+                # Pickle present but load failure is a real error — raise.
                 ctx.calibrator = PlattCalibrator.load(_cal_tmp)
-            if ctx.calibrator and ctx.calibrator.is_fitted:
-                log.info("Calibrator loaded (method=%s, ECE=%.4f)",
-                         ctx.calibrator.method,
-                         ctx.calibrator._ece_after or 0.0)
-        except Exception as exc:
-            log.info("Calibrator not available — using linear fallback: %s", exc)
+        if ctx.calibrator and ctx.calibrator.is_fitted:
+            log.info("Calibrator loaded (method=%s, ECE=%.4f)",
+                     ctx.calibrator.method,
+                     ctx.calibrator._ece_after or 0.0)
 
 
 def _load_meta_models(ctx: PipelineContext) -> None:
