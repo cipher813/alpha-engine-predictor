@@ -279,29 +279,36 @@ META_MODEL_ENABLED = _meta_cfg.get("enabled", False)
 
 # Per-model feature sets (subsets of FEATURES computed by alpha-engine-data).
 #
-# v3.1 additions (2026-04-15, predictor ROADMAP P2):
-#   MOMENTUM gets 4 return-decomposition features so the GBM can learn
-#   which horizon (5d, 20d, 60d, 120d) and which component (overnight
-#   vs intraday) carries signal. At 5d forward horizon, short-horizon
-#   returns have historically loaded negative (reversal); longer
-#   horizons may load positive (momentum). The meta-ridge coefficient
-#   sign will disambiguate.
+# v3.1 iteration (2026-04-15, predictor ROADMAP P2):
 #
-#   VOLATILITY gets 2 reversal-native distance-from-high features.
-#   They conceptually fit the volatility model (position-within-range
-#   signal alongside dist_from_52w_high / dist_from_52w_low).
+#   First pass added 6 features (return_60d, return_120d,
+#   overnight_return_5d, intraday_return_5d, dist_from_5d_high,
+#   dist_from_20d_high). Post-training Layer-1 feature importance
+#   analysis (2026-04-15 full training run) showed:
+#     return_60d          23.3% gain  ← #1 feature in momentum model
+#     return_120d         14.0% gain  ← #4 feature
+#     intraday_return_5d   8.7% gain  ← modest but non-zero
+#     overnight_return_5d  0.0% gain  ← DEAD, removed
+#     dist_from_20d_high   0.7% gain  ← near-dead, removed
+#     dist_from_5d_high    0.3% gain  ← DEAD, removed
+#
+#   Dropped the 3 dead features from the subscription lists. They
+#   remain in alpha-engine-data's feature store and ArcticDB rows
+#   (compute cost is trivial, storage is trivial, and they may be
+#   useful in a different model architecture or different horizon
+#   later). This PR only updates which columns the Layer-1 GBMs
+#   subscribe to.
 MOMENTUM_FEATURES = [
     "momentum_5d", "momentum_20d", "price_vs_ma50", "price_vs_ma200",
     "rsi_14", "macd_cross",
-    # v3.1 additions
+    # v3.1: longer-horizon returns — pulled real weight in Layer-1
     "return_60d", "return_120d",
-    "overnight_return_5d", "intraday_return_5d",
+    # v3.1: intraday component of 5d return — marginal but non-zero
+    "intraday_return_5d",
 ]
 VOLATILITY_FEATURES = [
     "atr_14_pct", "realized_vol_20d", "vol_ratio_10_60",
     "iv_rank", "dist_from_52w_high", "dist_from_52w_low",
-    # v3.1 additions
-    "dist_from_5d_high", "dist_from_20d_high",
 ]
 # Regime predictor uses macro series directly (not GBM features)
 # Research calibrator uses signals.json fields (not price features)
