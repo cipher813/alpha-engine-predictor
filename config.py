@@ -277,14 +277,31 @@ MULTI_HORIZON_LIST = _mh_cfg.get("horizons", [1, 5, 10, 20])
 _meta_cfg = _cfg.get("meta_model", {})
 META_MODEL_ENABLED = _meta_cfg.get("enabled", False)
 
-# Per-model feature sets (subsets of FEATURES computed by feature_engineer)
+# Per-model feature sets (subsets of FEATURES computed by alpha-engine-data).
+#
+# v3.1 additions (2026-04-15, predictor ROADMAP P2):
+#   MOMENTUM gets 4 return-decomposition features so the GBM can learn
+#   which horizon (5d, 20d, 60d, 120d) and which component (overnight
+#   vs intraday) carries signal. At 5d forward horizon, short-horizon
+#   returns have historically loaded negative (reversal); longer
+#   horizons may load positive (momentum). The meta-ridge coefficient
+#   sign will disambiguate.
+#
+#   VOLATILITY gets 2 reversal-native distance-from-high features.
+#   They conceptually fit the volatility model (position-within-range
+#   signal alongside dist_from_52w_high / dist_from_52w_low).
 MOMENTUM_FEATURES = [
     "momentum_5d", "momentum_20d", "price_vs_ma50", "price_vs_ma200",
     "rsi_14", "macd_cross",
+    # v3.1 additions
+    "return_60d", "return_120d",
+    "overnight_return_5d", "intraday_return_5d",
 ]
 VOLATILITY_FEATURES = [
     "atr_14_pct", "realized_vol_20d", "vol_ratio_10_60",
     "iv_rank", "dist_from_52w_high", "dist_from_52w_low",
+    # v3.1 additions
+    "dist_from_5d_high", "dist_from_20d_high",
 ]
 # Regime predictor uses macro series directly (not GBM features)
 # Research calibrator uses signals.json fields (not price features)
