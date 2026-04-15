@@ -202,6 +202,27 @@ def run_meta_training(
         if labeled.empty:
             reject_empty_labeled.append(ticker)
             continue
+
+        # v3.1 diagnostic (ROADMAP Predictor P2): compute 21d forward
+        # sector-neutral alpha alongside the 5d label. Used ONLY to
+        # evaluate the trained meta-model's IC at a longer horizon —
+        # tells us whether the 5d forward label is the right horizon
+        # (if 21d IC >> 5d IC, we should consider a parallel 21d
+        # training stack). Not used for training; pure sidecar metric.
+        #
+        # Shift -21 means "close 21 rows ahead". At the tail of the
+        # history the value is NaN; rows with NaN are excluded from
+        # the 21d IC computation only (they still train on 5d).
+        close_for_21d = raw_df["Close"].astype(float)
+        bench_21d = sector_etf_s if sector_etf_s is not None else spy_series
+        if bench_21d is not None:
+            bench_aligned_21d = bench_21d.reindex(close_for_21d.index, method="ffill")
+            stock_fwd_21d = (close_for_21d.shift(-21) / close_for_21d) - 1.0
+            bench_fwd_21d = (bench_aligned_21d.shift(-21) / bench_aligned_21d) - 1.0
+            labeled["forward_return_21d"] = (stock_fwd_21d - bench_fwd_21d).reindex(labeled.index)
+        else:
+            labeled["forward_return_21d"] = float("nan")
+
         ticker_features[ticker] = labeled
 
     log.info(
@@ -244,12 +265,14 @@ def run_meta_training(
         mom_vals = df[cfg.MOMENTUM_FEATURES].to_numpy(dtype=np.float32)
         vol_vals = df[cfg.VOLATILITY_FEATURES].to_numpy(dtype=np.float32)
         fwd = df["forward_return_5d"].to_numpy(dtype=np.float32)
+        fwd_21d = df.get("forward_return_21d", pd.Series(float("nan"), index=df.index)).to_numpy(dtype=np.float32)
         dates = df.index
         for j in range(len(dates)):
             all_rows.append((
                 dates[j], ticker,
                 mom_vals[j], vol_vals[j],
                 float(fwd[j]),
+                float(fwd_21d[j]),
             ))
 
     all_rows.sort(key=lambda r: r[0])
@@ -258,6 +281,7 @@ def run_meta_training(
     X_mom = np.stack([r[2] for r in all_rows])
     X_vol = np.stack([r[3] for r in all_rows])
     y_fwd = np.array([r[4] for r in all_rows], dtype=np.float32)
+    y_fwd_21d = np.array([r[5] for r in all_rows], dtype=np.float32)  # diagnostic only
 
     # Winsorize
     if cfg.LABEL_CLIP:
@@ -444,6 +468,7 @@ def run_meta_training(
                     "research_conviction": 0.0,
                     "sector_macro_modifier": 0.0,
                     "actual_fwd": float(y_fwd[idx]),
+                    "actual_fwd_21d": float(y_fwd_21d[idx]),  # diagnostic only
                 })
 
         elapsed = time.time() - fold_start
@@ -461,6 +486,31 @@ def run_meta_training(
     meta_y = np.array([r["actual_fwd"] for r in oos_meta_rows])
     meta_model = MetaModel(alpha=1.0)
     meta_model.fit(meta_X, meta_y, feature_names=META_FEATURES)
+
+    # ── Step 7.1: 21d forward IC diagnostic (ROADMAP Predictor P2) ───────────
+    # Evaluate whether the 5d-trained meta-model ranks tickers well at a
+    # 21d horizon. If 21d Spearman IC >> 5d IC, the 5d label is the
+    # wrong horizon (monthly momentum regime) and a parallel 21d stack
+    # is worth building. If 21d ≈ 5d, horizon isn't the issue — feature
+    # quality is. Either way the diagnostic is free: just a correlation
+    # against an already-collected label column. Not used for training.
+    from scipy.stats import spearmanr
+    meta_y_21d = np.array([r["actual_fwd_21d"] for r in oos_meta_rows])
+    meta_preds_oos_insample = meta_model.predict(meta_X).ravel()
+    mask_5d = np.isfinite(meta_y)
+    mask_21d = np.isfinite(meta_y_21d)
+    spearman_5d_res = spearmanr(meta_preds_oos_insample[mask_5d], meta_y[mask_5d])
+    spearman_5d = float(spearman_5d_res.correlation) if np.isfinite(spearman_5d_res.correlation) else 0.0
+    if mask_21d.sum() >= 100:
+        spearman_21d_res = spearmanr(meta_preds_oos_insample[mask_21d], meta_y_21d[mask_21d])
+        spearman_21d = float(spearman_21d_res.correlation) if np.isfinite(spearman_21d_res.correlation) else 0.0
+    else:
+        spearman_21d = float("nan")
+    log.info(
+        "Horizon IC diagnostic: meta preds vs 5d fwd Spearman=%.4f (n=%d)  "
+        "vs 21d fwd Spearman=%.4f (n=%d)",
+        spearman_5d, int(mask_5d.sum()), spearman_21d, int(mask_21d.sum()),
+    )
 
     # ── Step 7b: Fit isotonic calibrator on meta OOS predictions ─────────────
     # ROADMAP P1: collapse FLAT, use calibrated P(UP) as confidence.
@@ -663,6 +713,12 @@ def run_meta_training(
         "research_calibrator_metrics": prod_calibrator.metrics(),
         "meta_model_ic": round(meta_model._val_ic, 6),
         "meta_coefficients": meta_model._coefficients,
+        "horizon_diagnostic": {
+            "spearman_5d": round(spearman_5d, 6),
+            "spearman_21d": round(spearman_21d, 6) if np.isfinite(spearman_21d) else None,
+            "n_5d": int(mask_5d.sum()),
+            "n_21d": int(mask_21d.sum()),
+        },
         "walk_forward": {
             "momentum_median_ic": round(mom_median_ic, 6),
             "volatility_median_ic": round(vol_median_ic, 6),
