@@ -394,6 +394,46 @@ def run_meta_training(
     meta_model = MetaModel(alpha=1.0)
     meta_model.fit(meta_X, meta_y, feature_names=META_FEATURES)
 
+    # ── Step 7b: Fit isotonic calibrator on meta OOS predictions ─────────────
+    # ROADMAP P1: collapse FLAT, use calibrated P(UP) as confidence.
+    #
+    # Input to isotonic: continuous meta-model output on the pooled OOS
+    # rows. These predictions are OOS with respect to the Layer-1 base
+    # models (momentum/volatility/regime were held out by fold) but are
+    # in-sample for the meta ridge itself, which was just fit on meta_X.
+    # Pure nested CV would be cleaner; the pragmatic tradeoff is that
+    # ridge has low capacity (8 coefficients) and overfits minimally, so
+    # in-sample meta predictions are a reasonable calibration substrate.
+    #
+    # Output: P(actual_fwd > 0 | meta prediction). Binary target from
+    # sign(meta_y). This is the canonical isotonic use case — no sigmoid
+    # wrapper needed; isotonic produces a monotonic calibration curve
+    # directly from continuous input to calibrated probability.
+    #
+    # Hard-fail per feedback_hard_fail_until_stable: a broken calibrator
+    # silently degrades inference quality. Catch it here rather than
+    # letting the inference path log a WARNING and fall back to heuristic.
+    from model.calibrator import PlattCalibrator
+    oos_meta_preds = meta_model.predict(meta_X).ravel()
+    oos_up_labels = (meta_y > 0).astype(np.int32)
+    log.info(
+        "Fitting isotonic calibrator: n=%d  up_rate=%.3f  pred_std=%.6f",
+        len(oos_meta_preds), float(oos_up_labels.mean()), float(np.std(oos_meta_preds)),
+    )
+    calibrator = PlattCalibrator(method="isotonic")
+    calibrator.fit(oos_meta_preds, oos_up_labels, label_clip=float(cfg.LABEL_CLIP))
+    if not calibrator.is_fitted:
+        raise RuntimeError(
+            f"Isotonic calibrator did not fit (n={len(oos_meta_preds)} samples, "
+            f"min required 100). Training must produce a calibrator — see "
+            f"model/calibrator.py for the sample threshold."
+        )
+    log.info(
+        "Isotonic calibrator: ECE_before=%.4f  ECE_after=%.4f  (%.1f%% reduction)",
+        calibrator._ece_before, calibrator._ece_after,
+        (1 - calibrator._ece_after / max(calibrator._ece_before, 1e-8)) * 100,
+    )
+
     # Walk-forward summary
     mom_median_ic = float(np.median(mom_fold_ics)) if mom_fold_ics else 0.0
     vol_median_ic = float(np.median(vol_fold_ics)) if vol_fold_ics else 0.0
@@ -473,12 +513,17 @@ def run_meta_training(
             prefix = cfg.META_WEIGHTS_PREFIX  # "predictor/weights/meta/"
 
             # Save all models
+            # isotonic_calibrator.pkl — binary P(UP) head on meta output.
+            # Filename is contractual with the backtester's retrain_alert
+            # grace-period check (reads .meta.json sidecar). Do not rename
+            # without updating analysis/production_health.py.
             models = {
                 "momentum": (prod_mom, "momentum_model.txt"),
                 "volatility": (prod_vol, "volatility_model.txt"),
                 "regime": (prod_regime, "regime_predictor.pkl"),
                 "research_calibrator": (prod_calibrator, "research_calibrator.json"),
                 "meta_model": (meta_model, "meta_model.pkl"),
+                "isotonic_calibrator": (calibrator, "isotonic_calibrator.pkl"),
             }
             for name, (model, filename) in models.items():
                 local_path = Path(tmp) / filename
@@ -507,6 +552,12 @@ def run_meta_training(
                     "research_calibrator": {"key": f"{prefix}research_calibrator.json",
                                             "n_samples": prod_calibrator._n_samples},
                     "meta_model": {"key": f"{prefix}meta_model.pkl", "ic": round(meta_model._val_ic, 6)},
+                    "isotonic_calibrator": {
+                        "key": f"{prefix}isotonic_calibrator.pkl",
+                        "ece_before": round(calibrator._ece_before or 0.0, 6),
+                        "ece_after": round(calibrator._ece_after or 0.0, 6),
+                        "n_samples": calibrator._n_samples,
+                    },
                 },
                 "walk_forward": {
                     "momentum_median_ic": round(mom_median_ic, 6),
@@ -560,5 +611,5 @@ def run_meta_training(
         "feature_importance_top10": [],
         "feature_ics": {},
         "noise_candidates": [],
-        "calibration": None,
+        "calibration": calibrator.metrics(),
     }

@@ -52,9 +52,13 @@ GBM_RANK_WEIGHTS_KEY      = "predictor/weights/gbm_rank_latest.txt"
 GBM_RANK_WEIGHTS_META_KEY = "predictor/weights/gbm_rank_latest.txt.meta.json"
 GBM_MODE_KEY              = "predictor/weights/gbm_mode.json"
 
-# Calibrator weights (Platt scaling / isotonic regression)
-CALIBRATOR_WEIGHTS_KEY      = "predictor/weights/calibrator_latest.pkl"
-CALIBRATOR_WEIGHTS_META_KEY = "predictor/weights/calibrator_latest.pkl.meta.json"
+# Calibrator weights (isotonic regression on v3 meta-model output).
+# Path is contractual with alpha-engine-backtester retrain_alert grace
+# gate — it reads isotonic_calibrator.meta.json for deployed_at. The v2
+# GBM-era path (predictor/weights/calibrator_latest.pkl) was retired
+# 2026-04-15 with the binary UP/DOWN migration.
+CALIBRATOR_WEIGHTS_KEY      = "predictor/weights/meta/isotonic_calibrator.pkl"
+CALIBRATOR_WEIGHTS_META_KEY = "predictor/weights/meta/isotonic_calibrator.pkl.meta.json"
 
 PREDICTIONS_KEY = "predictor/predictions/{date}.json"
 PREDICTIONS_LATEST_KEY = "predictor/predictions/latest.json"
