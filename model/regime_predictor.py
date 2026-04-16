@@ -31,6 +31,63 @@ BEAR_THRESHOLD = -0.03   # SPY down >3% over next 20d → bear
 BULL_THRESHOLD = 0.03    # SPY up >3% over next 20d → bull
 
 
+def compute_classification_metrics(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    n_classes: int = 3,
+) -> dict:
+    """
+    Compute classification metrics for regime predictions.
+
+    Returns dict with:
+      - accuracy: overall classification accuracy
+      - confusion_matrix: 3×3 matrix (rows=true, cols=predicted), class order bear/neutral/bull
+      - per_class_precision: [bear, neutral, bull]
+      - per_class_recall: [bear, neutral, bull]
+      - per_class_support: [bear, neutral, bull] row counts
+      - macro_f1: unweighted mean of per-class F1 (balanced metric,
+                  guards against majority-class-only classifiers)
+    """
+    y_true = np.asarray(y_true, dtype=int).ravel()
+    y_pred = np.asarray(y_pred, dtype=int).ravel()
+    n = len(y_true)
+
+    cm = np.zeros((n_classes, n_classes), dtype=int)
+    for t, p in zip(y_true, y_pred):
+        if 0 <= t < n_classes and 0 <= p < n_classes:
+            cm[t, p] += 1
+
+    accuracy = float((y_true == y_pred).mean()) if n > 0 else 0.0
+
+    precision = np.zeros(n_classes)
+    recall = np.zeros(n_classes)
+    support = cm.sum(axis=1)  # row sums = true-class counts
+    pred_counts = cm.sum(axis=1)  # reused below
+
+    for k in range(n_classes):
+        col_sum = cm[:, k].sum()
+        row_sum = cm[k, :].sum()
+        precision[k] = float(cm[k, k] / col_sum) if col_sum > 0 else 0.0
+        recall[k] = float(cm[k, k] / row_sum) if row_sum > 0 else 0.0
+
+    f1 = np.zeros(n_classes)
+    for k in range(n_classes):
+        denom = precision[k] + recall[k]
+        f1[k] = float(2 * precision[k] * recall[k] / denom) if denom > 0 else 0.0
+    macro_f1 = float(f1.mean())
+
+    return {
+        "accuracy": round(accuracy, 4),
+        "confusion_matrix": cm.tolist(),
+        "per_class_precision": [round(p, 4) for p in precision],
+        "per_class_recall": [round(r, 4) for r in recall],
+        "per_class_support": [int(s) for s in support],
+        "macro_f1": round(macro_f1, 4),
+        "n_samples": int(n),
+        "class_order": REGIME_LABELS,
+    }
+
+
 class RegimePredictor:
     """Predict market regime probabilities from macro indicators."""
 
@@ -48,7 +105,9 @@ class RegimePredictor:
         self._model = None
         self._fitted = False
         self._n_samples = 0
-        self._accuracy = None
+        self._accuracy = None          # in-sample training accuracy (legacy field)
+        self._train_metrics: dict = {}  # full in-sample metrics (confusion matrix, F1, etc.)
+        self._oos_metrics: dict = {}    # walk-forward OOS metrics (populated by caller)
 
     def build_features(
         self,
@@ -151,16 +210,33 @@ class RegimePredictor:
         self._fitted = True
         self._n_samples = len(y)
 
-        # Training accuracy
+        # In-sample metrics (confusion matrix, per-class precision/recall, macro-F1).
+        # Retain self._accuracy scalar for legacy consumers (manifest, result dict).
         preds = self._model.predict(X)
-        self._accuracy = float((preds == y).mean())
+        self._train_metrics = compute_classification_metrics(y, preds)
+        self._accuracy = self._train_metrics["accuracy"]
 
         log.info(
-            "RegimePredictor fitted: n=%d  accuracy=%.2f%%  classes=%s",
-            self._n_samples, self._accuracy * 100,
+            "RegimePredictor fitted: n=%d  in-sample_acc=%.2f%%  macro_f1=%.3f  classes=%s",
+            self._n_samples, self._accuracy * 100, self._train_metrics["macro_f1"],
             dict(zip(*np.unique(y, return_counts=True))),
         )
+        cm = np.array(self._train_metrics["confusion_matrix"])
+        log.info("  In-sample confusion matrix (rows=true, cols=pred, order bear/neutral/bull):")
+        for i, row in enumerate(cm):
+            log.info("    %s: %s", REGIME_LABELS[i], row.tolist())
         return self
+
+    def set_oos_metrics(self, metrics: dict) -> None:
+        """
+        Attach walk-forward OOS evaluation metrics to this model instance.
+
+        Called by the trainer after aggregating per-fold regime OOS predictions.
+        Persisted via save() to the meta.json sidecar. Consumers (manifest,
+        promotion gate, email) read these as the trustworthy accuracy signal
+        — self._accuracy remains in-sample and is diagnostic only.
+        """
+        self._oos_metrics = metrics or {}
 
     @property
     def is_fitted(self) -> bool:
@@ -201,14 +277,23 @@ class RegimePredictor:
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "wb") as f:
             pickle.dump(self._model, f)
+        # Legacy scalar `accuracy` retained for backwards-compatibility with
+        # downstream readers (manifest, email, dashboard) that predate the
+        # walk-forward split. It mirrors in_sample.accuracy.
         meta = {
             "type": "regime_predictor",
             "n_samples": self._n_samples,
             "accuracy": round(self._accuracy, 4) if self._accuracy else None,
             "features": self.FEATURE_NAMES,
+            "in_sample": self._train_metrics,
+            "oos": self._oos_metrics,
         }
         Path(str(path) + ".meta.json").write_text(json.dumps(meta, indent=2))
-        log.info("RegimePredictor saved to %s", path)
+        log.info(
+            "RegimePredictor saved to %s (in_sample_acc=%.3f, oos_acc=%s)",
+            path, self._accuracy or 0.0,
+            self._oos_metrics.get("accuracy", "n/a"),
+        )
 
     @classmethod
     def load(cls, path: str | Path) -> "RegimePredictor":
@@ -222,5 +307,7 @@ class RegimePredictor:
             meta = json.loads(meta_path.read_text())
             rp._n_samples = meta.get("n_samples", 0)
             rp._accuracy = meta.get("accuracy")
+            rp._train_metrics = meta.get("in_sample", {}) or {}
+            rp._oos_metrics = meta.get("oos", {}) or {}
         log.info("RegimePredictor loaded from %s", path)
         return rp

@@ -257,6 +257,15 @@ WF_MEDIAN_IC_GATE = _wf_cfg.get("median_ic_gate", 0.02)
 WF_N_ESTIMATORS = _wf_cfg.get("wf_n_estimators", None)  # None → use GBM_N_ESTIMATORS
 WF_EARLY_STOPPING = _wf_cfg.get("wf_early_stopping", None)  # None → use GBM_EARLY_STOPPING_ROUNDS
 
+# Regime classifier promotion gate. 3-class balanced-random baseline is 0.333;
+# 0.40 requires the model to clear random by a meaningful margin on walk-forward
+# OOS. Macro-F1 guards against a degenerate majority-class classifier that scores
+# high on accuracy while having zero recall on bear or bull. Thresholds are
+# deliberately modest while the model is unvalidated — raise after we see real
+# OOS numbers from the first walk-forward run.
+REGIME_OOS_ACCURACY_GATE = _wf_cfg.get("regime_oos_accuracy_gate", 0.40)
+REGIME_OOS_MACRO_F1_GATE = _wf_cfg.get("regime_oos_macro_f1_gate", 0.30)
+
 # ── Feature selection / noise detection ─────────────────────────────────────
 _fs_cfg = _cfg.get("feature_selection", {})
 SHAP_NOISE_THRESHOLD_PCT = _fs_cfg.get("shap_noise_threshold_pct", 1.0)
