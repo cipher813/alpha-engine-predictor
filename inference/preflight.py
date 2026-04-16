@@ -37,6 +37,9 @@ class PredictorPreflight(BasePreflight):
       If SPY is stale, the upstream data path is broken and inference
       would produce predictions from stale features. Better to fail at
       preflight than to ship bad predictions to the executor.
+    - ``macro/VIX``, ``macro/VIX3M``, ``macro/TNX``, ``macro/IRX`` fresh
+      (same threshold). These feed regime and vol features; stale readings
+      would silently corrupt every prediction in the batch.
     """
 
     def run(self) -> None:
@@ -52,7 +55,10 @@ class PredictorPreflight(BasePreflight):
             max_age_days=None,  # existence check only; staleness handled by training monitor
         )
 
-        # macro/SPY freshness is the canonical signal for "is alpha-engine-data
-        # actually writing to ArcticDB on a daily basis." Matches the
-        # DataPreflight check in alpha-engine-data.
-        self.check_arcticdb_fresh("macro", "SPY", max_stale_days=4)
+        # Macro freshness: all five tickers must be current before inference
+        # runs. SPY is the canonical liveness probe; VIX/VIX3M/TNX/IRX feed
+        # regime and vol features directly. A stale reading on any of them
+        # would corrupt the entire prediction batch without any downstream
+        # signal — better to abort here and let the Step Function alarm fire.
+        for symbol in ("SPY", "VIX", "VIX3M", "TNX", "IRX"):
+            self.check_arcticdb_fresh("macro", symbol, max_stale_days=4)
