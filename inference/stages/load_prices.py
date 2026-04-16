@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
+import arcticdb as adb  # Hard dep: matches run_inference.py pattern. No try/except
+                        # ImportError — if the Lambda image lacks arcticdb, fail
+                        # loud at cold start rather than silently degrading.
 import numpy as np
 import pandas as pd
 
@@ -19,6 +23,18 @@ log = logging.getLogger(__name__)
 _SLIM_PREFIX   = "predictor/price_cache_slim/"
 _CLOSES_PREFIX = "predictor/daily_closes/"
 _DAILY_CLOSES_MAX_AGE_HOURS = 12  # upper bound for today's parquet write-time vs now
+
+# OHLCV columns in ArcticDB's universe library (title-case; matches the schema
+# that alpha-engine-data's builders/backfill.py + daily_append.py write).
+_ARCTIC_OHLCV_COLS = ["Open", "High", "Low", "Close", "Volume"]
+
+# Macro symbols expected in ArcticDB (stocks are anything else in ctx.tickers).
+# Historical backfill writes these to the universe library with full OHLCV;
+# daily_append writes them to the macro library with Close only. The reader
+# tries universe first, falls back to macro, so both writers are supported.
+_ARCTIC_MACRO_STEMS = ["SPY", "VIX", "VIX3M", "TNX", "IRX", "GLD", "USO"]
+_ARCTIC_SECTOR_ETFS = ["XLB", "XLC", "XLE", "XLF", "XLI", "XLK",
+                       "XLP", "XLRE", "XLU", "XLV", "XLY"]
 
 
 def _verify_daily_closes_fresh(s3_client, bucket: str, date_str: str) -> None:
@@ -554,35 +570,185 @@ def load_price_data_from_cache(
     return price_data, macro
 
 
+def load_price_data_from_arctic(
+    tickers: list[str],
+    date_str: str,
+    bucket: str,
+    *,
+    lookback_days: int = 730,
+) -> "tuple[dict[str, pd.DataFrame], dict[str, pd.Series]]":
+    """
+    Read OHLCV prices + macro series from ArcticDB — the same source training uses.
+
+    Replaces the slim-cache + daily_closes + yfinance-fallback chain in
+    ``load_price_data_from_cache`` with a single ArcticDB read, eliminating the
+    price-source split between training (ArcticDB) and inference (S3 parquets).
+
+    Parameters
+    ----------
+    tickers : list[str]
+        Stocks to read from the ``universe`` library. Macro + sector ETFs are
+        pulled separately from ``_ARCTIC_MACRO_STEMS`` and ``_ARCTIC_SECTOR_ETFS``;
+        callers don't need to include them.
+    date_str : str
+        End date (inclusive) of the read window in ``YYYY-MM-DD`` form.
+    bucket : str
+        S3 bucket that hosts the ArcticDB path prefix.
+    lookback_days : int
+        Calendar-day window ending at ``date_str`` (default 730 ≈ 2y).
+
+    Returns
+    -------
+    (price_data, macro) with the same shape as :func:`load_price_data_from_cache`:
+      * ``price_data[ticker]`` — ``DataFrame(Open, High, Low, Close, Volume)``
+        with ``DatetimeIndex``
+      * ``macro[key]`` — ``Series`` of Close prices (``SPY``, ``VIX``, sector ETFs)
+
+    Failure semantics
+    -----------------
+    * ArcticDB unreachable → ``PipelineAbort`` (hard fail). No yfinance fallback —
+      upstream is canonical, and the prior chained fallbacks masked data bugs for
+      days at a time (2026-04-14 silent ImportError, 2026-04-15 duplicate rows).
+    * Per-ticker read error rate > 5% → ``PipelineAbort``.
+    * Individual ticker missing/empty → logged WARNING and dropped from output.
+
+    Defensive dedup
+    ---------------
+    The 2026-04-15 write-path fix (builders/daily_append.py → ``update()`` instead
+    of ``append()``) prevents new duplicate-date rows, but historical rows may
+    still carry duplicates. Each frame is deduped on read with ``keep="last"``.
+    Remove after 1-2 clean Saturday cycles confirm upstream is clean.
+    """
+    end_ts   = pd.Timestamp(date_str).normalize()
+    start_ts = end_ts - pd.Timedelta(days=lookback_days)
+
+    region = os.environ.get("AWS_REGION", "us-east-1")
+    uri = f"s3s://s3.{region}.amazonaws.com:{bucket}?path_prefix=arcticdb&aws_auth=true"
+
+    try:
+        arctic = adb.Arctic(uri)
+        universe_lib = arctic.get_library("universe")
+        macro_lib    = arctic.get_library("macro")
+    except Exception as exc:
+        raise PipelineAbort(
+            f"ArcticDB unreachable at {uri}: {exc}"
+        ) from exc
+
+    def _read_ohlcv(lib, sym: str) -> pd.DataFrame:
+        """Read a single symbol from ``lib``, sliced to the lookback window."""
+        res = lib.read(sym, date_range=(start_ts, end_ts), columns=_ARCTIC_OHLCV_COLS)
+        df = res.data
+        if df.empty:
+            return df
+        return df[~df.index.duplicated(keep="last")].sort_index()
+
+    def _read_close(lib, sym: str) -> pd.DataFrame:
+        """Read Close-only (macro library has no OHLV columns)."""
+        res = lib.read(sym, date_range=(start_ts, end_ts), columns=["Close"])
+        df = res.data
+        if df.empty:
+            return df
+        return df[~df.index.duplicated(keep="last")].sort_index()
+
+    # ── Stocks: universe library only ────────────────────────────────────────
+    price_data: dict[str, pd.DataFrame] = {}
+    n_err = 0
+    for ticker in tickers:
+        try:
+            df = _read_ohlcv(universe_lib, ticker)
+        except Exception as exc:
+            log.warning("ArcticDB universe read failed for %s: %s", ticker, exc)
+            n_err += 1
+            continue
+        if df.empty:
+            log.warning("ArcticDB universe returned empty frame for %s", ticker)
+            n_err += 1
+            continue
+        price_data[ticker] = df
+
+    err_rate = n_err / max(len(tickers), 1)
+    if err_rate > 0.05:
+        raise PipelineAbort(
+            f"ArcticDB per-ticker error rate {err_rate:.1%} exceeds 5% threshold "
+            f"({n_err} failed of {len(tickers)}) — treating as pipeline failure"
+        )
+
+    # ── Macros + sector ETFs: try universe first (full OHLCV from backfill),
+    #     fall back to macro library (Close only from daily_append) ───────────
+    all_macro_syms = _ARCTIC_MACRO_STEMS + _ARCTIC_SECTOR_ETFS
+    for sym in all_macro_syms:
+        df: pd.DataFrame | None = None
+        try:
+            df = _read_ohlcv(universe_lib, sym)
+        except Exception:
+            df = None  # sym not in universe library — expected for post-backfill-only macros
+
+        if df is None or df.empty:
+            try:
+                df = _read_close(macro_lib, sym)
+            except Exception as exc:
+                log.warning("ArcticDB macro read failed for %s: %s", sym, exc)
+                continue
+
+        if df is None or df.empty:
+            log.warning("ArcticDB: %s not found in universe or macro libraries", sym)
+            continue
+
+        price_data[sym] = df
+
+    # ── Build macro dict (key → Close Series) from what we loaded ────────────
+    macro: dict[str, pd.Series] = {}
+    for sym in all_macro_syms:
+        if sym in price_data and "Close" in price_data[sym].columns:
+            s = price_data[sym]["Close"].dropna()
+            if not s.empty:
+                macro[sym] = s
+
+    n_stocks = sum(1 for t in price_data.keys() if t not in all_macro_syms)
+    log.info(
+        "[data_source=arcticdb] Loaded %d/%d stocks, %d macro series, window %s → %s",
+        n_stocks, len(tickers), len(macro),
+        start_ts.date(), end_ts.date(),
+    )
+    return price_data, macro
+
+
 # ── Stage entry point ────────────────────────────────────────────────────────
 
 def run(ctx: PipelineContext) -> None:
-    """Load prices from slim cache or yfinance fallback, plus macro series."""
+    """Load prices from ArcticDB (Phase 7a cutover flag) or slim-cache legacy path."""
     from inference.stages.write_output import write_predictions
 
-    # ── Try slim cache first, yfinance fallback ──────────────────────────────
-    cached_prices, cached_macro = load_price_data_from_cache(
-        ctx.tickers, ctx.date_str, ctx.bucket,
-    )
-
-    if cached_prices is not None:
-        ctx.price_data = cached_prices
-        ctx.macro = cached_macro or {}
-        log.info("Using slim-cache + daily_closes for prices and macro")
-        log.warning("[LEGACY_PRICE_READ] consumer=predictor_inference source=slim_cache_delta")
+    # ── Phase 7a: ArcticDB-direct path (flag-gated) ──────────────────────────
+    if getattr(cfg, "USE_ARCTIC_INFERENCE", False):
+        log.info("USE_ARCTIC_INFERENCE=1 — reading prices directly from ArcticDB")
+        ctx.price_data, ctx.macro = load_price_data_from_arctic(
+            ctx.tickers, ctx.date_str, ctx.bucket,
+        )
     else:
-        log.info("Slim cache unavailable — fetching from yfinance (full 2y)")
-        log.warning("[LEGACY_PRICE_READ] consumer=predictor_inference source=yfinance")
-        ctx.price_data = fetch_today_prices(ctx.tickers, fd=ctx.fd)
-        _n_ok = sum(1 for df in ctx.price_data.values() if not df.empty)
-        if _n_ok == 0:
-            log.error("yfinance returned zero usable price data — writing empty predictions")
-            write_predictions([], ctx.date_str, ctx.bucket,
-                              {"model_version": "no_price_data"},
-                              dry_run=ctx.dry_run, fd=ctx.fd)
-            raise PipelineAbort("zero price data from yfinance")
-        sector_etfs_needed = sorted({ctx.sector_map[t] for t in ctx.tickers if t in ctx.sector_map})
-        ctx.macro = fetch_macro_series(extra_tickers=sector_etfs_needed)
+        # ── Try slim cache first, yfinance fallback (legacy path) ────────────
+        cached_prices, cached_macro = load_price_data_from_cache(
+            ctx.tickers, ctx.date_str, ctx.bucket,
+        )
+
+        if cached_prices is not None:
+            ctx.price_data = cached_prices
+            ctx.macro = cached_macro or {}
+            log.info("Using slim-cache + daily_closes for prices and macro")
+            log.warning("[LEGACY_PRICE_READ] consumer=predictor_inference source=slim_cache_delta")
+        else:
+            log.info("Slim cache unavailable — fetching from yfinance (full 2y)")
+            log.warning("[LEGACY_PRICE_READ] consumer=predictor_inference source=yfinance")
+            ctx.price_data = fetch_today_prices(ctx.tickers, fd=ctx.fd)
+            _n_ok = sum(1 for df in ctx.price_data.values() if not df.empty)
+            if _n_ok == 0:
+                log.error("yfinance returned zero usable price data — writing empty predictions")
+                write_predictions([], ctx.date_str, ctx.bucket,
+                                  {"model_version": "no_price_data"},
+                                  dry_run=ctx.dry_run, fd=ctx.fd)
+                raise PipelineAbort("zero price data from yfinance")
+            sector_etfs_needed = sorted({ctx.sector_map[t] for t in ctx.tickers if t in ctx.sector_map})
+            ctx.macro = fetch_macro_series(extra_tickers=sector_etfs_needed)
 
     # ── Compute per-ticker price data age ────────────────────────────────────
     if ctx.price_data:

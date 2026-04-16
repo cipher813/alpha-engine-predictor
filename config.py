@@ -231,6 +231,15 @@ _split_cfg = _cfg["split"]
 TRAIN_FRAC = _split_cfg["train_frac"]
 VAL_FRAC = _split_cfg["val_frac"]
 
+# ── Inference source (Phase 7a cutover) ─────────────────────────────────────
+# When True, inference reads OHLCV directly from ArcticDB (same source as
+# training), bypassing the slim-cache + daily_closes + yfinance-fallback chain.
+# Default False so the migration ships behind a flag; flip via predictor.yaml:
+#   inference:
+#     use_arctic: true
+# Post-cutover, the legacy path is removed entirely (Phase 7e).
+USE_ARCTIC_INFERENCE = _cfg.get("inference", {}).get("use_arctic", False)
+
 # ── Data fetching ────────────────────────────────────────────────────────────
 _data_cfg = _cfg["data"]
 REFRESH_BATCH_SIZE = _data_cfg["refresh_batch_size"]
