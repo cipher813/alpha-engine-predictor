@@ -28,9 +28,11 @@ S3 layout:
                                           alpha-engine-data/collectors/daily_closes.py
                                           as the first step of the weekday Step Function,
                                           before the predictor inference Lambda runs.
-                                          Used as the Mon–Fri delta source by
-                                          load_price_data_from_cache(), reducing daily
-                                          fetches to only the ~1-2 split tickers per week.
+                                          Historically read by inference as the Mon–Fri
+                                          delta to the slim cache; inference now reads
+                                          directly from ArcticDB (Phase 7a, 2026-04-16).
+                                          These parquets are now orphaned — candidates
+                                          for removal in Phase 7e.
   predictor/price_cache_slim/*.parquet  — 2-year slice of each ticker (written by
                                           write_slim_cache() after each weekly training run).
                                           The inference Lambda downloads this (~9 MB) instead

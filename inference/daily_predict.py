@@ -53,8 +53,7 @@ from inference.stages.load_universe import (  # noqa: E402, F401
     get_universe_tickers, load_watchlist,
 )
 from inference.stages.load_prices import (  # noqa: E402, F401
-    _safe_last_date, fetch_today_prices, fetch_macro_series,
-    load_price_data_from_cache,
+    _safe_last_date, load_price_data_from_arctic,
 )
 from inference.stages.write_output import (  # noqa: E402, F401
     _load_predictor_params_from_s3, get_veto_threshold,
@@ -256,9 +255,9 @@ if __name__ == "__main__":
                     price_data[sym] = df
             return price_data, macro
 
-        _lp.load_price_data_from_cache = lambda tickers, *a, **k: _make_synthetic_prices(tickers)
-        _lp.fetch_today_prices = lambda tickers, **k: _make_synthetic_prices(tickers)[0]
-        _lp.fetch_macro_series = lambda *a, **k: {}
+        _lp.load_price_data_from_arctic = lambda tickers, *a, **k: _make_synthetic_prices(tickers)
+        _lp._verify_arctic_fresh = lambda *a, **k: None
+        _lp._connect_arctic = lambda *a, **k: (None, None)
 
         # Stub output
         _wo.write_predictions = lambda *a, **k: log.info("[OFFLINE] Skipped S3 write")
