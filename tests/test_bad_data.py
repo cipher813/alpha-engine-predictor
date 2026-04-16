@@ -108,139 +108,51 @@ class TestSlimCacheNaT:
 
 
 # ---------------------------------------------------------------------------
-# fetch_today_prices with empty yfinance
+# ArcticDB freshness gate (Phase 7a — replaces legacy daily_closes gate)
 # ---------------------------------------------------------------------------
 
-class TestFetchTodayPricesEmpty:
-    """fetch_today_prices should return empty DataFrames, not crash."""
+class TestArcticFreshnessGate:
+    """_verify_arctic_fresh guards against stale/missing SPY in ArcticDB."""
 
-    @patch("inference.stages.load_prices._yf_download_batch")
-    def test_yfinance_returns_empty(self, mock_download):
-        """When yfinance returns an empty DataFrame, result should be empty too."""
-        mock_download.return_value = pd.DataFrame()
-        from inference.daily_predict import fetch_today_prices
-        result = fetch_today_prices(["AAPL"])
-        assert "AAPL" in result
-        # Empty DataFrame is acceptable
-
-    @patch("inference.stages.load_prices._yf_download_batch", side_effect=ConnectionError("timeout"))
-    def test_yfinance_connection_error(self, mock_download):
-        """ConnectionError should be caught, not propagate."""
-        from inference.daily_predict import fetch_today_prices
-        result = fetch_today_prices(["AAPL"])
-        assert isinstance(result, dict)
-        assert result.get("AAPL", pd.DataFrame()).empty
-
-
-# ---------------------------------------------------------------------------
-# fetch_macro_series with partial failures
-# ---------------------------------------------------------------------------
-
-class TestFetchMacroPartialFailure:
-    """Macro series fetch should degrade gracefully on partial failures."""
-
-    @patch("yfinance.download")
-    def test_partial_macro_failure(self, mock_download):
-        """If some macro symbols fail, the rest should still be returned."""
-        # Simulate: SPY works, ^VIX is empty
-        dates = pd.date_range("2026-01-01", "2026-03-31", freq="B")
-        close = np.random.uniform(400, 500, len(dates))
-
-        # Build multi-ticker response
-        spy_data = pd.DataFrame({"Close": close}, index=dates)
-
-        # Return a DataFrame that has SPY but not ^VIX
-        mock_download.return_value = pd.DataFrame()
-
-        from inference.daily_predict import fetch_macro_series
-        result = fetch_macro_series(period="1y")
-        # Should not crash — returns whatever it can
-        assert isinstance(result, dict)
-
-
-# ---------------------------------------------------------------------------
-# Caret ticker mapping
-# ---------------------------------------------------------------------------
-
-class TestCaretTickerMapping:
-    """Split re-fetch should map bare macro tickers to yfinance caret format."""
-
-    def test_caret_map_coverage(self):
-        """VIX, TNX, IRX must be mapped to ^VIX, ^TNX, ^IRX."""
-        _CARET_MAP = {"VIX": "^VIX", "TNX": "^TNX", "IRX": "^IRX"}
-        assert _CARET_MAP["VIX"] == "^VIX"
-        assert _CARET_MAP["TNX"] == "^TNX"
-        assert _CARET_MAP["IRX"] == "^IRX"
-
-    def test_non_macro_tickers_pass_through(self):
-        """Regular tickers like AAPL should not get a caret prefix."""
-        _CARET_MAP = {"VIX": "^VIX", "TNX": "^TNX", "IRX": "^IRX"}
-        tickers = ["AAPL", "VIX", "MSFT"]
-        mapped = [_CARET_MAP.get(t, t) for t in tickers]
-        assert mapped == ["AAPL", "^VIX", "MSFT"]
-
-
-# ---------------------------------------------------------------------------
-# Daily closes freshness gate
-# ---------------------------------------------------------------------------
-
-class TestDailyClosesFreshnessGate:
-    """_verify_daily_closes_fresh guards against missing or stale DataPhase1 output."""
-
-    def _s3_mock(self, last_modified=None, raise_exc=None):
+    def _macro_lib_mock(self, last_date=None, raise_exc=None):
         from unittest.mock import MagicMock
-        s3 = MagicMock()
+        lib = MagicMock()
         if raise_exc is not None:
-            s3.head_object.side_effect = raise_exc
+            lib.read.side_effect = raise_exc
+            return lib
+        if last_date is None:
+            lib.read.return_value.data = pd.DataFrame(columns=["Close"])
         else:
-            s3.head_object.return_value = {"LastModified": last_modified}
-        return s3
+            idx = pd.DatetimeIndex([pd.Timestamp(last_date)])
+            lib.read.return_value.data = pd.DataFrame({"Close": [500.0]}, index=idx)
+        return lib
 
-    def test_missing_file_raises_pipeline_abort(self):
-        from inference.stages.load_prices import _verify_daily_closes_fresh
+    def test_missing_spy_raises_pipeline_abort(self):
+        from inference.stages.load_prices import _verify_arctic_fresh
         from inference.pipeline import PipelineAbort
 
-        s3 = self._s3_mock(raise_exc=Exception("NoSuchKey"))
-        with pytest.raises(PipelineAbort, match="not found"):
-            _verify_daily_closes_fresh(s3, "bucket", "2026-04-16")
+        lib = self._macro_lib_mock(raise_exc=Exception("SymbolNotFound"))
+        with pytest.raises(PipelineAbort, match="unreadable"):
+            _verify_arctic_fresh(lib, "2026-04-16")
 
-    def test_fresh_file_today_passes(self):
-        from datetime import datetime, timezone, timedelta
-        from inference.stages.load_prices import _verify_daily_closes_fresh
-
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        recent = datetime.now(timezone.utc) - timedelta(minutes=30)
-        s3 = self._s3_mock(last_modified=recent)
-        # Should NOT raise
-        _verify_daily_closes_fresh(s3, "bucket", today)
-
-    def test_stale_file_today_raises_pipeline_abort(self):
-        from datetime import datetime, timezone, timedelta
-        from inference.stages.load_prices import _verify_daily_closes_fresh
+    def test_empty_spy_raises_pipeline_abort(self):
+        from inference.stages.load_prices import _verify_arctic_fresh
         from inference.pipeline import PipelineAbort
 
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        yesterday_write = datetime.now(timezone.utc) - timedelta(hours=25)
-        s3 = self._s3_mock(last_modified=yesterday_write)
+        lib = self._macro_lib_mock(last_date=None)
+        with pytest.raises(PipelineAbort, match="no rows"):
+            _verify_arctic_fresh(lib, "2026-04-16")
+
+    def test_fresh_spy_passes(self):
+        from inference.stages.load_prices import _verify_arctic_fresh
+
+        lib = self._macro_lib_mock(last_date="2026-04-16")
+        _verify_arctic_fresh(lib, "2026-04-16")  # should not raise
+
+    def test_stale_spy_raises_pipeline_abort(self):
+        from inference.stages.load_prices import _verify_arctic_fresh
+        from inference.pipeline import PipelineAbort
+
+        lib = self._macro_lib_mock(last_date="2026-04-15")
         with pytest.raises(PipelineAbort, match="stale"):
-            _verify_daily_closes_fresh(s3, "bucket", today)
-
-    def test_backfill_skips_freshness_check(self):
-        """Historical date_str should NOT enforce LastModified — legitimate old files."""
-        from datetime import datetime, timezone, timedelta
-        from inference.stages.load_prices import _verify_daily_closes_fresh
-
-        old_write = datetime.now(timezone.utc) - timedelta(days=30)
-        s3 = self._s3_mock(last_modified=old_write)
-        # Past date: should NOT raise even though file is ancient
-        _verify_daily_closes_fresh(s3, "bucket", "2026-03-10")
-
-    def test_boundary_exactly_at_threshold(self):
-        """File at exactly the 12h boundary should pass (strict > for staleness)."""
-        from datetime import datetime, timezone, timedelta
-        from inference.stages.load_prices import _verify_daily_closes_fresh
-
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        at_boundary = datetime.now(timezone.utc) - timedelta(hours=11, minutes=59)
-        s3 = self._s3_mock(last_modified=at_boundary)
-        _verify_daily_closes_fresh(s3, "bucket", today)
+            _verify_arctic_fresh(lib, "2026-04-16")
