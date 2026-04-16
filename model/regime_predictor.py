@@ -202,9 +202,17 @@ class RegimePredictor:
         """
         from sklearn.linear_model import LogisticRegression
 
+        # class_weight='balanced' adjusts the loss to treat minority-class
+        # errors proportionally more costly — n_samples / (n_classes * count_k)
+        # for class k. Without this, the 16%/49%/35% bear/neutral/bull split
+        # under L2=1.0 regularization collapses the bear coefficient to zero
+        # and the classifier never predicts bear on held-out folds. Smoke
+        # test 2026-04-16 confirmed that failure mode; re-run after adding
+        # this lifts bear recall above the per-class floor gate below.
         self._model = LogisticRegression(
             C=1.0, solver="lbfgs",
             max_iter=1000, random_state=42,
+            class_weight="balanced",
         )
         self._model.fit(X, y)
         self._fitted = True

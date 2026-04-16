@@ -40,22 +40,12 @@ def test_feature_names_persisted_on_save(tmp_path):
 def test_predict_single_uses_model_feature_names_not_module(tmp_path):
     """The critical backwards-compat check: a model trained on an older,
     shorter feature list must produce predictions without shape errors even
-    after META_FEATURES has grown. predict_single must read the model's own
-    schema, not the module constant."""
-    legacy_features = [
-        "research_calibrator_prob",
-        "momentum_score",
-        "expected_move",
-        "regime_bull",
-        "regime_bear",
-        "research_composite_score",
-        "research_conviction",
-        "sector_macro_modifier",
-    ]
-    # Sanity — legacy list must be a proper prefix of the current list
-    assert legacy_features == META_FEATURES[: len(legacy_features)]
-    # And the current list must have been extended (otherwise this test is vacuous)
-    assert len(META_FEATURES) > len(legacy_features)
+    after META_FEATURES changes shape. predict_single must read the model's
+    own schema, not the module constant. Uses a synthetic legacy schema with
+    NON-overlapping names so we can invoke predict_single with both the legacy
+    feature dict and extra keys without relying on the current META_FEATURES
+    order (which changes as the stack evolves — e.g. regime removal 2026-04-16)."""
+    legacy_features = [f"legacy_feat_{i}" for i in range(5)]
 
     X, y = _synth_training_data(legacy_features)
     mm = MetaModel(alpha=1.0).fit(X, y, feature_names=legacy_features)
@@ -66,10 +56,14 @@ def test_predict_single_uses_model_feature_names_not_module(tmp_path):
     # keys — predict_single must ignore the new keys because the loaded model
     # was not trained on them.
     mm2 = MetaModel.load(pkl_path)
-    feats = {name: 0.1 for name in META_FEATURES}
+    feats = {name: 0.1 for name in legacy_features}
+    feats.update({name: 0.2 for name in META_FEATURES})  # extra, should be ignored
     pred = mm2.predict_single(feats)
     assert isinstance(pred, float)
     assert np.isfinite(pred)
+    # And the model's feature names must match what it was trained on — not
+    # what the module currently exports
+    assert mm2._feature_names == legacy_features
 
 
 def test_pre_pr34_models_without_feature_names_still_load(tmp_path):

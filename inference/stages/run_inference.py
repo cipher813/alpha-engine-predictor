@@ -130,7 +130,8 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
 
     mom_scorer = ctx.meta_models.get("momentum")
     vol_scorer = ctx.meta_models.get("volatility")
-    regime_model = ctx.meta_models.get("regime")
+    # regime_model removed from ctx.meta_models lookup 2026-04-16 — Tier 0
+    # classifier no longer loaded by load_model.py.
     research_cal = ctx.meta_models.get("research_calibrator")
     meta_model = ctx.meta_models.get("meta")
 
@@ -148,40 +149,51 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
     _mom_mode = "GBM" if _mom_ic >= 0.02 else "direct (GBM IC=%.4f < 0.02)" % _mom_ic
     log.info("Momentum scoring mode: %s", _mom_mode)
 
-    # ── Step 1: Compute regime (once, market-wide) ───────────────────────────
-    regime_probs = {"regime_bear": 0.33, "regime_neutral": 0.34, "regime_bull": 0.33}
-    # Raw macro features (A+E): extracted once per inference run and broadcast
-    # to every ticker's meta-feature row below. Same regime_features_df the
-    # classifier consumes, so training-serving skew is structurally
-    # impossible — one build_features() call, two readers.
+    # ── Step 1: Compute raw macro features (once, market-wide) ──────────────
+    # RegimePredictor used here as a pure feature-engineering utility via
+    # build_features(). The regime classifier itself was retired 2026-04-16
+    # (Tier 0 model could not clear an honest baseline — see meta_model.py
+    # note and roadmap). The 6 macro features below feed the meta ridge
+    # directly; no classifier in the loop.
     macro_row_for_meta: dict[str, float] = {name: 0.0 for name in MACRO_FEATURE_META_MAP.values()}
-    if regime_model is not None and regime_model.is_fitted:
-        try:
-            spy_s = ctx.macro.get("SPY") if ctx.macro else None
-            vix_s = ctx.macro.get("VIX") if ctx.macro else None
-            vix3m_s = ctx.macro.get("VIX3M") if ctx.macro else None
-            tnx_s = ctx.macro.get("TNX") if ctx.macro else None
-            irx_s = ctx.macro.get("IRX") if ctx.macro else None
+    try:
+        from model.regime_predictor import RegimePredictor as _RPFeatureBuilder
+        spy_s = ctx.macro.get("SPY") if ctx.macro else None
+        vix_s = ctx.macro.get("VIX") if ctx.macro else None
+        vix3m_s = ctx.macro.get("VIX3M") if ctx.macro else None
+        tnx_s = ctx.macro.get("TNX") if ctx.macro else None
+        irx_s = ctx.macro.get("IRX") if ctx.macro else None
 
-            if spy_s is not None and len(spy_s) >= 20:
-                # build_features expects dict of Close Series, not DataFrames
-                _close_prices = {}
-                for _tk, _df in (ctx.price_data or {}).items():
-                    if _df is not None and not _df.empty and "Close" in _df.columns:
-                        _close_prices[_tk] = _df["Close"].astype(float)
-                regime_features_df = regime_model.build_features(
-                    spy_s, vix_s, vix3m_s, tnx_s, irx_s, _close_prices,
+        if spy_s is not None and len(spy_s) >= 20:
+            _close_prices = {}
+            for _tk, _df in (ctx.price_data or {}).items():
+                if _df is not None and not _df.empty and "Close" in _df.columns:
+                    _close_prices[_tk] = _df["Close"].astype(float)
+            regime_features_df = _RPFeatureBuilder().build_features(
+                spy_s, vix_s, vix3m_s, tnx_s, irx_s, _close_prices,
+            )
+            if not regime_features_df.empty:
+                latest_regime = regime_features_df.iloc[-1]
+                for src_name, meta_name in MACRO_FEATURE_META_MAP.items():
+                    macro_row_for_meta[meta_name] = float(latest_regime.get(src_name, 0.0))
+                log.info(
+                    "Macro features: spy_20d_ret=%.3f spy_20d_vol=%.3f vix_lvl=%.2f "
+                    "vix_slope=%.3f yc_slope=%.3f breadth=%.2f",
+                    latest_regime.get("spy_20d_return", 0),
+                    latest_regime.get("spy_20d_vol", 0),
+                    latest_regime.get("vix_level", 0),
+                    latest_regime.get("vix_term_slope", 0),
+                    latest_regime.get("yield_curve_slope", 0),
+                    latest_regime.get("market_breadth", 0),
                 )
-                if not regime_features_df.empty:
-                    latest_regime = regime_features_df.iloc[-1]
-                    regime_probs = regime_model.predict_single(latest_regime.to_dict())
-                    for src_name, meta_name in MACRO_FEATURE_META_MAP.items():
-                        macro_row_for_meta[meta_name] = float(latest_regime.get(src_name, 0.0))
-                    log.info("Regime: bull=%.2f  neutral=%.2f  bear=%.2f",
-                             regime_probs["regime_bull"], regime_probs["regime_neutral"],
-                             regime_probs["regime_bear"])
-        except Exception as e:
-            log.warning("Regime prediction failed: %s — using uniform priors", e)
+    except Exception as e:
+        # Preflight upstream already validates macro data freshness, so this
+        # block should never fire in the happy path. Log at ERROR so CloudWatch
+        # surfaces it loudly; fallback leaves zero-fill macro features so we
+        # don't take the whole day offline, but the ridge's macro coefficients
+        # will see a degenerate row — predictions that day are effectively
+        # equivalent to the pre-macro-features v3.0 model. Tracked via log scan.
+        log.error("Macro feature build failed: %s — using zero-fill defaults", e)
 
     # ── Step 2: Load research signals for calibrator ─────────────────────────
     # Read signals/latest.json for composite scores and conviction.
@@ -287,19 +299,22 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
             "research_calibrator_prob": research_cal_prob,
             "momentum_score": momentum_score,
             "expected_move": expected_move,
-            "regime_bull": regime_probs["regime_bull"],
-            "regime_bear": regime_probs["regime_bear"],
             "research_composite_score": research_score_norm,
             "research_conviction": research_conviction,
             "sector_macro_modifier": sector_modifier,
-            **macro_row_for_meta,  # raw macro features (A+E)
+            **macro_row_for_meta,  # raw macro features
         }
 
         if meta_model is not None and meta_model.is_fitted:
             alpha = float(meta_model.predict_single(meta_features))
         else:
-            # Fallback: weighted average of Layer 1 outputs
-            alpha = 0.4 * momentum_score + 0.3 * (research_cal_prob - 0.5) * 0.1 + 0.2 * expected_move * np.sign(momentum_score) + 0.1 * (regime_probs["regime_bull"] - regime_probs["regime_bear"]) * 0.05
+            # Fallback: weighted average of Layer 1 outputs. Prior regime-based
+            # term dropped along with the Tier 0 classifier removal (2026-04-16).
+            alpha = (
+                0.4 * momentum_score
+                + 0.3 * (research_cal_prob - 0.5) * 0.1
+                + 0.2 * expected_move * np.sign(momentum_score)
+            )
 
         # Research signal adjustment: meta-model was trained without research
         # data, so its ridge coefficients for research features are zero.
@@ -346,8 +361,12 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
             "research_calibrator_prob": round(research_cal_prob, 4),
             "momentum_confirmation": round(momentum_score, 6),
             "expected_move": round(expected_move, 6),
-            "regime_bull": round(regime_probs["regime_bull"], 4),
-            "regime_bear": round(regime_probs["regime_bear"], 4),
+            # regime_bull/regime_bear removed from per-ticker output 2026-04-16
+            # (Tier 0 classifier retired). Downstream consumers (dashboard,
+            # executor veto gate) must not expect these keys; the LLM macro
+            # agent in research still emits a market_regime string via
+            # signals.json, which remains the regime input the executor's
+            # position sizer consumes.
             "meta_model_version": "v3.0",
         }
 

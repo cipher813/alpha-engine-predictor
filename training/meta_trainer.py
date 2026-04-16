@@ -429,15 +429,6 @@ def run_meta_training(
     mom_fold_ics = []
     vol_fold_ics = []
 
-    # Walk-forward OOS pool for the regime classifier itself. Each fold's
-    # fold_regime is trained on history ≤ train_end and evaluated on the
-    # fold's test window — strictly time-aware, no leakage. Aggregated below
-    # into accuracy + confusion matrix + macro-F1, the trustworthy signals
-    # for promotion and for downstream consumers (manifest, dashboard).
-    regime_oos_y_true: list[int] = []
-    regime_oos_y_pred: list[int] = []
-    regime_fold_accuracies: list[float] = []
-
     for i, fold in enumerate(folds):
         fold_start = time.time()
         tr = fold["train_idx"]
@@ -465,54 +456,24 @@ def run_meta_training(
         vol_ic = float(np.corrcoef(vol_preds, abs_fwd[te])[0, 1]) if np.std(vol_preds) > 1e-10 else 0.0
         vol_fold_ics.append(vol_ic)
 
-        # Regime predictor: train on dates up to train_end
-        regime_train_mask = common_dates <= pd.Timestamp(fold["train_end"])
-        regime_test_mask = (common_dates >= pd.Timestamp(fold["test_start"])) & \
-                           (common_dates <= pd.Timestamp(fold["test_end"]))
-        if regime_train_mask.sum() >= 100:
-            fold_regime = RegimePredictor()
-            fold_regime.fit(regime_X_aligned[regime_train_mask], regime_y_aligned[regime_train_mask])
-        else:
-            fold_regime = None
-
-        # Collect regime OOS predictions for this fold (one row per date in
-        # the fold's test window). These feed the aggregate walk-forward
-        # evaluation after the loop — the metric that should gate promotion
-        # and that downstream consumers should trust (not in-sample accuracy).
-        if fold_regime is not None and regime_test_mask.sum() > 0:
-            regime_X_te = regime_X_aligned[regime_test_mask]
-            regime_y_te = regime_y_aligned[regime_test_mask]
-            regime_preds_te = fold_regime._model.predict(regime_X_te)
-            regime_oos_y_true.extend(regime_y_te.tolist())
-            regime_oos_y_pred.extend(regime_preds_te.tolist())
-            fold_acc = float((regime_preds_te == regime_y_te).mean())
-            regime_fold_accuracies.append(fold_acc)
-
-        # Build meta-model OOS rows for this fold's test set
-        # Group test samples by date for regime prediction
+        # Build meta-model OOS rows for this fold's test set. Raw macro
+        # features are extracted per test_date and broadcast to every ticker
+        # on that date (market-wide values, not per-ticker). RegimePredictor
+        # here is used only as a feature-engineering utility via the static
+        # regime_features_df built once at Step 4 — the classifier model itself
+        # is no longer trained, uploaded, or consumed by the meta-model (see
+        # note at top of meta_model.py and the roadmap entry for the Tier 1
+        # regime rewrite).
         test_dates_unique = sorted(set(all_dates[j] for j in te))
         for test_date in test_dates_unique:
             date_mask = np.array([all_dates[j] == test_date for j in te])
             date_indices = te[date_mask]
 
-            # Regime prediction for this date. Raw macro features extracted
-            # once per date and broadcast to every ticker in date_indices —
-            # they are market-wide, not per-ticker, so all tickers on a
-            # given date share identical macro columns. No training-serving
-            # skew: inference extracts from the same regime_features_df built
-            # via RegimePredictor.build_features().
             macro_row: dict[str, float] = {}
             if test_date in regime_features_df.index:
-                regime_x = regime_features_df.loc[test_date, RegimePredictor.FEATURE_NAMES].to_numpy().reshape(1, -1)
-                regime_probs = (
-                    fold_regime.predict_proba(regime_x)[0]
-                    if fold_regime is not None
-                    else np.array([0.33, 0.34, 0.33])
-                )
                 for src_name, meta_name in MACRO_FEATURE_META_MAP.items():
                     macro_row[meta_name] = float(regime_features_df.at[test_date, src_name])
             else:
-                regime_probs = np.array([0.33, 0.34, 0.33])
                 for meta_name in MACRO_FEATURE_META_MAP.values():
                     macro_row[meta_name] = 0.0
 
@@ -521,14 +482,12 @@ def run_meta_training(
                 row = {
                     "momentum_score": float(mom_preds[local_idx]),
                     "expected_move": float(vol_preds[local_idx]),
-                    "regime_bull": float(regime_probs[2]),
-                    "regime_bear": float(regime_probs[0]),
                     "research_calibrator_prob": 0.5,  # placeholder (v0 lookup applied later)
                     "research_composite_score": 0.5,  # not available in price-only training
                     "research_conviction": 0.0,
                     "sector_macro_modifier": 0.0,
                     "actual_fwd": float(y_fwd[idx]),
-                    **macro_row,  # raw macro features (A+E)
+                    **macro_row,  # raw macro features
                 }
                 # Multi-horizon labels (diagnostic only)
                 for hi, h in enumerate(_DIAGNOSTIC_HORIZONS):
@@ -660,89 +619,17 @@ def run_meta_training(
     vol_test_ic = float(np.corrcoef(vol_test_preds, np.abs(y_fwd[val_end:]))[0, 1]) if len(vol_test_preds) > 1 else 0.0
     log.info("Volatility production: test_IC=%.4f  best_iter=%d", vol_test_ic, prod_vol._best_iteration)
 
-    # Regime production model (full history)
-    prod_regime = RegimePredictor()
-    prod_regime.fit(regime_X_aligned, regime_y_aligned)
-
-    # Attach walk-forward OOS metrics aggregated from the per-fold regime
-    # predictors above. This is the trustworthy accuracy signal; in-sample
-    # accuracy on the prod model retrained on full history will always
-    # overstate real-world performance.
-    from model.regime_predictor import compute_classification_metrics
-    regime_oos_metrics: dict = {}
-    if regime_oos_y_true:
-        regime_oos_metrics = compute_classification_metrics(
-            np.asarray(regime_oos_y_true),
-            np.asarray(regime_oos_y_pred),
-        )
-        regime_oos_metrics["n_folds"] = len(regime_fold_accuracies)
-        regime_oos_metrics["fold_accuracies"] = [
-            round(a, 4) for a in regime_fold_accuracies
-        ]
-        regime_oos_metrics["median_fold_accuracy"] = (
-            round(float(np.median(regime_fold_accuracies)), 4)
-            if regime_fold_accuracies else None
-        )
-        log.info(
-            "Regime walk-forward OOS: acc=%.3f  macro_f1=%.3f  n=%d  n_folds=%d",
-            regime_oos_metrics["accuracy"],
-            regime_oos_metrics["macro_f1"],
-            regime_oos_metrics["n_samples"],
-            regime_oos_metrics["n_folds"],
-        )
-        cm_oos = np.array(regime_oos_metrics["confusion_matrix"])
-        log.info("  OOS confusion matrix (rows=true, cols=pred, order bear/neutral/bull):")
-        for i, row in enumerate(cm_oos):
-            log.info("    %s: %s", ["bear", "neutral", "bull"][i], row.tolist())
-    else:
-        log.warning(
-            "Regime walk-forward OOS: no fold produced predictions — "
-            "downstream consumers will see empty oos metrics"
-        )
-    prod_regime.set_oos_metrics(regime_oos_metrics)
-
-    # Regime classifier promotion gate. Hard-fails per feedback_hard_fail_until_stable:
-    # a silently-regressed regime classifier feeds noise into the meta-model's
-    # regime_bull/regime_bear features and into downstream consumers (LLM cross-check,
-    # dashboard). Better to break training loudly than to ship a degenerate
-    # majority-class predictor with 0.58 training accuracy and 0.0 bull/bear recall.
-    #
-    # Baseline for 3-class balanced-random is 0.333; the accuracy gate at 0.40 is
-    # deliberately modest while we gather our first real walk-forward numbers.
-    # Macro-F1 is the honest guard against majority-class collapse — accuracy alone
-    # can score 0.58 by always predicting "neutral" (the majority class by
-    # construction, given the ±3% label thresholds over 20d SPY returns).
-    regime_oos_acc = regime_oos_metrics.get("accuracy")
-    regime_oos_f1 = regime_oos_metrics.get("macro_f1")
-    regime_passes_gate = (
-        regime_oos_acc is not None
-        and regime_oos_f1 is not None
-        and regime_oos_acc >= cfg.REGIME_OOS_ACCURACY_GATE
-        and regime_oos_f1 >= cfg.REGIME_OOS_MACRO_F1_GATE
-    )
-    if regime_oos_acc is None or regime_oos_f1 is None:
-        raise RuntimeError(
-            "Regime walk-forward OOS metrics not produced. The fold loop did not "
-            "collect any regime OOS predictions — check fold structure and the "
-            "common_dates alignment in meta_trainer.py."
-        )
-    if not regime_passes_gate:
-        raise RuntimeError(
-            f"Regime classifier failed promotion gate: "
-            f"OOS accuracy={regime_oos_acc:.3f} (gate ≥ {cfg.REGIME_OOS_ACCURACY_GATE:.2f}), "
-            f"OOS macro_f1={regime_oos_f1:.3f} (gate ≥ {cfg.REGIME_OOS_MACRO_F1_GATE:.2f}). "
-            f"Confusion matrix (rows=true, cols=pred, bear/neutral/bull): "
-            f"{regime_oos_metrics.get('confusion_matrix')}. "
-            f"Per-class recall: {regime_oos_metrics.get('per_class_recall')}. "
-            "If the classifier is collapsing to a majority-class predictor, recall "
-            "for bear and bull will be near zero. Retrain with more data, rebalance, "
-            "or relax the label thresholds before shipping."
-        )
-    log.info(
-        "Regime promotion gate: OOS acc=%.3f (≥%.2f) macro_f1=%.3f (≥%.2f) → PASS",
-        regime_oos_acc, cfg.REGIME_OOS_ACCURACY_GATE,
-        regime_oos_f1, cfg.REGIME_OOS_MACRO_F1_GATE,
-    )
+    # Regime classifier removed from the critical path 2026-04-16. Its
+    # Tier 0 implementation (multinomial logistic on 6 macro features) could
+    # not clear an honest baseline — walk-forward OOS accuracy of 39.5% sat
+    # below always-predict-majority (~49%), with bear recall of 0.23 under
+    # balanced class weights. Raw macro features now feed the meta ridge
+    # directly via MACRO_FEATURE_META_MAP above. Tier 1 regime rewrite
+    # (LightGBM + broader features + triple-barrier labeling + proper purge
+    # ≥ label horizon) is tracked in the roadmap; when it ships, it will
+    # enter the stack through a dedicated promotion gate referencing named
+    # baselines (majority-class, random, persistence) rather than absolute
+    # thresholds.
 
     # Research calibrator (v0 — lookup table)
     prod_calibrator = ResearchCalibrator()
@@ -791,10 +678,14 @@ def run_meta_training(
             # Filename is contractual with the backtester's retrain_alert
             # grace-period check (reads .meta.json sidecar). Do not rename
             # without updating analysis/production_health.py.
+            # Regime predictor removed from upload set 2026-04-16 — see note
+            # in Step 8 above. Existing s3://.../regime_predictor.pkl from the
+            # prior training cycle is left in place; inference no longer loads
+            # it (see inference/stages/load_model.py). Cleanup of the stale
+            # S3 artifact is tracked in the Tier 1 regime roadmap entry.
             models = {
                 "momentum": (prod_mom, "momentum_model.txt"),
                 "volatility": (prod_vol, "volatility_model.txt"),
-                "regime": (prod_regime, "regime_predictor.pkl"),
                 "research_calibrator": (prod_calibrator, "research_calibrator.json"),
                 "meta_model": (meta_model, "meta_model.pkl"),
                 "isotonic_calibrator": (calibrator, "isotonic_calibrator.pkl"),
@@ -822,15 +713,8 @@ def run_meta_training(
                 "models": {
                     "momentum": {"key": f"{prefix}momentum_model.txt", "test_ic": round(mom_test_ic, 6)},
                     "volatility": {"key": f"{prefix}volatility_model.txt", "test_ic": round(vol_test_ic, 6)},
-                    "regime": {
-                        "key": f"{prefix}regime_predictor.pkl",
-                        "accuracy": prod_regime._accuracy,  # in-sample, legacy field
-                        "oos_accuracy": regime_oos_metrics.get("accuracy"),
-                        "oos_macro_f1": regime_oos_metrics.get("macro_f1"),
-                        "oos_n_samples": regime_oos_metrics.get("n_samples"),
-                        "oos_per_class_recall": regime_oos_metrics.get("per_class_recall"),
-                        "gate_passed": regime_passes_gate,
-                    },
+                    # regime: removed from manifest 2026-04-16 (Tier 0 model
+                    # retired; see Step 8 note and roadmap).
                     "research_calibrator": {"key": f"{prefix}research_calibrator.json",
                                             "n_samples": prod_calibrator._n_samples},
                     "meta_model": {
@@ -849,10 +733,6 @@ def run_meta_training(
                     "momentum_median_ic": round(mom_median_ic, 6),
                     "volatility_median_ic": round(vol_median_ic, 6),
                     "n_folds": len(folds),
-                    "regime_oos_accuracy": regime_oos_metrics.get("accuracy"),
-                    "regime_oos_macro_f1": regime_oos_metrics.get("macro_f1"),
-                    "regime_oos_confusion_matrix": regime_oos_metrics.get("confusion_matrix"),
-                    "regime_median_fold_accuracy": regime_oos_metrics.get("median_fold_accuracy"),
                 },
                 "meta_coefficients": meta_model._coefficients,
             }
@@ -865,9 +745,8 @@ def run_meta_training(
 
     log.info(
         "Meta-training complete: mom_IC=%.4f  vol_IC=%.4f  meta_IC=%.4f  "
-        "regime_acc=%.1f%%  promoted=%s  elapsed=%.0fs",
-        mom_test_ic, vol_test_ic, meta_model._val_ic,
-        (prod_regime._accuracy or 0) * 100, promoted, elapsed_s,
+        "promoted=%s  elapsed=%.0fs",
+        mom_test_ic, vol_test_ic, meta_model._val_ic, promoted, elapsed_s,
     )
 
     return {
@@ -880,12 +759,10 @@ def run_meta_training(
         "n_test": N - val_end,
         "momentum_test_ic": round(mom_test_ic, 6),
         "volatility_test_ic": round(vol_test_ic, 6),
-        "regime_accuracy": round((prod_regime._accuracy or 0), 4),  # in-sample, legacy
-        "regime_oos_accuracy": regime_oos_metrics.get("accuracy"),
-        "regime_oos_macro_f1": regime_oos_metrics.get("macro_f1"),
-        "regime_oos_per_class_recall": regime_oos_metrics.get("per_class_recall"),
-        "regime_oos_confusion_matrix": regime_oos_metrics.get("confusion_matrix"),
-        "regime_gate_passed": regime_passes_gate,
+        # regime_* fields removed from result dict 2026-04-16 (Tier 0 model
+        # retired). Email formatter and downstream consumers must not expect
+        # regime_accuracy / regime_oos_* keys; they will be restored when the
+        # Tier 1 regime model ships with its own promotion gate + metrics.
         "research_calibrator_n": prod_calibrator._n_samples,
         "research_calibrator_metrics": prod_calibrator.metrics(),
         "meta_model_ic": round(meta_model._val_ic, 6),

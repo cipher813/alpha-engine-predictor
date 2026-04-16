@@ -106,3 +106,30 @@ class TestRegimePredictorOOSRoundtrip:
         rp.save(pkl_path)
         rp2 = RegimePredictor.load(pkl_path)
         assert rp2._oos_metrics == {}
+
+
+class TestBalancedClassWeights:
+    def test_minority_class_gets_nonzero_prediction_probability(self):
+        """With class_weight='balanced', the bear coefficient cannot collapse
+        to the point where P(bear | x) is zero for every observation.
+        Regression-style test for the 2026-04-16 smoke-test finding: without
+        balanced weights the OOS confusion matrix had a full zero column for
+        bear predictions. Constructs an imbalanced training set (16/49/35
+        split mirroring real data) and verifies the fitted model predicts
+        bear for AT LEAST one sample."""
+        rng = np.random.default_rng(2026)
+        n_bear, n_neutral, n_bull = 80, 245, 175  # ~16/49/35 split
+        # Build separable-ish features so fit isn't degenerate
+        def _cluster(mean, n):
+            return rng.normal(loc=mean, scale=0.5, size=(n, len(RegimePredictor.FEATURE_NAMES)))
+        X = np.vstack([_cluster(-1.0, n_bear), _cluster(0.0, n_neutral), _cluster(1.0, n_bull)])
+        y = np.array([0] * n_bear + [1] * n_neutral + [2] * n_bull)
+
+        rp = RegimePredictor().fit(X, y)
+        preds = rp._model.predict(X)
+        # Bear must receive at least one prediction — the degenerate zero-column
+        # case is the exact failure the balanced weights must prevent.
+        assert int((preds == 0).sum()) > 0, (
+            f"balanced classifier still ignoring bear class; preds distribution: "
+            f"{dict(zip(*np.unique(preds, return_counts=True)))}"
+        )

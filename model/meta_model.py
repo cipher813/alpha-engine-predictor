@@ -25,26 +25,25 @@ log = logging.getLogger(__name__)
 
 # Meta-model input features (order must match at training and inference)
 #
-# Layer-1 outputs and research context come first; raw macro features follow
-# the classifier's compressed outputs (regime_bull, regime_bear). The raw
-# features give Ridge a direct linear channel to the same macro signal the
-# softmax classifier compresses — complementary information when the
-# classifier's compression drops structure. Feature importance analysis
-# (standardized coefficients + permutation) on the first post-deploy run
-# tells us whether the classifier columns are pulling weight beyond what
-# the raw columns already explain, informing a pruning decision.
+# Layer-1 outputs and research context, plus raw macro features as direct
+# ridge inputs. Previously included classifier-derived regime_bull/regime_bear
+# columns from a multinomial logistic regime predictor; removed 2026-04-16
+# after smoke-test walk-forward validation revealed the classifier scored
+# 39.5% OOS accuracy (below always-predict-majority's 49%) with bear recall
+# of 0.23 — a known-weak signal that wasn't contributing beyond what the
+# raw macro features already carry. Tier 1 regime model upgrade on the
+# roadmap (LightGBM + broader feature set + triple-barrier labeling); the
+# hard-classified regime signal will return once it clears a named baseline.
 META_FEATURES = [
     "research_calibrator_prob",   # P(research signal is correct)
     "momentum_score",             # momentum model output (continuous)
     "expected_move",              # volatility model output (continuous)
-    "regime_bull",                # P(bull regime) — classifier output
-    "regime_bear",                # P(bear regime) — classifier output
     "research_composite_score",   # raw research score (0-100, normalized to 0-1)
     "research_conviction",        # rising=1, stable=0, declining=-1
     "sector_macro_modifier",      # sector modifier from research (0.7-1.3, centered at 1)
-    # Raw macro features (E): same 6 inputs the regime classifier consumes,
-    # exposed directly to the meta ridge. Single market-wide value per date;
-    # all tickers on a given date share these columns.
+    # Raw macro features: same 6 inputs the Tier 0 regime classifier used to
+    # consume, now exposed directly to the meta ridge. Single market-wide
+    # value per date; all tickers on a given date share these columns.
     "macro_spy_20d_return",       # trailing 20d SPY return
     "macro_spy_20d_vol",          # annualized 20d realized vol
     "macro_vix_level",            # VIX normalized by baseline 20

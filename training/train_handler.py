@@ -117,39 +117,13 @@ def _build_ic_table_html(result, is_meta, ic_color, ic_label, promoted_mode,
         meta_ic = result.get("meta_model_ic", test_ic)
         mom_ic = result.get("momentum_test_ic", mse_ic)
         vol_ic = result.get("volatility_test_ic", 0)
-        regime_in_sample_acc = result.get("regime_accuracy", 0)
-        regime_oos_acc = result.get("regime_oos_accuracy")
-        regime_oos_f1 = result.get("regime_oos_macro_f1")
-        regime_oos_recall = result.get("regime_oos_per_class_recall")
-        regime_gate = result.get("regime_gate_passed")
         rows += _row("Meta-Model IC", f'{meta_ic:.4f}', bg=True)
         rows += _row("Momentum IC", f'{mom_ic:.4f}')
         rows += _row("Volatility IC", f'{vol_ic:.4f}', bg=True)
-        # Regime: show both OOS (the trustworthy number) and in-sample (legacy).
-        # OOS accuracy + macro-F1 together — macro-F1 is the honest guard
-        # against a majority-class classifier that scores high accuracy while
-        # having zero bear/bull recall.
-        if regime_oos_acc is not None:
-            gate_tag = "PASS" if regime_gate else "FAIL"
-            gate_color = "#2e7d32" if regime_gate else "#c62828"
-            rows += _row(
-                "Regime OOS Acc",
-                f'<span style="color:{gate_color};">{regime_oos_acc*100:.1f}% ({gate_tag})</span>',
-            )
-            if regime_oos_f1 is not None:
-                rows += _row("Regime Macro-F1", f'{regime_oos_f1:.3f}', bg=True)
-            if regime_oos_recall and len(regime_oos_recall) == 3:
-                rows += _row(
-                    "Regime Recall (bear/neutral/bull)",
-                    f'{regime_oos_recall[0]:.2f} / {regime_oos_recall[1]:.2f} / {regime_oos_recall[2]:.2f}',
-                )
-            rows += _row(
-                "Regime In-Sample (legacy)",
-                f'{regime_in_sample_acc*100:.1f}%',
-                bg=True,
-            )
-        else:
-            rows += _row("Regime Accuracy", f'{regime_in_sample_acc*100:.1f}%')
+        # Regime classifier removed from the critical path 2026-04-16 (Tier 0
+        # model retired; raw macro features now feed the ridge directly).
+        # Tier 1 regime model will re-introduce regime rows here when it
+        # ships, with metrics tied to a named baseline.
         coefs = result.get("meta_coefficients", {})
         if coefs:
             coef_str = " | ".join(
@@ -564,14 +538,12 @@ def send_training_email(result: dict, date_str: str) -> bool:
         meta_ic = result.get("meta_model_ic", test_ic)
         mom_ic = result.get("momentum_test_ic", mse_ic)
         vol_ic_val = result.get("volatility_test_ic", 0)
-        regime_acc = result.get("regime_accuracy", 0)
         plain_body = (
             f"Alpha Engine Training — {date_str}\n"
             f"Model: {version}  Samples: {n_train:,}  Elapsed: {elapsed_s:.0f}s\n"
             f"\nMeta-Model IC:      {meta_ic:.4f} — {ic_label}"
             f"\nMomentum IC:        {mom_ic:.4f}"
             f"\nVolatility IC:      {vol_ic_val:.4f}"
-            f"\nRegime Accuracy:    {regime_acc*100:.1f}%"
             f"\nPromotion:          {promo_label}\n"
             f"{wf_plain}"
         )

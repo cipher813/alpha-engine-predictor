@@ -265,6 +265,13 @@ WF_EARLY_STOPPING = _wf_cfg.get("wf_early_stopping", None)  # None → use GBM_E
 # OOS numbers from the first walk-forward run.
 REGIME_OOS_ACCURACY_GATE = _wf_cfg.get("regime_oos_accuracy_gate", 0.40)
 REGIME_OOS_MACRO_F1_GATE = _wf_cfg.get("regime_oos_macro_f1_gate", 0.30)
+# Per-class recall floor. Bear/neutral/bull must each recall at least this
+# fraction of their true instances on walk-forward OOS. Catches the failure
+# mode where average metrics look OK but the classifier ignores a class
+# (e.g. bear recall = 0 under L2 regularization + class imbalance, smoke
+# test 2026-04-16). Set conservatively — a model that can't identify 15%
+# of bear periods is useless as a regime signal regardless of macro-F1.
+REGIME_OOS_PER_CLASS_RECALL_FLOOR = _wf_cfg.get("regime_oos_per_class_recall_floor", 0.15)
 
 # ── Feature selection / noise detection ─────────────────────────────────────
 _fs_cfg = _cfg.get("feature_selection", {})
