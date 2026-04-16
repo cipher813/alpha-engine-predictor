@@ -97,7 +97,7 @@ def run_meta_training(
     from model.gbm_scorer import GBMScorer
     from model.regime_predictor import RegimePredictor
     from model.research_calibrator import ResearchCalibrator
-    from model.meta_model import MetaModel, META_FEATURES
+    from model.meta_model import MetaModel, META_FEATURES, MACRO_FEATURE_META_MAP
 
     start_ts = datetime.now(timezone.utc)
 
@@ -456,42 +456,38 @@ def run_meta_training(
         vol_ic = float(np.corrcoef(vol_preds, abs_fwd[te])[0, 1]) if np.std(vol_preds) > 1e-10 else 0.0
         vol_fold_ics.append(vol_ic)
 
-        # Regime predictor: train on dates up to train_end
-        regime_train_mask = common_dates <= pd.Timestamp(fold["train_end"])
-        regime_test_mask = (common_dates >= pd.Timestamp(fold["test_start"])) & \
-                           (common_dates <= pd.Timestamp(fold["test_end"]))
-        if regime_train_mask.sum() >= 100:
-            fold_regime = RegimePredictor()
-            fold_regime.fit(regime_X_aligned[regime_train_mask], regime_y_aligned[regime_train_mask])
-        else:
-            fold_regime = None
-
-        # Build meta-model OOS rows for this fold's test set
-        # Group test samples by date for regime prediction
+        # Build meta-model OOS rows for this fold's test set. Raw macro
+        # features are extracted per test_date and broadcast to every ticker
+        # on that date (market-wide values, not per-ticker). RegimePredictor
+        # here is used only as a feature-engineering utility via the static
+        # regime_features_df built once at Step 4 — the classifier model itself
+        # is no longer trained, uploaded, or consumed by the meta-model (see
+        # note at top of meta_model.py and the roadmap entry for the Tier 1
+        # regime rewrite).
         test_dates_unique = sorted(set(all_dates[j] for j in te))
         for test_date in test_dates_unique:
             date_mask = np.array([all_dates[j] == test_date for j in te])
             date_indices = te[date_mask]
 
-            # Regime prediction for this date
-            if fold_regime is not None and test_date in regime_features_df.index:
-                regime_x = regime_features_df.loc[test_date, RegimePredictor.FEATURE_NAMES].to_numpy().reshape(1, -1)
-                regime_probs = fold_regime.predict_proba(regime_x)[0]
+            macro_row: dict[str, float] = {}
+            if test_date in regime_features_df.index:
+                for src_name, meta_name in MACRO_FEATURE_META_MAP.items():
+                    macro_row[meta_name] = float(regime_features_df.at[test_date, src_name])
             else:
-                regime_probs = np.array([0.33, 0.34, 0.33])
+                for meta_name in MACRO_FEATURE_META_MAP.values():
+                    macro_row[meta_name] = 0.0
 
             for idx in date_indices:
                 local_idx = np.where(te == idx)[0][0]
                 row = {
                     "momentum_score": float(mom_preds[local_idx]),
                     "expected_move": float(vol_preds[local_idx]),
-                    "regime_bull": float(regime_probs[2]),
-                    "regime_bear": float(regime_probs[0]),
                     "research_calibrator_prob": 0.5,  # placeholder (v0 lookup applied later)
                     "research_composite_score": 0.5,  # not available in price-only training
                     "research_conviction": 0.0,
                     "sector_macro_modifier": 0.0,
                     "actual_fwd": float(y_fwd[idx]),
+                    **macro_row,  # raw macro features
                 }
                 # Multi-horizon labels (diagnostic only)
                 for hi, h in enumerate(_DIAGNOSTIC_HORIZONS):
@@ -623,9 +619,17 @@ def run_meta_training(
     vol_test_ic = float(np.corrcoef(vol_test_preds, np.abs(y_fwd[val_end:]))[0, 1]) if len(vol_test_preds) > 1 else 0.0
     log.info("Volatility production: test_IC=%.4f  best_iter=%d", vol_test_ic, prod_vol._best_iteration)
 
-    # Regime production model (full history)
-    prod_regime = RegimePredictor()
-    prod_regime.fit(regime_X_aligned, regime_y_aligned)
+    # Regime classifier removed from the critical path 2026-04-16. Its
+    # Tier 0 implementation (multinomial logistic on 6 macro features) could
+    # not clear an honest baseline — walk-forward OOS accuracy of 39.5% sat
+    # below always-predict-majority (~49%), with bear recall of 0.23 under
+    # balanced class weights. Raw macro features now feed the meta ridge
+    # directly via MACRO_FEATURE_META_MAP above. Tier 1 regime rewrite
+    # (LightGBM + broader features + triple-barrier labeling + proper purge
+    # ≥ label horizon) is tracked in the roadmap; when it ships, it will
+    # enter the stack through a dedicated promotion gate referencing named
+    # baselines (majority-class, random, persistence) rather than absolute
+    # thresholds.
 
     # Research calibrator (v0 — lookup table)
     prod_calibrator = ResearchCalibrator()
@@ -674,10 +678,14 @@ def run_meta_training(
             # Filename is contractual with the backtester's retrain_alert
             # grace-period check (reads .meta.json sidecar). Do not rename
             # without updating analysis/production_health.py.
+            # Regime predictor removed from upload set 2026-04-16 — see note
+            # in Step 8 above. Existing s3://.../regime_predictor.pkl from the
+            # prior training cycle is left in place; inference no longer loads
+            # it (see inference/stages/load_model.py). Cleanup of the stale
+            # S3 artifact is tracked in the Tier 1 regime roadmap entry.
             models = {
                 "momentum": (prod_mom, "momentum_model.txt"),
                 "volatility": (prod_vol, "volatility_model.txt"),
-                "regime": (prod_regime, "regime_predictor.pkl"),
                 "research_calibrator": (prod_calibrator, "research_calibrator.json"),
                 "meta_model": (meta_model, "meta_model.pkl"),
                 "isotonic_calibrator": (calibrator, "isotonic_calibrator.pkl"),
@@ -705,10 +713,15 @@ def run_meta_training(
                 "models": {
                     "momentum": {"key": f"{prefix}momentum_model.txt", "test_ic": round(mom_test_ic, 6)},
                     "volatility": {"key": f"{prefix}volatility_model.txt", "test_ic": round(vol_test_ic, 6)},
-                    "regime": {"key": f"{prefix}regime_predictor.pkl", "accuracy": prod_regime._accuracy},
+                    # regime: removed from manifest 2026-04-16 (Tier 0 model
+                    # retired; see Step 8 note and roadmap).
                     "research_calibrator": {"key": f"{prefix}research_calibrator.json",
                                             "n_samples": prod_calibrator._n_samples},
-                    "meta_model": {"key": f"{prefix}meta_model.pkl", "ic": round(meta_model._val_ic, 6)},
+                    "meta_model": {
+                        "key": f"{prefix}meta_model.pkl",
+                        "ic": round(meta_model._val_ic, 6),
+                        "importance": meta_model._importance,
+                    },
                     "isotonic_calibrator": {
                         "key": f"{prefix}isotonic_calibrator.pkl",
                         "ece_before": round(calibrator._ece_before or 0.0, 6),
@@ -732,9 +745,8 @@ def run_meta_training(
 
     log.info(
         "Meta-training complete: mom_IC=%.4f  vol_IC=%.4f  meta_IC=%.4f  "
-        "regime_acc=%.1f%%  promoted=%s  elapsed=%.0fs",
-        mom_test_ic, vol_test_ic, meta_model._val_ic,
-        (prod_regime._accuracy or 0) * 100, promoted, elapsed_s,
+        "promoted=%s  elapsed=%.0fs",
+        mom_test_ic, vol_test_ic, meta_model._val_ic, promoted, elapsed_s,
     )
 
     return {
@@ -747,11 +759,15 @@ def run_meta_training(
         "n_test": N - val_end,
         "momentum_test_ic": round(mom_test_ic, 6),
         "volatility_test_ic": round(vol_test_ic, 6),
-        "regime_accuracy": round((prod_regime._accuracy or 0), 4),
+        # regime_* fields removed from result dict 2026-04-16 (Tier 0 model
+        # retired). Email formatter and downstream consumers must not expect
+        # regime_accuracy / regime_oos_* keys; they will be restored when the
+        # Tier 1 regime model ships with its own promotion gate + metrics.
         "research_calibrator_n": prod_calibrator._n_samples,
         "research_calibrator_metrics": prod_calibrator.metrics(),
         "meta_model_ic": round(meta_model._val_ic, 6),
         "meta_coefficients": meta_model._coefficients,
+        "meta_importance": meta_model._importance,
         "horizon_diagnostic": {
             # Backwards-compat scalars (existing consumers):
             "spearman_5d": round(spearman_5d, 6),

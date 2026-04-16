@@ -300,16 +300,16 @@ def _build_predictor_email(
         return f'<span style="color:{colors.get(d, "#888")}; font-weight:bold;">{d}</span>'
 
     def _meta_cols(p: dict) -> str:
-        """Extra columns for meta-model predictions: momentum, vol, regime, research."""
+        """Extra columns for meta-model predictions: momentum, vol, research.
+        Regime column removed 2026-04-16 (Tier 0 classifier retired). The
+        LLM-derived market_regime from research still renders in the header
+        pill above the table — that's the regime signal the executor consumes."""
         mom = p.get("momentum_confirmation")
         vol = p.get("expected_move")
-        rbull = p.get("regime_bull")
-        rbear = p.get("regime_bear")
         rscore = p.get("research_calibrator_prob")
         return (
             f'<td {TDR}>{f"{mom:+.3f}" if mom is not None else "—"}</td>'
             f'<td {TDR}>{f"{vol:.3f}" if vol is not None else "—"}</td>'
-            f'<td {TDR}>{f"{rbull:.0%}" if rbull is not None else "—"}</td>'
             f'<td {TDR}>{f"{rscore:.0%}" if rscore is not None else "—"}</td>'
         )
 
@@ -342,7 +342,6 @@ def _build_predictor_email(
         meta_headers = (
             f'<th {TH}>Mom</th>'
             f'<th {TH}>Vol</th>'
-            f'<th {TH}>Regime</th>'
             f'<th {TH}>Res.Cal</th>'
         ) if is_meta else ""
         return (

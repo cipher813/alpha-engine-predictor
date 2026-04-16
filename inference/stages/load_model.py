@@ -296,14 +296,11 @@ def _load_meta_models(ctx: PipelineContext) -> None:
     except Exception as e:
         log.warning("Volatility model not available: %s", e)
 
-    # Regime predictor
-    try:
-        from model.regime_predictor import RegimePredictor
-        path = _dl(f"{prefix}regime_predictor.pkl", "meta_regime.pkl")
-        ctx.meta_models["regime"] = RegimePredictor.load(path)
-        log.info("Loaded regime predictor")
-    except Exception as e:
-        log.warning("Regime predictor not available: %s", e)
+    # Regime predictor load retired 2026-04-16. Tier 0 classifier failed
+    # honest walk-forward validation and was removed from the critical path.
+    # Raw macro features feed the ridge directly via build_features() in
+    # run_inference.py. Tier 1 regime rewrite is on the roadmap; when it
+    # ships it will re-introduce a loader block here with its own path.
 
     # Research calibrator
     try:

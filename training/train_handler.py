@@ -117,11 +117,13 @@ def _build_ic_table_html(result, is_meta, ic_color, ic_label, promoted_mode,
         meta_ic = result.get("meta_model_ic", test_ic)
         mom_ic = result.get("momentum_test_ic", mse_ic)
         vol_ic = result.get("volatility_test_ic", 0)
-        regime_acc = result.get("regime_accuracy", 0)
         rows += _row("Meta-Model IC", f'{meta_ic:.4f}', bg=True)
         rows += _row("Momentum IC", f'{mom_ic:.4f}')
         rows += _row("Volatility IC", f'{vol_ic:.4f}', bg=True)
-        rows += _row("Regime Accuracy", f'{regime_acc*100:.1f}%')
+        # Regime classifier removed from the critical path 2026-04-16 (Tier 0
+        # model retired; raw macro features now feed the ridge directly).
+        # Tier 1 regime model will re-introduce regime rows here when it
+        # ships, with metrics tied to a named baseline.
         coefs = result.get("meta_coefficients", {})
         if coefs:
             coef_str = " | ".join(
@@ -129,6 +131,37 @@ def _build_ic_table_html(result, is_meta, ic_color, ic_label, promoted_mode,
                 if k != "intercept" and abs(v) > 0.0001
             )
             rows += _row("Meta Coefficients", coef_str, bg=True)
+        # Feature importance (Phase 4): show standardized coefficients +
+        # permutation IC drop side-by-side. Standardized reveals which features
+        # drive predictions independent of raw scale; permutation cross-checks
+        # against ridge's linearity assumption. Together they inform the
+        # classifier-output-vs-raw-macro pruning decision.
+        importance = result.get("meta_importance", {})
+        std_coef = importance.get("standardized_coef", {}) if importance else {}
+        perm = importance.get("permutation", {}) if importance else {}
+        if std_coef:
+            top = sorted(std_coef.items(), key=lambda x: -abs(x[1]))[:8]
+            imp_rows = "".join(
+                f'<tr><td style="padding:2px 8px; font-family:monospace; color:#555;">{name}</td>'
+                f'<td style="padding:2px 8px; font-family:monospace; text-align:right;">{std:+.3f}</td>'
+                f'<td style="padding:2px 8px; font-family:monospace; text-align:right;">{perm.get(name, 0):+.4f}</td></tr>'
+                for name, std in top
+            )
+            imp_html = (
+                '<table style="border-collapse:collapse; font-size:11px; margin-top:4px;">'
+                '<tr style="color:#555;">'
+                '<th style="padding:2px 8px; text-align:left;">feature</th>'
+                '<th style="padding:2px 8px; text-align:right;">std_coef</th>'
+                '<th style="padding:2px 8px; text-align:right;">perm_ic_drop</th>'
+                '</tr>'
+                f'{imp_rows}</table>'
+            )
+            rows += (
+                '<tr>'
+                '<td style="padding:5px 10px; color:#555; vertical-align:top;">Feature Importance</td>'
+                f'<td style="padding:5px 10px;">{imp_html}</td>'
+                '</tr>'
+            )
     else:
         rows += _row("Val IC", f'{val_ic:.4f}', bg=True)
         rows += _row("MSE Model IC",
@@ -505,14 +538,12 @@ def send_training_email(result: dict, date_str: str) -> bool:
         meta_ic = result.get("meta_model_ic", test_ic)
         mom_ic = result.get("momentum_test_ic", mse_ic)
         vol_ic_val = result.get("volatility_test_ic", 0)
-        regime_acc = result.get("regime_accuracy", 0)
         plain_body = (
             f"Alpha Engine Training — {date_str}\n"
             f"Model: {version}  Samples: {n_train:,}  Elapsed: {elapsed_s:.0f}s\n"
             f"\nMeta-Model IC:      {meta_ic:.4f} — {ic_label}"
             f"\nMomentum IC:        {mom_ic:.4f}"
             f"\nVolatility IC:      {vol_ic_val:.4f}"
-            f"\nRegime Accuracy:    {regime_acc*100:.1f}%"
             f"\nPromotion:          {promo_label}\n"
             f"{wf_plain}"
         )

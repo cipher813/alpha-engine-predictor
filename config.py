@@ -257,6 +257,22 @@ WF_MEDIAN_IC_GATE = _wf_cfg.get("median_ic_gate", 0.02)
 WF_N_ESTIMATORS = _wf_cfg.get("wf_n_estimators", None)  # None → use GBM_N_ESTIMATORS
 WF_EARLY_STOPPING = _wf_cfg.get("wf_early_stopping", None)  # None → use GBM_EARLY_STOPPING_ROUNDS
 
+# Regime classifier promotion gate. 3-class balanced-random baseline is 0.333;
+# 0.40 requires the model to clear random by a meaningful margin on walk-forward
+# OOS. Macro-F1 guards against a degenerate majority-class classifier that scores
+# high on accuracy while having zero recall on bear or bull. Thresholds are
+# deliberately modest while the model is unvalidated — raise after we see real
+# OOS numbers from the first walk-forward run.
+REGIME_OOS_ACCURACY_GATE = _wf_cfg.get("regime_oos_accuracy_gate", 0.40)
+REGIME_OOS_MACRO_F1_GATE = _wf_cfg.get("regime_oos_macro_f1_gate", 0.30)
+# Per-class recall floor. Bear/neutral/bull must each recall at least this
+# fraction of their true instances on walk-forward OOS. Catches the failure
+# mode where average metrics look OK but the classifier ignores a class
+# (e.g. bear recall = 0 under L2 regularization + class imbalance, smoke
+# test 2026-04-16). Set conservatively — a model that can't identify 15%
+# of bear periods is useless as a regime signal regardless of macro-F1.
+REGIME_OOS_PER_CLASS_RECALL_FLOOR = _wf_cfg.get("regime_oos_per_class_recall_floor", 0.15)
+
 # ── Feature selection / noise detection ─────────────────────────────────────
 _fs_cfg = _cfg.get("feature_selection", {})
 SHAP_NOISE_THRESHOLD_PCT = _fs_cfg.get("shap_noise_threshold_pct", 1.0)
