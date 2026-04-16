@@ -18,6 +18,54 @@ log = logging.getLogger(__name__)
 
 _SLIM_PREFIX   = "predictor/price_cache_slim/"
 _CLOSES_PREFIX = "predictor/daily_closes/"
+_DAILY_CLOSES_MAX_AGE_HOURS = 12  # upper bound for today's parquet write-time vs now
+
+
+def _verify_daily_closes_fresh(s3_client, bucket: str, date_str: str) -> None:
+    """Assert s3://{bucket}/predictor/daily_closes/{date_str}.parquet exists and,
+    when date_str is today (UTC), was written within the last 12 hours.
+
+    Raises PipelineAbort on missing-file or stale-write. Backfill runs (date_str
+    in the past) only get the existence check — historical files are expected
+    to be old. Today's run gets both existence AND LastModified freshness to
+    catch silent upstream staleness (e.g., DataPhase1 skipped while predictor
+    retried; partial writes leaving yesterday's blob at today's key).
+    """
+    from datetime import datetime, timezone, timedelta
+
+    key = f"{_CLOSES_PREFIX}{date_str}.parquet"
+    try:
+        resp = s3_client.head_object(Bucket=bucket, Key=key)
+    except Exception as exc:
+        log.error(
+            "daily_closes/%s.parquet is missing from s3://%s. DataPhase1 "
+            "(alpha-engine-data) must run before the predictor inference "
+            "Lambda — check the Step Function execution.",
+            date_str, bucket,
+        )
+        raise PipelineAbort(
+            f"daily_closes/{date_str}.parquet not found — DataPhase1 did not "
+            f"run or failed. Cannot proceed with inference."
+        ) from exc
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if date_str != today:
+        return  # backfill: historical files are legitimately old
+
+    age = datetime.now(timezone.utc) - resp["LastModified"]
+    if age > timedelta(hours=_DAILY_CLOSES_MAX_AGE_HOURS):
+        age_h = age.total_seconds() / 3600
+        log.error(
+            "daily_closes/%s.parquet exists but LastModified is %.1fh ago "
+            "(max %dh). DataPhase1 did not refresh today's file — the blob "
+            "at today's key is a stale write.",
+            date_str, age_h, _DAILY_CLOSES_MAX_AGE_HOURS,
+        )
+        raise PipelineAbort(
+            f"daily_closes/{date_str}.parquet is stale ({age_h:.1f}h old, "
+            f"max {_DAILY_CLOSES_MAX_AGE_HOURS}h) — DataPhase1 did not rewrite "
+            f"today's file. Cannot proceed with inference."
+        )
 
 
 # ── Price functions (migrated from daily_predict.py) ─────────────────────────
@@ -566,31 +614,12 @@ def run(ctx: PipelineContext) -> None:
         extra = fetch_macro_series(extra_tickers=missing_etfs)
         ctx.macro.update({k: v for k, v in extra.items() if k not in ctx.macro})
 
-    # ── Verify daily closes exist (written by DataPhase1 / alpha-engine-data) ─
-    # As of the 2026-04-10 architectural cleanup, this predictor no longer
-    # writes daily_closes itself. The authoritative writer is
-    # alpha-engine-data/collectors/daily_closes.py, which runs as DataPhase1
-    # in the weekday Step Function before this inference Lambda. If DataPhase1
-    # failed or has not run, the file will be missing — fail loud so the
-    # operator sees a clear error instead of the predictor silently producing
-    # empty predictions from missing price history downstream.
+    # Gate: daily_closes/{date}.parquet must exist AND, for today's run, must
+    # have been written in the last 12h. Catches both outright DataPhase1
+    # failures and silent-staleness (yesterday's blob at today's key).
     if not ctx.dry_run:
         import boto3
-        _s3 = boto3.client("s3")
-        _key = f"{_CLOSES_PREFIX}{ctx.date_str}.parquet"
-        try:
-            _s3.head_object(Bucket=ctx.bucket, Key=_key)
-        except Exception as _exc:
-            log.error(
-                "daily_closes/%s.parquet is missing from s3://%s. "
-                "DataPhase1 (alpha-engine-data) must run before the predictor "
-                "inference Lambda — check the Step Function execution.",
-                ctx.date_str, ctx.bucket,
-            )
-            raise PipelineAbort(
-                f"daily_closes/{ctx.date_str}.parquet not found — DataPhase1 "
-                f"did not run or failed. Cannot proceed with inference."
-            ) from _exc
+        _verify_daily_closes_fresh(boto3.client("s3"), ctx.bucket, ctx.date_str)
 
     # ── Timeout gate ─────────────────────────────────────────────────────────
     if ctx.near_timeout():

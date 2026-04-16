@@ -178,3 +178,69 @@ class TestCaretTickerMapping:
         tickers = ["AAPL", "VIX", "MSFT"]
         mapped = [_CARET_MAP.get(t, t) for t in tickers]
         assert mapped == ["AAPL", "^VIX", "MSFT"]
+
+
+# ---------------------------------------------------------------------------
+# Daily closes freshness gate
+# ---------------------------------------------------------------------------
+
+class TestDailyClosesFreshnessGate:
+    """_verify_daily_closes_fresh guards against missing or stale DataPhase1 output."""
+
+    def _s3_mock(self, last_modified=None, raise_exc=None):
+        from unittest.mock import MagicMock
+        s3 = MagicMock()
+        if raise_exc is not None:
+            s3.head_object.side_effect = raise_exc
+        else:
+            s3.head_object.return_value = {"LastModified": last_modified}
+        return s3
+
+    def test_missing_file_raises_pipeline_abort(self):
+        from inference.stages.load_prices import _verify_daily_closes_fresh
+        from inference.pipeline import PipelineAbort
+
+        s3 = self._s3_mock(raise_exc=Exception("NoSuchKey"))
+        with pytest.raises(PipelineAbort, match="not found"):
+            _verify_daily_closes_fresh(s3, "bucket", "2026-04-16")
+
+    def test_fresh_file_today_passes(self):
+        from datetime import datetime, timezone, timedelta
+        from inference.stages.load_prices import _verify_daily_closes_fresh
+
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        recent = datetime.now(timezone.utc) - timedelta(minutes=30)
+        s3 = self._s3_mock(last_modified=recent)
+        # Should NOT raise
+        _verify_daily_closes_fresh(s3, "bucket", today)
+
+    def test_stale_file_today_raises_pipeline_abort(self):
+        from datetime import datetime, timezone, timedelta
+        from inference.stages.load_prices import _verify_daily_closes_fresh
+        from inference.pipeline import PipelineAbort
+
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        yesterday_write = datetime.now(timezone.utc) - timedelta(hours=25)
+        s3 = self._s3_mock(last_modified=yesterday_write)
+        with pytest.raises(PipelineAbort, match="stale"):
+            _verify_daily_closes_fresh(s3, "bucket", today)
+
+    def test_backfill_skips_freshness_check(self):
+        """Historical date_str should NOT enforce LastModified — legitimate old files."""
+        from datetime import datetime, timezone, timedelta
+        from inference.stages.load_prices import _verify_daily_closes_fresh
+
+        old_write = datetime.now(timezone.utc) - timedelta(days=30)
+        s3 = self._s3_mock(last_modified=old_write)
+        # Past date: should NOT raise even though file is ancient
+        _verify_daily_closes_fresh(s3, "bucket", "2026-03-10")
+
+    def test_boundary_exactly_at_threshold(self):
+        """File at exactly the 12h boundary should pass (strict > for staleness)."""
+        from datetime import datetime, timezone, timedelta
+        from inference.stages.load_prices import _verify_daily_closes_fresh
+
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        at_boundary = datetime.now(timezone.utc) - timedelta(hours=11, minutes=59)
+        s3 = self._s3_mock(last_modified=at_boundary)
+        _verify_daily_closes_fresh(s3, "bucket", today)
