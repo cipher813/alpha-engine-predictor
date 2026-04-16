@@ -104,3 +104,49 @@ def test_macro_feature_names_included_in_meta_features():
         assert meta_name.startswith("macro_")
         assert meta_name == f"macro_{src}"
         assert meta_name in META_FEATURES
+
+
+def test_importance_populated_after_fit():
+    """Phase 4: standardized coefficients + permutation IC drop must be
+    present after fit() and their feature keys must match self._feature_names."""
+    X, y = _synth_training_data(META_FEATURES, n=500, seed=7)
+    mm = MetaModel(alpha=1.0).fit(X, y, feature_names=META_FEATURES)
+
+    imp = mm._importance
+    assert "standardized_coef" in imp
+    assert "permutation" in imp
+    assert "base_ic" in imp
+    # Every feature must have both standardized and permutation values
+    assert set(imp["standardized_coef"].keys()) == set(META_FEATURES)
+    assert set(imp["permutation"].keys()) == set(META_FEATURES)
+    # Standardized coef for the strongest synthetic driver (first column) must
+    # be meaningfully larger than for a zero-weight column
+    assert abs(imp["standardized_coef"][META_FEATURES[0]]) > abs(
+        imp["standardized_coef"][META_FEATURES[-1]]
+    )
+
+
+def test_importance_roundtrip_through_save_load(tmp_path):
+    """Importance metadata must survive save+load so the dashboard / email
+    consumers can read it from the .meta.json sidecar without refitting."""
+    X, y = _synth_training_data(META_FEATURES, n=300)
+    mm = MetaModel(alpha=1.0).fit(X, y, feature_names=META_FEATURES)
+    pkl_path = tmp_path / "mm.pkl"
+    mm.save(pkl_path)
+
+    meta = json.loads(Path(str(pkl_path) + ".meta.json").read_text())
+    assert "importance" in meta
+    assert set(meta["importance"]["standardized_coef"].keys()) == set(META_FEATURES)
+
+    mm2 = MetaModel.load(pkl_path)
+    assert mm2._importance == meta["importance"]
+
+
+def test_importance_empty_on_tiny_dataset(tmp_path):
+    """When n < 20 the model short-circuits fit without populating importance.
+    Consumers must not assume the key is present and non-empty — serialization
+    must still work."""
+    X = np.random.default_rng(0).normal(size=(10, 3))
+    y = np.random.default_rng(1).normal(size=10)
+    mm = MetaModel(alpha=1.0).fit(X, y, feature_names=["a", "b", "c"])
+    assert mm._importance == {}

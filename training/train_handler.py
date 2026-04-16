@@ -117,11 +117,39 @@ def _build_ic_table_html(result, is_meta, ic_color, ic_label, promoted_mode,
         meta_ic = result.get("meta_model_ic", test_ic)
         mom_ic = result.get("momentum_test_ic", mse_ic)
         vol_ic = result.get("volatility_test_ic", 0)
-        regime_acc = result.get("regime_accuracy", 0)
+        regime_in_sample_acc = result.get("regime_accuracy", 0)
+        regime_oos_acc = result.get("regime_oos_accuracy")
+        regime_oos_f1 = result.get("regime_oos_macro_f1")
+        regime_oos_recall = result.get("regime_oos_per_class_recall")
+        regime_gate = result.get("regime_gate_passed")
         rows += _row("Meta-Model IC", f'{meta_ic:.4f}', bg=True)
         rows += _row("Momentum IC", f'{mom_ic:.4f}')
         rows += _row("Volatility IC", f'{vol_ic:.4f}', bg=True)
-        rows += _row("Regime Accuracy", f'{regime_acc*100:.1f}%')
+        # Regime: show both OOS (the trustworthy number) and in-sample (legacy).
+        # OOS accuracy + macro-F1 together — macro-F1 is the honest guard
+        # against a majority-class classifier that scores high accuracy while
+        # having zero bear/bull recall.
+        if regime_oos_acc is not None:
+            gate_tag = "PASS" if regime_gate else "FAIL"
+            gate_color = "#2e7d32" if regime_gate else "#c62828"
+            rows += _row(
+                "Regime OOS Acc",
+                f'<span style="color:{gate_color};">{regime_oos_acc*100:.1f}% ({gate_tag})</span>',
+            )
+            if regime_oos_f1 is not None:
+                rows += _row("Regime Macro-F1", f'{regime_oos_f1:.3f}', bg=True)
+            if regime_oos_recall and len(regime_oos_recall) == 3:
+                rows += _row(
+                    "Regime Recall (bear/neutral/bull)",
+                    f'{regime_oos_recall[0]:.2f} / {regime_oos_recall[1]:.2f} / {regime_oos_recall[2]:.2f}',
+                )
+            rows += _row(
+                "Regime In-Sample (legacy)",
+                f'{regime_in_sample_acc*100:.1f}%',
+                bg=True,
+            )
+        else:
+            rows += _row("Regime Accuracy", f'{regime_in_sample_acc*100:.1f}%')
         coefs = result.get("meta_coefficients", {})
         if coefs:
             coef_str = " | ".join(
@@ -129,6 +157,37 @@ def _build_ic_table_html(result, is_meta, ic_color, ic_label, promoted_mode,
                 if k != "intercept" and abs(v) > 0.0001
             )
             rows += _row("Meta Coefficients", coef_str, bg=True)
+        # Feature importance (Phase 4): show standardized coefficients +
+        # permutation IC drop side-by-side. Standardized reveals which features
+        # drive predictions independent of raw scale; permutation cross-checks
+        # against ridge's linearity assumption. Together they inform the
+        # classifier-output-vs-raw-macro pruning decision.
+        importance = result.get("meta_importance", {})
+        std_coef = importance.get("standardized_coef", {}) if importance else {}
+        perm = importance.get("permutation", {}) if importance else {}
+        if std_coef:
+            top = sorted(std_coef.items(), key=lambda x: -abs(x[1]))[:8]
+            imp_rows = "".join(
+                f'<tr><td style="padding:2px 8px; font-family:monospace; color:#555;">{name}</td>'
+                f'<td style="padding:2px 8px; font-family:monospace; text-align:right;">{std:+.3f}</td>'
+                f'<td style="padding:2px 8px; font-family:monospace; text-align:right;">{perm.get(name, 0):+.4f}</td></tr>'
+                for name, std in top
+            )
+            imp_html = (
+                '<table style="border-collapse:collapse; font-size:11px; margin-top:4px;">'
+                '<tr style="color:#555;">'
+                '<th style="padding:2px 8px; text-align:left;">feature</th>'
+                '<th style="padding:2px 8px; text-align:right;">std_coef</th>'
+                '<th style="padding:2px 8px; text-align:right;">perm_ic_drop</th>'
+                '</tr>'
+                f'{imp_rows}</table>'
+            )
+            rows += (
+                '<tr>'
+                '<td style="padding:5px 10px; color:#555; vertical-align:top;">Feature Importance</td>'
+                f'<td style="padding:5px 10px;">{imp_html}</td>'
+                '</tr>'
+            )
     else:
         rows += _row("Val IC", f'{val_ic:.4f}', bg=True)
         rows += _row("MSE Model IC",

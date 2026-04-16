@@ -833,7 +833,11 @@ def run_meta_training(
                     },
                     "research_calibrator": {"key": f"{prefix}research_calibrator.json",
                                             "n_samples": prod_calibrator._n_samples},
-                    "meta_model": {"key": f"{prefix}meta_model.pkl", "ic": round(meta_model._val_ic, 6)},
+                    "meta_model": {
+                        "key": f"{prefix}meta_model.pkl",
+                        "ic": round(meta_model._val_ic, 6),
+                        "importance": meta_model._importance,
+                    },
                     "isotonic_calibrator": {
                         "key": f"{prefix}isotonic_calibrator.pkl",
                         "ece_before": round(calibrator._ece_before or 0.0, 6),
@@ -886,6 +890,7 @@ def run_meta_training(
         "research_calibrator_metrics": prod_calibrator.metrics(),
         "meta_model_ic": round(meta_model._val_ic, 6),
         "meta_coefficients": meta_model._coefficients,
+        "meta_importance": meta_model._importance,
         "horizon_diagnostic": {
             # Backwards-compat scalars (existing consumers):
             "spearman_5d": round(spearman_5d, 6),

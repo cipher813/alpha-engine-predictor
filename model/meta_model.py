@@ -85,6 +85,13 @@ class MetaModel:
         # Without this, any META_FEATURES addition would break all inferences
         # against the previously-trained model.
         self._feature_names: list[str] = []
+        # Importance reports (Phase 4). Ridge coefficients alone are not
+        # comparable across features that live on different scales, so we also
+        # persist standardized coefficients (coef × std(feature) / std(y)) and
+        # permutation importance (drop in Pearson correlation when a column
+        # is shuffled). Both computed on the in-sample fit; honest walk-forward
+        # importance is the backtester's job.
+        self._importance: dict = {}
 
     def fit(
         self,
@@ -134,15 +141,85 @@ class MetaModel:
         if np.std(preds) > 1e-10 and np.std(y) > 1e-10:
             self._val_ic = float(np.corrcoef(preds, y)[0, 1])
 
+        # Importance reporting (Phase 4). Standardized coefficients make the
+        # features comparable across scales; permutation importance cross-checks
+        # against the linearity assumption. Feature-importance read informs the
+        # later pruning decision on classifier outputs vs. raw macro features.
+        self._importance = self._compute_importance(X, y, preds)
+
         log.info(
             "MetaModel fitted: n=%d  IC=%.4f  alpha=%.1f",
             self._n_samples, self._val_ic, self.alpha,
         )
-        for name, coef in sorted(self._coefficients.items(), key=lambda x: -abs(x[1])):
-            if name != "intercept":
-                log.info("  %s: %.4f", name, coef)
+        # Print coefficients ordered by standardized magnitude (scale-adjusted)
+        # rather than raw magnitude — raw coefficients are misleading when
+        # features differ by orders of magnitude (e.g. VIX level ~ 1 vs. SPY
+        # return ~ 0.01). Intercept excluded from the ranking.
+        std_coef = self._importance.get("standardized_coef", {})
+        ranked = sorted(std_coef.items(), key=lambda x: -abs(x[1]))
+        for name, std in ranked:
+            raw = self._coefficients.get(name, 0.0)
+            perm = self._importance.get("permutation", {}).get(name, 0.0)
+            log.info("  %-30s raw=%+.4f  std=%+.4f  perm_ic_drop=%+.4f",
+                     name, raw, std, perm)
 
         return self
+
+    def _compute_importance(
+        self, X: np.ndarray, y: np.ndarray, preds: np.ndarray,
+    ) -> dict:
+        """
+        Compute comparable per-feature importance metrics on the in-sample fit.
+
+        Standardized coefficient: coef_k × std(X_k) / std(y). Scale-free,
+        directly comparable across features with different units.
+
+        Permutation importance: drop in Pearson IC between preds and y when
+        column k is shuffled. Pure model-agnostic read that cross-checks the
+        ridge's linearity assumption — if a classifier output explains less
+        after the raw features are present, its permutation IC drop shrinks.
+
+        Both are in-sample; walk-forward permutation on a held-out fold is the
+        backtester's job. Cheap here, loud signal to read on the dashboard.
+        """
+        n, k = X.shape
+        y_std = float(np.std(y))
+        if y_std < 1e-12 or n < 20:
+            return {}
+
+        feat_std = X.std(axis=0)
+        coef = self._model.coef_
+        standardized = {
+            name: round(float(coef[i] * feat_std[i] / y_std), 6)
+            for i, name in enumerate(self._feature_names)
+        }
+
+        # Permutation importance: baseline IC minus IC with column shuffled.
+        # Positive value = feature contributes positively to predictive IC.
+        # Fixed seed for reproducibility within a run.
+        base_ic = float(np.corrcoef(preds, y)[0, 1]) if np.std(preds) > 1e-10 else 0.0
+        rng = np.random.default_rng(42)
+        perm: dict[str, float] = {}
+        for i, name in enumerate(self._feature_names):
+            X_shuf = X.copy()
+            rng.shuffle(X_shuf[:, i])
+            shuf_preds = self._model.predict(X_shuf)
+            if np.std(shuf_preds) > 1e-10:
+                shuf_ic = float(np.corrcoef(shuf_preds, y)[0, 1])
+            else:
+                shuf_ic = 0.0
+            perm[name] = round(base_ic - shuf_ic, 6)
+
+        return {
+            "standardized_coef": standardized,
+            "permutation": perm,
+            "base_ic": round(base_ic, 6),
+            "y_std": round(y_std, 6),
+            "feature_std": {
+                name: round(float(feat_std[i]), 6)
+                for i, name in enumerate(self._feature_names)
+            },
+        }
 
     @property
     def is_fitted(self) -> bool:
@@ -175,6 +252,7 @@ class MetaModel:
             "alpha": self.alpha,
             "coefficients": self._coefficients,
             "feature_names": self._feature_names,
+            "importance": self._importance,
         }
 
     def save(self, path: str | Path) -> None:
@@ -201,6 +279,7 @@ class MetaModel:
             mm.alpha = meta.get("alpha", 1.0)
             mm._coefficients = meta.get("coefficients", {})
             mm._feature_names = meta.get("feature_names", []) or []
+            mm._importance = meta.get("importance", {}) or {}
         # Backwards-compat: a model saved before feature_names was persisted
         # (pre-PR #34) has only `coefficients`. Reconstruct feature_names from
         # the coefficients dict, excluding the intercept. This keeps previously
