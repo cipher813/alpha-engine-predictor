@@ -569,8 +569,10 @@ def run(ctx: PipelineContext) -> None:
         ctx.price_data = cached_prices
         ctx.macro = cached_macro or {}
         log.info("Using slim-cache + daily_closes for prices and macro")
+        log.warning("[LEGACY_PRICE_READ] consumer=predictor_inference source=slim_cache_delta")
     else:
         log.info("Slim cache unavailable — fetching from yfinance (full 2y)")
+        log.warning("[LEGACY_PRICE_READ] consumer=predictor_inference source=yfinance")
         ctx.price_data = fetch_today_prices(ctx.tickers, fd=ctx.fd)
         _n_ok = sum(1 for df in ctx.price_data.values() if not df.empty)
         if _n_ok == 0:
