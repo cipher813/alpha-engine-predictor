@@ -171,6 +171,13 @@ class RegimePredictor:
                 {dt: np.mean(vals) for dt, vals in breadth_by_date.items() if len(vals) >= 10},
                 dtype=float,
             )
+            # sort_index() is required — breadth_by_date is built by iterating
+            # tickers in arbitrary order, so insertion order is non-monotonic.
+            # reindex(method="ffill") raises "index must be monotonic increasing
+            # or decreasing" on unsorted inputs. Surfaced during the 2026-04-16
+            # local dry-run; Saturday production training happened to pick up a
+            # sorted order by coincidence.
+            breadth_series = breadth_series.sort_index()
             df["market_breadth"] = breadth_series.reindex(df.index, method="ffill").fillna(0.5)
         else:
             df["market_breadth"] = 0.5  # neutral default
