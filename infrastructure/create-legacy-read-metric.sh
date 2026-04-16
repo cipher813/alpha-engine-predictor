@@ -20,25 +20,28 @@ set -euo pipefail
 LOG_GROUP="/aws/lambda/alpha-engine-predictor-inference"
 FILTER_NAME="legacy-price-read-marker"
 NAMESPACE="AlphaEngine/Migration"
-METRIC_NAME="legacy_price_read_count"
+METRIC_NAME="predictor_inference_legacy_price_read"
 REGION="${AWS_REGION:-us-east-1}"
 
 echo "Creating metric filter '${FILTER_NAME}' on ${LOG_GROUP} ..."
 
+# No dimensions: AWS rejects dimensions with simple string filter patterns.
+# Consumer is encoded in the metric name instead. When Phase 7b/7c add more
+# consumers, each gets its own metric name (backtester_legacy_price_read, etc.)
+# or we migrate to extraction patterns with proper dimensions.
 aws logs put-metric-filter \
   --region "${REGION}" \
   --log-group-name "${LOG_GROUP}" \
   --filter-name "${FILTER_NAME}" \
   --filter-pattern '"[LEGACY_PRICE_READ]"' \
   --metric-transformations \
-      "metricName=${METRIC_NAME},metricNamespace=${NAMESPACE},metricValue=1,defaultValue=0,dimensions={Consumer=predictor_inference}"
+      "metricName=${METRIC_NAME},metricNamespace=${NAMESPACE},metricValue=1"
 
 echo "OK metric filter created/updated."
 echo
 echo "To inspect after next inference run:"
 echo "  aws cloudwatch get-metric-statistics --region ${REGION} \\"
 echo "    --namespace ${NAMESPACE} --metric-name ${METRIC_NAME} \\"
-echo "    --dimensions Name=Consumer,Value=predictor_inference \\"
 echo "    --start-time \$(date -u -v-7d +%Y-%m-%dT%H:%M:%S) \\"
 echo "    --end-time \$(date -u +%Y-%m-%dT%H:%M:%S) \\"
 echo "    --period 86400 --statistics Sum"
