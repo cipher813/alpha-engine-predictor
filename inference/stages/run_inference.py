@@ -126,7 +126,7 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
     # after PR #5 removed the per-ticker inline compute fallback. Features now
     # come exclusively from ArcticDB via _load_precomputed_features_from_arcticdb.
     # Training still imports it — only inference was migrated.
-    from model.meta_model import META_FEATURES
+    from model.meta_model import META_FEATURES, MACRO_FEATURE_META_MAP
 
     mom_scorer = ctx.meta_models.get("momentum")
     vol_scorer = ctx.meta_models.get("volatility")
@@ -150,6 +150,11 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
 
     # ── Step 1: Compute regime (once, market-wide) ───────────────────────────
     regime_probs = {"regime_bear": 0.33, "regime_neutral": 0.34, "regime_bull": 0.33}
+    # Raw macro features (A+E): extracted once per inference run and broadcast
+    # to every ticker's meta-feature row below. Same regime_features_df the
+    # classifier consumes, so training-serving skew is structurally
+    # impossible — one build_features() call, two readers.
+    macro_row_for_meta: dict[str, float] = {name: 0.0 for name in MACRO_FEATURE_META_MAP.values()}
     if regime_model is not None and regime_model.is_fitted:
         try:
             spy_s = ctx.macro.get("SPY") if ctx.macro else None
@@ -170,6 +175,8 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
                 if not regime_features_df.empty:
                     latest_regime = regime_features_df.iloc[-1]
                     regime_probs = regime_model.predict_single(latest_regime.to_dict())
+                    for src_name, meta_name in MACRO_FEATURE_META_MAP.items():
+                        macro_row_for_meta[meta_name] = float(latest_regime.get(src_name, 0.0))
                     log.info("Regime: bull=%.2f  neutral=%.2f  bear=%.2f",
                              regime_probs["regime_bull"], regime_probs["regime_neutral"],
                              regime_probs["regime_bear"])
@@ -285,6 +292,7 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
             "research_composite_score": research_score_norm,
             "research_conviction": research_conviction,
             "sector_macro_modifier": sector_modifier,
+            **macro_row_for_meta,  # raw macro features (A+E)
         }
 
         if meta_model is not None and meta_model.is_fitted:

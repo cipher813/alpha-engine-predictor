@@ -97,7 +97,7 @@ def run_meta_training(
     from model.gbm_scorer import GBMScorer
     from model.regime_predictor import RegimePredictor
     from model.research_calibrator import ResearchCalibrator
-    from model.meta_model import MetaModel, META_FEATURES
+    from model.meta_model import MetaModel, META_FEATURES, MACRO_FEATURE_META_MAP
 
     start_ts = datetime.now(timezone.utc)
 
@@ -495,12 +495,26 @@ def run_meta_training(
             date_mask = np.array([all_dates[j] == test_date for j in te])
             date_indices = te[date_mask]
 
-            # Regime prediction for this date
-            if fold_regime is not None and test_date in regime_features_df.index:
+            # Regime prediction for this date. Raw macro features extracted
+            # once per date and broadcast to every ticker in date_indices —
+            # they are market-wide, not per-ticker, so all tickers on a
+            # given date share identical macro columns. No training-serving
+            # skew: inference extracts from the same regime_features_df built
+            # via RegimePredictor.build_features().
+            macro_row: dict[str, float] = {}
+            if test_date in regime_features_df.index:
                 regime_x = regime_features_df.loc[test_date, RegimePredictor.FEATURE_NAMES].to_numpy().reshape(1, -1)
-                regime_probs = fold_regime.predict_proba(regime_x)[0]
+                regime_probs = (
+                    fold_regime.predict_proba(regime_x)[0]
+                    if fold_regime is not None
+                    else np.array([0.33, 0.34, 0.33])
+                )
+                for src_name, meta_name in MACRO_FEATURE_META_MAP.items():
+                    macro_row[meta_name] = float(regime_features_df.at[test_date, src_name])
             else:
                 regime_probs = np.array([0.33, 0.34, 0.33])
+                for meta_name in MACRO_FEATURE_META_MAP.values():
+                    macro_row[meta_name] = 0.0
 
             for idx in date_indices:
                 local_idx = np.where(te == idx)[0][0]
@@ -514,6 +528,7 @@ def run_meta_training(
                     "research_conviction": 0.0,
                     "sector_macro_modifier": 0.0,
                     "actual_fwd": float(y_fwd[idx]),
+                    **macro_row,  # raw macro features (A+E)
                 }
                 # Multi-horizon labels (diagnostic only)
                 for hi, h in enumerate(_DIAGNOSTIC_HORIZONS):
