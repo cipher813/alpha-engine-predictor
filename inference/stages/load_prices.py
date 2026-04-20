@@ -20,7 +20,7 @@ import arcticdb as adb  # Hard dep: matches run_inference.py pattern. No try/exc
                         # loud at cold start rather than silently degrading.
 import pandas as pd
 
-from alpha_engine_lib.trading_calendar import prior_trading_day
+from alpha_engine_lib.trading_calendar import last_closed_trading_day
 
 from inference.pipeline import PipelineContext, PipelineAbort
 
@@ -56,18 +56,25 @@ def _safe_last_date(idx: "pd.Index") -> "pd.Timestamp | None":
 
 def _verify_arctic_fresh(macro_lib, date_str: str) -> None:
     """Assert ArcticDB's SPY close series has a row for the most recent
-    CLOSED trading day relative to ``date_str``.
+    trading day whose session has actually closed.
 
-    The morning SF runs at 6:05 AM PT — before the market closes — so
-    today's close does not yet exist. What we DO need is the most recent
-    completed trading day's close (Friday's close on a Monday run). That
-    is what ``prior_trading_day`` returns.
+    Uses ``last_closed_trading_day()`` so the check is symmetric across
+    pre-open and post-close contexts:
 
-    Stricter-than-equal checks here caused the 2026-04-20 Monday abort:
-    the old ``expected = pd.Timestamp(date_str).normalize()`` compared
-    SPY's last_date against today's calendar date, so a Monday run with
-    SPY@2026-04-17 (Friday) was flagged stale even though Friday is the
-    latest close available to any consumer on Monday pre-open.
+      - Morning SF (pre-open) → expects yesterday's close in SPY
+      - Manual post-close rerun → expects today's close in SPY
+      - Weekend / holiday rerun → expects the prior trading day's close
+
+    Stricter-than-equal checks caused the 2026-04-20 Monday abort: the
+    old ``expected = pd.Timestamp(date_str).normalize()`` compared SPY's
+    last_date against today's calendar date, so a 6:05 AM run with
+    SPY@Fri was flagged stale even though Fri IS the latest closed-
+    session data any consumer can have pre-open on Monday.
+
+    ``date_str`` is retained in the parameter signature for caller
+    compatibility and error messaging but is NOT used to compute the
+    freshness threshold — wall-clock time is what determines whether
+    today's session has closed yet.
 
     Raises PipelineAbort on stale/missing SPY.
     """
@@ -85,13 +92,12 @@ def _verify_arctic_fresh(macro_lib, date_str: str) -> None:
             "ArcticDB macro SPY has no rows — DataPhase1 has never written."
         )
 
-    inference_date = pd.Timestamp(date_str).normalize()
-    expected_min = pd.Timestamp(prior_trading_day(inference_date.date())).normalize()
+    expected_min = pd.Timestamp(last_closed_trading_day()).normalize()
     if last_date < expected_min:
         raise PipelineAbort(
             f"ArcticDB macro SPY last_date={last_date.date()} is stale for "
-            f"inference date={inference_date.date()} (expected last_date >= "
-            f"{expected_min.date()}, the most recent closed trading day). "
+            f"inference date={date_str} (expected last_date >= "
+            f"{expected_min.date()}, the most recent closed trading session). "
             f"The post-close daily-data job likely failed to update macro — "
             f"refusing to run inference on pre-last-close prices."
         )
