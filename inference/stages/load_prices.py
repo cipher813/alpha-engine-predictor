@@ -20,6 +20,8 @@ import arcticdb as adb  # Hard dep: matches run_inference.py pattern. No try/exc
                         # loud at cold start rather than silently degrading.
 import pandas as pd
 
+from alpha_engine_lib.trading_calendar import prior_trading_day
+
 from inference.pipeline import PipelineContext, PipelineAbort
 
 log = logging.getLogger(__name__)
@@ -53,13 +55,19 @@ def _safe_last_date(idx: "pd.Index") -> "pd.Timestamp | None":
 
 
 def _verify_arctic_fresh(macro_lib, date_str: str) -> None:
-    """Assert ArcticDB's SPY close series has a row for ``date_str``.
+    """Assert ArcticDB's SPY close series has a row for the most recent
+    CLOSED trading day relative to ``date_str``.
 
-    Replaces the legacy ``_verify_daily_closes_fresh`` S3 check. Step Function
-    guarantees ``date_str`` is a trading day (CheckTradingDay gates the run),
-    so SPY's last row MUST equal ``date_str``. A staler row means DataPhase1
-    did not successfully write to ArcticDB today — we refuse to run inference
-    on stale prices rather than silently predicting off yesterday's close.
+    The morning SF runs at 6:05 AM PT — before the market closes — so
+    today's close does not yet exist. What we DO need is the most recent
+    completed trading day's close (Friday's close on a Monday run). That
+    is what ``prior_trading_day`` returns.
+
+    Stricter-than-equal checks here caused the 2026-04-20 Monday abort:
+    the old ``expected = pd.Timestamp(date_str).normalize()`` compared
+    SPY's last_date against today's calendar date, so a Monday run with
+    SPY@2026-04-17 (Friday) was flagged stale even though Friday is the
+    latest close available to any consumer on Monday pre-open.
 
     Raises PipelineAbort on stale/missing SPY.
     """
@@ -77,12 +85,15 @@ def _verify_arctic_fresh(macro_lib, date_str: str) -> None:
             "ArcticDB macro SPY has no rows — DataPhase1 has never written."
         )
 
-    expected = pd.Timestamp(date_str).normalize()
-    if last_date < expected:
+    inference_date = pd.Timestamp(date_str).normalize()
+    expected_min = pd.Timestamp(prior_trading_day(inference_date.date())).normalize()
+    if last_date < expected_min:
         raise PipelineAbort(
             f"ArcticDB macro SPY last_date={last_date.date()} is stale for "
-            f"inference date={expected.date()}. DataPhase1 did not refresh "
-            f"macro today — refusing to run inference on yesterday's prices."
+            f"inference date={inference_date.date()} (expected last_date >= "
+            f"{expected_min.date()}, the most recent closed trading day). "
+            f"The post-close daily-data job likely failed to update macro — "
+            f"refusing to run inference on pre-last-close prices."
         )
 
 
