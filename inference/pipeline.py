@@ -41,6 +41,12 @@ class PipelineContext:
     watchlist_path: Optional[str] = None
     fd: object = None  # file descriptor for dry-run output
 
+    # Supplemental scoring: when non-empty, score ONLY these tickers and merge
+    # the result into the existing predictions/{date}.json (rather than overwriting).
+    # Used by the Step Function's coverage-gap re-invocation path when Research
+    # produces buy_candidates after the first PredictorInference has already run.
+    explicit_tickers: list = field(default_factory=list)
+
     # ── Timing ───────────────────────────────────────────────────────────────
     start_ts: float = 0.0
     soft_timeout_s: int = 780
@@ -102,6 +108,18 @@ class PipelineAbort(Exception):
     pass
 
 
+class PipelineHardFail(Exception):
+    """Raised by a stage when the pipeline must fail unconditionally — even
+    from a non-critical stage. Propagates to Lambda/CLI as a real exception so
+    Step Function Catch fires and downstream (executor) never sees a
+    partially-written predictions.json.
+
+    Distinguished from PipelineAbort (clean skip) and from regular exceptions
+    (which non-critical stages log-and-continue on).
+    """
+    pass
+
+
 # ── Stage registry ───────────────────────────────────────────────────────────
 
 # Each stage: (name, module_path, critical)
@@ -131,6 +149,10 @@ def run_pipeline(ctx: PipelineContext) -> None:
         except PipelineAbort as abort:
             log.info("Pipeline aborted cleanly by %s: %s", stage_name, abort)
             return
+        except PipelineHardFail as hf:
+            # Propagate unconditionally — do NOT honor the critical flag.
+            log.error("HARD FAIL from %s: %s", stage_name, hf, exc_info=True)
+            raise
         except Exception as exc:
             if critical:
                 log.error("CRITICAL stage %s failed: %s", stage_name, exc, exc_info=True)

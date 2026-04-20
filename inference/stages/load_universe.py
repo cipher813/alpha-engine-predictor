@@ -203,10 +203,53 @@ def load_watchlist(
 # ── Stage entry point ────────────────────────────────────────────────────────
 
 def run(ctx: PipelineContext) -> None:
-    """Load ticker universe from watchlist or signals, plus sector map."""
+    """Load ticker universe from watchlist or signals, plus sector map.
 
+    Supplemental-scoring mode: if ``ctx.explicit_tickers`` is non-empty, the
+    universe is forced to that list (regardless of signals.json content).
+    signals_data is still loaded from S3 when available so the email renderer
+    and ticker-source annotations have the research context; if signals.json
+    is unavailable in this mode we proceed with an empty dict — the Step
+    Function coverage-gap path has already validated the tickers exist in
+    signals.json before invoking, so we don't re-enforce that here.
+    """
+
+    # ── Explicit-tickers (supplemental-scoring) short-circuit ────────────────
+    if ctx.explicit_tickers:
+        ctx.tickers = list(ctx.explicit_tickers)
+        try:
+            _, ctx.signals_data = get_universe_tickers(ctx.bucket, ctx.date_str)
+        except Exception as exc:
+            log.warning(
+                "Supplemental mode: signals.json load failed (%s) — "
+                "proceeding without research context", exc,
+            )
+            ctx.signals_data = {}
+        # Annotate sources from signals_data when possible
+        buy_set = {
+            e.get("ticker", "").upper()
+            for e in (ctx.signals_data.get("buy_candidates") or [])
+            if isinstance(e, dict)
+        }
+        universe_set = {
+            e.get("ticker", "").upper()
+            for e in (ctx.signals_data.get("universe") or [])
+            if isinstance(e, dict)
+        }
+        ctx.ticker_sources = {
+            t: (
+                "buy_candidate" if t in buy_set
+                else "tracked" if t in universe_set
+                else "supplemental"
+            )
+            for t in ctx.tickers
+        }
+        log.info(
+            "Supplemental-scoring mode: %d explicit tickers (%s)",
+            len(ctx.tickers), ", ".join(ctx.tickers[:10]) + ("…" if len(ctx.tickers) > 10 else ""),
+        )
     # ── Ticker universe ──────────────────────────────────────────────────────
-    if ctx.watchlist_path:
+    elif ctx.watchlist_path:
         ctx.tickers, ctx.ticker_sources, ctx.signals_data = load_watchlist(
             path=ctx.watchlist_path,
             s3_bucket=ctx.bucket,

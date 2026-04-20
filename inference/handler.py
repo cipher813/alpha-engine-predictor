@@ -45,9 +45,13 @@ def handler(event: dict, context) -> dict:
     AWS Lambda entry point.
 
     event may contain:
-        action    (str)  : "predict" (default) | "train"
-        date      (str)  : Override date YYYY-MM-DD.
-        dry_run   (bool) : If True, skip S3 writes and email (for testing).
+        action    (str)        : "predict" (default) | "train"
+        date      (str)        : Override date YYYY-MM-DD.
+        dry_run   (bool)       : If True, skip S3 writes and email (for testing).
+        tickers   (list[str])  : Supplemental-scoring mode. When non-empty,
+                                 score ONLY these tickers and merge into the
+                                 existing predictions/{date}.json. Used by the
+                                 weekday Step Function's coverage-gap re-invoke.
     """
     os.environ.setdefault("S3_BUCKET", "alpha-engine-research")
     os.environ.setdefault("XDG_CACHE_HOME", "/tmp")
@@ -72,12 +76,17 @@ def handler(event: dict, context) -> dict:
     action  = event.get("action", "predict")
     date_str = event.get("date", None)
     dry_run  = bool(event.get("dry_run", False))
+    raw_tickers = event.get("tickers") or []
+    if isinstance(raw_tickers, str):
+        raw_tickers = [t.strip() for t in raw_tickers.split(",") if t.strip()]
+    explicit_tickers = [t.upper() for t in raw_tickers if t]
 
     log.info(
-        "Lambda invocation: action=%s  date=%s  dry_run=%s  function=%s",
+        "Lambda invocation: action=%s  date=%s  dry_run=%s  tickers=%s  function=%s",
         action,
         date_str or "today",
         dry_run,
+        f"{len(explicit_tickers)} supplemental" if explicit_tickers else "full universe",
         getattr(context, "function_name", "local"),
     )
 
@@ -112,9 +121,15 @@ def handler(event: dict, context) -> dict:
         local=False,
         model_type="gbm",
         watchlist_path="auto",
+        explicit_tickers=explicit_tickers,
     )
     log.info("Predictor Lambda completed successfully")
     return {
         "statusCode": 200,
-        "body": f"Predictions written for {date_str or 'today'}",
+        "body": (
+            f"Supplemental predictions written for {date_str or 'today'} "
+            f"({len(explicit_tickers)} tickers)"
+            if explicit_tickers else
+            f"Predictions written for {date_str or 'today'}"
+        ),
     }
