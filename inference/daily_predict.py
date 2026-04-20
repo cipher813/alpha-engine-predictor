@@ -71,20 +71,26 @@ def main(
     s3_bucket: Optional[str] = None,
     model_type: str = "mlp",
     watchlist_path: Optional[str] = None,
+    explicit_tickers: Optional[list] = None,
 ) -> None:
     """
     Run the full daily prediction pipeline.
 
     Parameters
     ----------
-    date_str :       Override prediction date YYYY-MM-DD. Default: today.
-    dry_run :        Skip S3 writes; print output to stdout.
-    local :          Load model from local checkpoints/ instead of S3.
-    s3_bucket :      Override S3 bucket. Falls back to S3_BUCKET env var or config default.
-    model_type :     Which model to run: 'mlp' (default) or 'gbm'.
-    watchlist_path : Path to watchlist.json. When provided, predictions are
-                     restricted to the tickers in the universe.
-                     When None, the full signals.json universe is used.
+    date_str :         Override prediction date YYYY-MM-DD. Default: today.
+    dry_run :          Skip S3 writes; print output to stdout.
+    local :            Load model from local checkpoints/ instead of S3.
+    s3_bucket :        Override S3 bucket. Falls back to S3_BUCKET env var or config default.
+    model_type :       Which model to run: 'mlp' (default) or 'gbm'.
+    watchlist_path :   Path to watchlist.json. When provided, predictions are
+                       restricted to the tickers in the universe.
+                       When None, the full signals.json universe is used.
+    explicit_tickers : List of tickers to score. When non-empty, bypasses the
+                       universe lookup and scores ONLY these tickers; the
+                       resulting predictions are merged into the existing
+                       predictions/{date}.json (supplemental-scoring mode).
+                       Designed for the Step Function coverage-gap re-invocation.
     """
     logging.basicConfig(
         level=logging.INFO,
@@ -132,6 +138,7 @@ def main(
         fd=fd,
         start_ts=_start_ts,
         soft_timeout_s=_SOFT_TIMEOUT_S,
+        explicit_tickers=[t.upper() for t in (explicit_tickers or []) if t],
     )
     run_pipeline(ctx)
 
@@ -190,12 +197,32 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--tickers",
+        default=None,
+        metavar="T1,T2,...",
+        help=(
+            "Comma-separated list of tickers to score. When set, bypasses the "
+            "universe lookup and scores ONLY these tickers; the result is "
+            "merged into the existing predictions/{date}.json instead of "
+            "overwriting it (supplemental-scoring mode). Combined_rank is "
+            "recomputed across the merged union. Used by the weekday Step "
+            "Function when Research produces buy_candidates after the first "
+            "PredictorInference run has already written predictions. "
+            "Example: --tickers SNDK,WDC,BIIB,XEL"
+        ),
+    )
+    parser.add_argument(
         "--offline",
         action="store_true",
         help="Full offline mode: synthetic prices, dummy GBM models, no S3/API calls. "
              "Tests feature computation, ranking, veto logic, and email formatting.",
     )
     args = parser.parse_args()
+
+    _explicit = (
+        [t.strip().upper() for t in args.tickers.split(",") if t.strip()]
+        if args.tickers else []
+    )
 
     if args.offline:
         # Import the actual stage modules so monkey-patches propagate correctly
@@ -296,4 +323,5 @@ if __name__ == "__main__":
             s3_bucket=args.s3_bucket,
             model_type=args.model_type,
             watchlist_path=args.watchlist,
+            explicit_tickers=_explicit,
         )

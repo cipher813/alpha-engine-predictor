@@ -118,6 +118,66 @@ def get_veto_threshold(s3_bucket: str, market_regime: str = "") -> float:
 
 # ── Output writing (migrated from daily_predict.py) ──────────────────────────
 
+def _read_existing_predictions(s3_bucket: str, date_str: str) -> list[dict]:
+    """Read existing predictions/{date}.json from S3.
+
+    Returns the `predictions` list, or [] if the object is absent or unreadable.
+    Used by supplemental-scoring mode to merge new predictions into the
+    existing day's output without overwriting prior tickers.
+    """
+    import boto3
+    from botocore.exceptions import ClientError
+    dated_key = cfg.PREDICTIONS_KEY.format(date=date_str)
+    try:
+        s3 = boto3.client("s3")
+        obj = s3.get_object(Bucket=s3_bucket, Key=dated_key)
+        payload = json.loads(obj["Body"].read())
+        return list(payload.get("predictions") or [])
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code in ("NoSuchKey", "AccessDenied", "404", "403"):
+            log.info(
+                "Supplemental mode: no existing predictions at s3://%s/%s (%s) — "
+                "merge is a no-op union with empty",
+                s3_bucket, dated_key, code,
+            )
+            return []
+        raise
+
+
+def _merge_predictions(
+    new: list[dict],
+    existing: list[dict],
+) -> list[dict]:
+    """Union existing + new predictions by ticker (new wins on collision),
+    then re-sort by predicted_alpha desc and reassign combined_rank.
+
+    gbm_veto is NOT recomputed here — caller is responsible for running the
+    veto block over the merged list (it depends on `n_preds` which changes
+    after union).
+    """
+    by_ticker: dict[str, dict] = {}
+    for p in existing:
+        t = (p.get("ticker") or "").upper()
+        if t:
+            by_ticker[t] = dict(p)  # copy, will mutate combined_rank below
+    for p in new:
+        t = (p.get("ticker") or "").upper()
+        if t:
+            by_ticker[t] = dict(p)  # new overrides existing on collision
+
+    merged = list(by_ticker.values())
+    merged.sort(key=lambda p: -(p.get("predicted_alpha") or 0))
+    for i, p in enumerate(merged):
+        p["combined_rank"] = i + 1
+    log.info(
+        "Supplemental merge: %d new + %d existing → %d union (%d collisions)",
+        len(new), len(existing), len(merged),
+        len(new) + len(existing) - len(merged),
+    )
+    return merged
+
+
 def write_predictions(
     predictions: list[dict],
     date_str: str,
@@ -714,6 +774,41 @@ def run(ctx: PipelineContext) -> None:
             "n_stale": sum(1 for d in ctx.ticker_data_age.values() if d > 1),
         },
     }
+
+    # ── Supplemental merge (re-invocation coverage-gap path) ────────────────
+    # When invoked with explicit_tickers, merge these new predictions into the
+    # existing predictions/{date}.json so the first-run's predictions are not
+    # overwritten. combined_rank is recomputed across the merged union; veto
+    # compute (below) then runs on the merged set.
+    if ctx.explicit_tickers and not ctx.dry_run:
+        existing = _read_existing_predictions(ctx.bucket, ctx.date_str)
+        ctx.predictions = _merge_predictions(ctx.predictions, existing)
+
+    # ── Coverage hard-fail (buy_candidates ⊆ predictions) ────────────────────
+    # Defense in depth: the Step Function's coverage-gap Choice state is the
+    # self-healing mechanism that ensures every buy_candidate gets scored. This
+    # assertion catches any future regression of that orchestration: if the
+    # write is about to complete with buy_candidates that have no prediction
+    # row, raise so the Step Function Catch fires and downstream (executor)
+    # never sees a partially-scored predictions.json. This is the hard-fail
+    # side of the alpha-engine "no_silent_fails" posture.
+    sd = ctx.signals_data or {}
+    _buy = sd.get("buy_candidates") or []
+    _buy_tickers = {
+        (e.get("ticker") or "").upper()
+        for e in _buy if isinstance(e, dict) and e.get("ticker")
+    }
+    _scored = {(p.get("ticker") or "").upper() for p in ctx.predictions}
+    _missing = sorted(_buy_tickers - _scored)
+    if _missing:
+        from inference.pipeline import PipelineHardFail
+        msg = (
+            f"Coverage gap: {len(_missing)} buy_candidate(s) not scored by predictor — "
+            f"refusing to write predictions.json. Missing: {', '.join(_missing)}. "
+            "Step Function coverage-gap Choice state should have re-invoked "
+            "with --tickers; escalate to that wiring if you're seeing this."
+        )
+        raise PipelineHardFail(msg)
 
     # ── Veto logic ───────────────────────────────────────────────────────────
     market_regime = ctx.signals_data.get("market_regime", "") if ctx.signals_data else ""

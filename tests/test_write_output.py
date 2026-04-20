@@ -6,7 +6,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import inference.stages.write_output as wo
-from inference.stages.write_output import write_predictions, get_veto_threshold
+from inference.stages.write_output import (
+    write_predictions, get_veto_threshold,
+    _merge_predictions, _read_existing_predictions,
+)
 
 
 class TestWritePredictionsDryRun:
@@ -77,3 +80,198 @@ class TestGetVetoThresholdExtended:
     def test_none_regime(self, _mock):
         result = get_veto_threshold("bucket", None)
         assert result == pytest.approx(0.65)
+
+
+class TestMergePredictions:
+    """Supplemental-scoring merge: new + existing → union, re-ranked."""
+
+    def _pred(self, ticker: str, alpha: float) -> dict:
+        return {
+            "ticker": ticker,
+            "predicted_alpha": alpha,
+            "predicted_direction": "UP" if alpha >= 0 else "DOWN",
+            "prediction_confidence": 0.55,
+            "combined_rank": None,
+        }
+
+    def test_empty_existing_returns_new_with_ranks(self):
+        new = [self._pred("A", 0.02), self._pred("B", -0.01)]
+        merged = _merge_predictions(new, [])
+        assert len(merged) == 2
+        # Sorted by alpha desc: A(+0.02) rank 1, B(-0.01) rank 2
+        assert merged[0]["ticker"] == "A" and merged[0]["combined_rank"] == 1
+        assert merged[1]["ticker"] == "B" and merged[1]["combined_rank"] == 2
+
+    def test_union_preserves_existing_non_overlapping(self):
+        existing = [self._pred("X", 0.05), self._pred("Y", 0.03)]
+        new = [self._pred("Z", 0.04)]
+        merged = _merge_predictions(new, existing)
+        tickers = [p["ticker"] for p in merged]
+        assert set(tickers) == {"X", "Y", "Z"}
+        # Rank recomputed across union: X(0.05), Z(0.04), Y(0.03)
+        rank_by_ticker = {p["ticker"]: p["combined_rank"] for p in merged}
+        assert rank_by_ticker == {"X": 1, "Z": 2, "Y": 3}
+
+    def test_new_overrides_existing_on_collision(self):
+        existing = [self._pred("A", 0.01)]
+        new = [self._pred("A", 0.10)]  # new wins
+        merged = _merge_predictions(new, existing)
+        assert len(merged) == 1
+        assert merged[0]["predicted_alpha"] == 0.10
+        assert merged[0]["combined_rank"] == 1
+
+    def test_rank_recomputed_across_full_union(self):
+        existing = [self._pred(f"E{i}", 0.02 - i * 0.001) for i in range(3)]  # E0 best
+        new = [self._pred("N0", 0.025), self._pred("N1", 0.018)]
+        merged = _merge_predictions(new, existing)
+        # Expected order by alpha desc: N0(.025), E0(.02), E1(.019), N1(.018), E2(.018)
+        expected_top = ["N0", "E0", "E1"]
+        top3 = [p["ticker"] for p in merged[:3]]
+        assert top3 == expected_top
+        # Ranks are contiguous 1..N
+        ranks = sorted(p["combined_rank"] for p in merged)
+        assert ranks == list(range(1, len(merged) + 1))
+
+    def test_case_insensitive_ticker_keys(self):
+        existing = [self._pred("aapl", 0.01)]
+        new = [self._pred("AAPL", 0.05)]  # should collide
+        merged = _merge_predictions(new, existing)
+        assert len(merged) == 1  # merged, not both
+        assert merged[0]["predicted_alpha"] == 0.05
+
+
+class TestCoverageGuard:
+    """Hard-fail when buy_candidates has tickers not scored by predictor.
+
+    Defense-in-depth: the Step Function coverage-gap Choice state should
+    normally re-invoke the predictor with --tickers to fill the gap before
+    this write runs. This assertion catches any regression of that wiring
+    instead of letting the executor see a partial predictions.json.
+    """
+
+    def _ctx(self, predictions, signals_data, explicit=False):
+        from inference.pipeline import PipelineContext
+        ctx = PipelineContext(
+            date_str="2026-04-20",
+            bucket="bucket",
+            dry_run=True,  # skip write/email so we isolate the guard
+            predictions=list(predictions),
+            signals_data=signals_data,
+            explicit_tickers=[],  # first-run path (no merge)
+        )
+        if explicit:
+            ctx.explicit_tickers = [p["ticker"] for p in predictions]
+        return ctx
+
+    @patch.object(wo, "get_veto_threshold", return_value=0.65)
+    @patch.object(wo, "_load_gbm_meta", return_value={})
+    def test_passes_when_all_buy_candidates_scored(self, _m1, _m2):
+        ctx = self._ctx(
+            predictions=[
+                {"ticker": "A", "predicted_alpha": 0.01, "combined_rank": 1,
+                 "predicted_direction": "UP", "prediction_confidence": 0.55},
+                {"ticker": "B", "predicted_alpha": -0.01, "combined_rank": 2,
+                 "predicted_direction": "DOWN", "prediction_confidence": 0.55},
+            ],
+            signals_data={"buy_candidates": [{"ticker": "A"}, {"ticker": "B"}]},
+        )
+        # Should not raise
+        wo.run(ctx)
+
+    @patch.object(wo, "get_veto_threshold", return_value=0.65)
+    @patch.object(wo, "_load_gbm_meta", return_value={})
+    def test_raises_on_missing_buy_candidates(self, _m1, _m2):
+        from inference.pipeline import PipelineHardFail
+        ctx = self._ctx(
+            predictions=[
+                {"ticker": "A", "predicted_alpha": 0.01, "combined_rank": 1,
+                 "predicted_direction": "UP", "prediction_confidence": 0.55},
+            ],
+            signals_data={
+                "buy_candidates": [
+                    {"ticker": "A"},
+                    {"ticker": "SNDK"},  # unscored — today's bug
+                    {"ticker": "WDC"},   # unscored
+                ],
+            },
+        )
+        with pytest.raises(PipelineHardFail) as exc:
+            wo.run(ctx)
+        assert "SNDK" in str(exc.value)
+        assert "WDC" in str(exc.value)
+        assert "Coverage gap" in str(exc.value)
+
+    @patch.object(wo, "get_veto_threshold", return_value=0.65)
+    @patch.object(wo, "_load_gbm_meta", return_value={})
+    def test_empty_buy_candidates_is_no_op(self, _m1, _m2):
+        ctx = self._ctx(
+            predictions=[
+                {"ticker": "A", "predicted_alpha": 0.01, "combined_rank": 1,
+                 "predicted_direction": "UP", "prediction_confidence": 0.55},
+            ],
+            signals_data={"buy_candidates": []},
+        )
+        # Should not raise
+        wo.run(ctx)
+
+    @patch.object(wo, "get_veto_threshold", return_value=0.65)
+    @patch.object(wo, "_load_gbm_meta", return_value={})
+    def test_missing_signals_data_is_no_op(self, _m1, _m2):
+        ctx = self._ctx(
+            predictions=[
+                {"ticker": "A", "predicted_alpha": 0.01, "combined_rank": 1,
+                 "predicted_direction": "UP", "prediction_confidence": 0.55},
+            ],
+            signals_data={},
+        )
+        # Should not raise
+        wo.run(ctx)
+
+
+class TestReadExistingPredictions:
+    """_read_existing_predictions — S3 read with clean 404 handling."""
+
+    def test_returns_empty_on_nosuchkey(self):
+        from botocore.exceptions import ClientError
+        err = ClientError(
+            {"Error": {"Code": "NoSuchKey", "Message": "not found"}}, "GetObject"
+        )
+        mock_s3 = MagicMock()
+        mock_s3.get_object.side_effect = err
+        mock_boto3 = MagicMock()
+        mock_boto3.client.return_value = mock_s3
+        with patch.dict("sys.modules", {"boto3": mock_boto3}):
+            result = _read_existing_predictions("bucket", "2026-04-20")
+        assert result == []
+
+    def test_reraises_on_other_client_errors(self):
+        from botocore.exceptions import ClientError
+        err = ClientError(
+            {"Error": {"Code": "InternalError", "Message": "boom"}}, "GetObject"
+        )
+        mock_s3 = MagicMock()
+        mock_s3.get_object.side_effect = err
+        mock_boto3 = MagicMock()
+        mock_boto3.client.return_value = mock_s3
+        with patch.dict("sys.modules", {"boto3": mock_boto3}):
+            with pytest.raises(ClientError):
+                _read_existing_predictions("bucket", "2026-04-20")
+
+    def test_returns_predictions_on_success(self):
+        payload = json.dumps({
+            "date": "2026-04-20",
+            "predictions": [
+                {"ticker": "AAPL", "predicted_alpha": 0.02},
+                {"ticker": "MSFT", "predicted_alpha": -0.01},
+            ],
+        }).encode()
+        mock_body = MagicMock()
+        mock_body.read.return_value = payload
+        mock_s3 = MagicMock()
+        mock_s3.get_object.return_value = {"Body": mock_body}
+        mock_boto3 = MagicMock()
+        mock_boto3.client.return_value = mock_s3
+        with patch.dict("sys.modules", {"boto3": mock_boto3}):
+            result = _read_existing_predictions("bucket", "2026-04-20")
+        assert len(result) == 2
+        assert [p["ticker"] for p in result] == ["AAPL", "MSFT"]
