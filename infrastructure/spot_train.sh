@@ -240,12 +240,12 @@ ssh -A $SSH_OPTS -i "$KEY_FILE" ec2-user@"$PUBLIC_IP" \
 }
 
 # ── Copy local config + .env to EC2 ──────────────────────────────────────────
-# Must happen BEFORE `pip install` because requirements.txt now includes a
-# private-repo dep (alpha-engine-lib @ git+https://...) that needs the
-# ALPHA_ENGINE_LIB_TOKEN from .env to clone. Previously .env was uploaded
-# after pip install, which worked when all deps were public. Moving it
-# up in the sequence is the fix for the 2026-04-14 smoke failure:
-# "could not read Username for 'https://github.com'".
+# .env carries non-secret runtime config (EMAIL_*, S3_BUCKET, etc.) consumed
+# by the training workload. The alpha-engine-lib PAT is NO LONGER sourced
+# from .env — the spot fetches it from SSM at pip-install time (see DEPS
+# block). Matches spot_data_weekly.sh + spot_backtest.sh. Removes the
+# "ALPHA_ENGINE_LIB_TOKEN typo on dispatcher breaks spots" class of failure
+# (hit 2026-04-20 on the backtester spot, same-shape risk here).
 echo "==> Uploading config/predictor.yaml and .env..."
 scp $SSH_OPTS -i "$KEY_FILE" \
   "$REPO_ROOT/config/predictor.yaml" \
@@ -256,7 +256,7 @@ if [ -f "$ENV_FILE" ]; then
     "$ENV_FILE" \
     ec2-user@"$PUBLIC_IP":/home/ec2-user/predictor/.env
 else
-  echo "ERROR: .env not found at $ENV_FILE — required for ALPHA_ENGINE_LIB_TOKEN"
+  echo "ERROR: .env not found at $ENV_FILE"
   exit 1
 fi
 
@@ -273,18 +273,24 @@ fi
 
 $PIP install --upgrade pip -q
 
-# Configure git auth for the private alpha-engine-lib dep. Token is read
-# from the .env that was SCP'd in the step above.
+# Source .env for non-secret runtime vars. The alpha-engine-lib PAT comes
+# from SSM below — keeps the secret off the dispatcher + off the SCP wire.
 set -a
 source /home/ec2-user/predictor/.env
 set +a
 
-if [ -z "${ALPHA_ENGINE_LIB_TOKEN:-}" ]; then
-  echo "ERROR: ALPHA_ENGINE_LIB_TOKEN missing from .env — required for private alpha-engine-lib install"
+# Fetch alpha-engine-lib PAT from SSM Parameter Store. The spot's IAM
+# profile (alpha-engine-executor-profile) grants ssm:GetParameter on
+# /alpha-engine/*. Token is scoped to a local shell var, never exported,
+# unset immediately after git config. Matches spot_data_weekly.sh.
+LIB_TOKEN=$(aws ssm get-parameter --name /alpha-engine/lib-token --with-decryption --query 'Parameter.Value' --output text --region us-east-1 2>/dev/null || echo "")
+if [ -z "$LIB_TOKEN" ]; then
+  echo "ERROR: could not fetch /alpha-engine/lib-token from SSM — required for alpha-engine-lib pip install"
   exit 1
 fi
 
-git config --global url."https://x-access-token:${ALPHA_ENGINE_LIB_TOKEN}@github.com/cipher813/alpha-engine-lib".insteadOf "https://github.com/cipher813/alpha-engine-lib"
+git config --global url."https://x-access-token:${LIB_TOKEN}@github.com/cipher813/alpha-engine-lib".insteadOf "https://github.com/cipher813/alpha-engine-lib"
+unset LIB_TOKEN
 
 # Filter out private packages (flow-doctor) that aren't on PyPI. alpha-engine-lib
 # is a git+https URL in requirements.txt and is resolved via the URL rewrite
