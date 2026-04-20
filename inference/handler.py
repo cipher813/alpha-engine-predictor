@@ -10,6 +10,11 @@ training exceeding Lambda's 15-minute timeout.
     models from S3, runs blended inference on the research watchlist, writes
     predictions to S3. Sends predictor email.
 
+  action == "check_coverage":
+    Compute buy_candidates - predictions delta and return the missing tickers.
+    Used by the weekday Step Function's coverage-gap Choice state to decide
+    whether to re-invoke `action=predict` with a `tickers` payload.
+
   action == "train":
     DEPRECATED — returns error directing to spot_train.sh.
 
@@ -91,6 +96,20 @@ def handler(event: dict, context) -> dict:
     )
 
     bucket = os.environ.get("S3_BUCKET", "alpha-engine-research")
+
+    # ── Coverage check (Step Function coverage-gap Choice state) ────────────
+    if action == "check_coverage":
+        from inference.coverage_check import compute_coverage_delta
+        result = compute_coverage_delta(bucket=bucket, date_str=date_str)
+        log.info(
+            "Coverage check: %d buy_candidates, %d predictions, %d missing → %s",
+            result["n_buy_candidates"], result["n_predictions"],
+            result["missing_count"],
+            ", ".join(result["missing_tickers"][:10]) + (
+                "…" if len(result["missing_tickers"]) > 10 else ""
+            ) if result["missing_tickers"] else "none",
+        )
+        return result
 
     # ── Train (DEPRECATED — moved to EC2 spot instance) ─────────────────────
     if action == "train":
