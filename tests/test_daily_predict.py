@@ -176,6 +176,51 @@ class TestBuildPredictorEmail:
         assert "Research" in html or "research" in html.lower()
         assert "AAPL" in plain
 
+    def test_buy_candidates_render_in_research_brief(self):
+        """Buy Candidates section should render and include unscored tickers."""
+        from inference.daily_predict import _build_predictor_email
+
+        # Predictions cover only TICK1 — TICK2/TICK3 are in buy_candidates but unscored
+        preds = [{
+            "ticker": "TICK1",
+            "predicted_alpha": 0.02,
+            "predicted_direction": "UP",
+            "prediction_confidence": 0.60,
+            "mse_rank": 1,
+            "model_rank": 1,
+            "combined_rank": 1.0,
+            "watchlist_source": "tracked",
+        }]
+        signals = {
+            "market_regime": "neutral",
+            "universe": [
+                {"ticker": "TICK1", "score": 80.0, "conviction": "rising",
+                 "signal": "ENTER", "sector": "Tech"},
+                {"ticker": "TICK2", "score": 72.0, "conviction": "rising",
+                 "signal": "ENTER", "sector": "Tech"},
+                {"ticker": "TICK3", "score": 68.0, "conviction": "stable",
+                 "signal": "ENTER", "sector": "Energy"},
+            ],
+            "buy_candidates": [
+                {"ticker": "TICK1", "score": 80.0, "conviction": "rising",
+                 "signal": "ENTER", "sector": "Tech"},
+                {"ticker": "TICK2", "score": 72.0, "conviction": "rising",
+                 "signal": "ENTER", "sector": "Tech"},
+                {"ticker": "TICK3", "score": 68.0, "conviction": "stable",
+                 "signal": "ENTER", "sector": "Energy"},
+            ],
+        }
+        subject, html, plain = _build_predictor_email(
+            preds, self._make_metrics(), "2024-06-01", signals_data=signals
+        )
+        assert "Buy Candidates (3)" in html
+        assert "Buy Candidates (3)" in plain
+        assert "TICK2" in html and "TICK3" in html
+        assert "TICK2" in plain and "TICK3" in plain
+        assert "NO PRED" in html
+        assert "not scored by GBM" in html
+        assert "[NO PRED]" in plain
+
     def test_missing_ic_metric(self):
         """Should handle missing ic_30d metric without crashing."""
         from inference.daily_predict import _build_predictor_email

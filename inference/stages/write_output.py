@@ -251,8 +251,18 @@ def _build_predictor_email(
     sd = signals_data or {}
     market_regime    = sd.get("market_regime", "")
     population       = sd.get("universe", []) or sd.get("population", [])
+    buy_candidates   = sd.get("buy_candidates", []) or []
     sector_ratings   = sd.get("sector_ratings", {})
     sorted_sectors: list = []
+
+    # Tickers the executor can act on that the GBM did NOT score — surface these
+    # prominently so a stale/short predictions run can't silently hide buys.
+    _pred_tickers     = {p.get("ticker") for p in predictions}
+    unscored_buys     = [
+        c for c in buy_candidates
+        if isinstance(c, dict) and c.get("ticker") not in _pred_tickers
+    ]
+    unscored_tickers  = {c.get("ticker") for c in unscored_buys}
 
     # ── Subject ───────────────────────────────────────────────────────────────
     veto_str    = f" | {n_vetoed} veto{'es' if n_vetoed != 1 else ''}" if n_vetoed else ""
@@ -383,34 +393,45 @@ def _build_predictor_email(
             f'{market_regime.upper() if market_regime else "NEUTRAL"}</span>'
         )
 
-        # Population table
-        cand_rows = ""
-        for c in population:
+        def _render_research_row(c: dict) -> str:
             score      = c.get("score") or c.get("long_term_score") or "—"
             conviction = c.get("conviction", "—")
             signal     = c.get("signal") or c.get("long_term_rating") or "—"
             sector     = c.get("sector", "—")
             gbm_veto   = c.get("gbm_veto", False)
-            veto_badge = ' <span style="color:#c62828; font-weight:bold; font-size:10px;">GBM⚠</span>' if gbm_veto else ""
             score_str  = f"{score:.1f}" if isinstance(score, (int, float)) else str(score)
-            cand_rows += (
+            badges = ""
+            if gbm_veto:
+                badges += ' <span style="color:#c62828; font-weight:bold; font-size:10px;">GBM⚠</span>'
+            if c.get("ticker") in unscored_tickers:
+                badges += ' <span style="color:#d84315; font-weight:bold; font-size:10px;" title="Actionable but no GBM prediction">NO PRED</span>'
+            return (
                 f'<tr>'
-                f'<td {TD}><b>{c.get("ticker","?")}</b>{veto_badge}</td>'
+                f'<td {TD}><b>{c.get("ticker","?")}</b>{badges}</td>'
                 f'<td {TDR}>{score_str}</td>'
                 f'<td {TD}>{conviction}</td>'
                 f'<td {TD}>{signal}</td>'
                 f'<td {TD}>{sector}</td>'
                 f'</tr>'
             )
-        if not cand_rows:
-            cand_rows = f'<tr><td colspan="5" style="padding:4px 8px; color:#888; font-style:italic;">none</td></tr>'
-        cand_table = (
-            f'<table {TABLE}>'
-            f'<tr><th {TH}>Ticker</th><th {TH}>Score</th><th {TH}>Conviction</th>'
-            f'<th {TH}>Signal</th><th {TH}>Sector</th></tr>'
-            f'{cand_rows}'
-            f'</table>'
-        )
+
+        def _render_research_table(rows_src: list) -> str:
+            rows = "".join(_render_research_row(c) for c in rows_src if isinstance(c, dict))
+            if not rows:
+                rows = f'<tr><td colspan="5" style="padding:4px 8px; color:#888; font-style:italic;">none</td></tr>'
+            return (
+                f'<table {TABLE}>'
+                f'<tr><th {TH}>Ticker</th><th {TH}>Score</th><th {TH}>Conviction</th>'
+                f'<th {TH}>Signal</th><th {TH}>Sector</th></tr>'
+                f'{rows}'
+                f'</table>'
+            )
+
+        # Buy Candidates = the actionable set (signal == ENTER). This is what the
+        # executor sizes positions on; render it explicitly so every tradeable
+        # ticker is visible in the morning brief even if it isn't in predictions.
+        buy_table = _render_research_table(buy_candidates) if buy_candidates else ""
+        cand_table = _render_research_table(population)
 
         # Sector ratings (top sectors sorted by rating desc, skip empty)
         sector_rows = ""
@@ -434,10 +455,29 @@ def _build_predictor_email(
                 f'</table>'
             )
 
+        buy_block = ""
+        if buy_table:
+            unscored_note = ""
+            if unscored_buys:
+                _names = ", ".join(sorted(t for t in unscored_tickers if t))
+                unscored_note = (
+                    f'<p style="margin:4px 0 0 0; font-size:11px; color:#d84315;">'
+                    f'⚠ {len(unscored_buys)} buy candidate{"s" if len(unscored_buys) != 1 else ""} '
+                    f'not scored by GBM (executor can still size them): <b>{_names}</b>'
+                    f'</p>'
+                )
+            buy_block = (
+                f'<h4 style="margin:8px 0 4px 0; font-size:12px; color:#2e7d32;">'
+                f'Buy Candidates ({len(buy_candidates)}) — actionable</h4>'
+                f'{buy_table}'
+                f'{unscored_note}'
+            )
+
         research_html = (
             f'<div style="background:#f8f9fa; border-left:3px solid #555; padding:12px 16px; margin-bottom:16px;">'
             f'<h3 style="margin:0 0 8px 0; font-size:14px; color:#333;">Research Brief</h3>'
             f'<p style="margin:0 0 8px 0;">Market Regime: {regime_pill}</p>'
+            f'{buy_block}'
             f'<h4 style="margin:8px 0 4px 0; font-size:12px; color:#555;">Population ({len(population)})</h4>'
             f'{cand_table}'
             f'{"<h4 style=margin:8px 0 4px 0; font-size:12px; color:#555;>Sector Ratings</h4>" + sector_table if sector_table else ""}'
@@ -486,6 +526,20 @@ def _build_predictor_email(
             )
         return "\n".join(lines) + "\n"
 
+    def _plain_research_row(c: dict) -> str:
+        score = c.get("score")
+        score_str = f"{score:.1f}" if isinstance(score, (int, float)) else "—"
+        flags = ""
+        if c.get("gbm_veto"):
+            flags += " [GBM VETO]"
+        if c.get("ticker") in unscored_tickers:
+            flags += " [NO PRED]"
+        return (
+            f"  {c.get('ticker','?'):<6}  score={score_str:>5}  "
+            f"{c.get('conviction','—'):<10}  {c.get('signal','—'):<8}  "
+            f"{c.get('sector','—')}{flags}\n"
+        )
+
     # Research plain section
     research_plain = ""
     if sd:
@@ -495,17 +549,21 @@ def _build_predictor_email(
             f"{'='*60}\n"
             f"Market Regime: {market_regime.upper() if market_regime else 'NEUTRAL'}\n"
         )
+        if buy_candidates:
+            research_plain += f"\nBuy Candidates ({len(buy_candidates)}) — actionable:\n"
+            for c in buy_candidates:
+                if isinstance(c, dict):
+                    research_plain += _plain_research_row(c)
+            if unscored_buys:
+                _names = ", ".join(sorted(t for t in unscored_tickers if t))
+                research_plain += (
+                    f"  ⚠ {len(unscored_buys)} not scored by GBM: {_names}\n"
+                )
         if population:
             research_plain += f"\nPopulation ({len(population)}):\n"
             for c in population:
-                score = c.get("score")
-                score_str = f"{score:.1f}" if isinstance(score, (int, float)) else "—"
-                veto_str_c = " [GBM VETO]" if c.get("gbm_veto") else ""
-                research_plain += (
-                    f"  {c.get('ticker','?'):<6}  score={score_str:>5}  "
-                    f"{c.get('conviction','—'):<10}  {c.get('signal','—'):<8}  "
-                    f"{c.get('sector','—')}{veto_str_c}\n"
-                )
+                if isinstance(c, dict):
+                    research_plain += _plain_research_row(c)
         if sector_ratings:
             research_plain += "\nSector Ratings:\n"
             for sector, v in sorted_sectors[:8]:
