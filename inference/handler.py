@@ -15,6 +15,12 @@ training exceeding Lambda's 15-minute timeout.
     Used by the weekday Step Function's coverage-gap Choice state to decide
     whether to re-invoke `action=predict` with a `tickers` payload.
 
+  action == "check_deploy_drift":
+    Compare the deployed Step Function definition + CloudFormation stack
+    SHAs against alpha-engine-data @main HEAD on GitHub. Used by the
+    weekday Step Function's first state (DeployDriftCheck) to halt the
+    pipeline when infrastructure code has been merged but not deployed.
+
   action == "train":
     DEPRECATED — returns error directing to spot_train.sh.
 
@@ -108,6 +114,26 @@ def handler(event: dict, context) -> dict:
             ", ".join(result["missing_tickers"][:10]) + (
                 "…" if len(result["missing_tickers"]) > 10 else ""
             ) if result["missing_tickers"] else "none",
+        )
+        return result
+
+    # ── Deploy-drift check (Step Function first state) ──────────────────────
+    if action == "check_deploy_drift":
+        from inference.deploy_drift import check_deploy_drift
+        account_id = (
+            getattr(context, "invoked_function_arn", "").split(":")[4]
+            if context is not None and getattr(context, "invoked_function_arn", "")
+            else os.environ.get("AWS_ACCOUNT_ID", "")
+        )
+        result = check_deploy_drift(
+            region=os.environ.get("AWS_REGION", "us-east-1"),
+            account_id=account_id,
+        )
+        log.info(
+            "Deploy-drift check: upstream=%s  sf=%s(drift=%s)  cf=%s(drift=%s)",
+            (result["upstream_sha"] or "?")[:12],
+            (result["sf_sha"] or "missing")[:12], result["sf_drift"],
+            (result["stack_sha"] or "missing")[:12], result["cf_drift"],
         )
         return result
 

@@ -20,6 +20,15 @@ FROM public.ecr.aws/lambda/python:3.12
 # Install libgomp (OpenMP runtime required by LightGBM).
 RUN dnf install -y libgomp && dnf clean all
 
+# Bake the source commit SHA into the image so PredictorPreflight can detect
+# deploy drift (deployed SHA vs origin/main HEAD). Passed by deploy.sh via
+# `--build-arg GIT_SHA=<sha>` (CI uses $GITHUB_SHA; local dev defaults to
+# `git rev-parse HEAD`). A file is chosen over an env var so the stamp
+# travels with the image artifact itself — you can't have a "deployed image"
+# with a different stamp than what was baked.
+ARG GIT_SHA=unknown
+RUN echo "${GIT_SHA}" > /var/task/GIT_SHA.txt
+
 # Stage alpha-engine-lib from a local vendor directory. deploy.sh (or a
 # local sibling clone) populates vendor/alpha-engine-lib before the
 # Docker build. This mirrors the alpha-engine-config staging pattern —

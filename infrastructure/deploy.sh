@@ -122,11 +122,17 @@ cleanup_staged_artifacts() {
 trap cleanup_staged_artifacts EXIT
 
 # ── Step 1: Build Docker image ────────────────────────────────────────────────
+# Stamp the source commit SHA into the image for the PredictorPreflight
+# deploy-drift check. CI passes $GITHUB_SHA; local dev falls back to HEAD.
+GIT_SHA="${GITHUB_SHA:-$(git rev-parse HEAD 2>/dev/null || echo unknown)}"
+echo "  Stamping image with GIT_SHA=${GIT_SHA}"
+
 echo ""
 echo "==> Building Docker image..."
 docker build \
   --platform linux/amd64 \
   --provenance=false \
+  --build-arg "GIT_SHA=${GIT_SHA}" \
   --tag "${ECR_REPO}:${IMAGE_TAG}" \
   --file Dockerfile \
   .
