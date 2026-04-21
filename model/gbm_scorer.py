@@ -372,7 +372,14 @@ class GBMScorer:
             n_estimators=meta.get("n_estimators", 2000),
         )
         scorer._booster = booster
-        scorer._feature_names = meta.get("feature_names", [])
+        # Backwards-compat: v2 GBM save format (pre-2026-04-13 rip, last
+        # artifact 2026-03-28 `gbm_latest.txt`) stored the feature list
+        # under `feature_list`. Current save path writes `feature_names`.
+        # The backtester's predictor-backtest mode still loads the v2
+        # artifact from S3 (predictor/weights/gbm_latest.txt) — without
+        # this fallback it raises "Loaded model has no feature_names
+        # metadata" and aborts the whole Saturday SF backtester step.
+        scorer._feature_names = meta.get("feature_names") or meta.get("feature_list") or []
         scorer._best_iteration = meta.get("best_iteration", 0)
         scorer._val_ic = meta.get("val_ic", 0.0)
 
