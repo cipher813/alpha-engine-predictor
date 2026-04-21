@@ -816,6 +816,12 @@ def run(ctx: PipelineContext) -> None:
 
     n_preds = len(ctx.predictions)
     for p in ctx.predictions:
+        # Unscoreable entries already carry gbm_veto=True from run_inference;
+        # preserve it. Overwriting here would silently regress the "cannot
+        # score ⇒ hard veto" contract — the executor would size on NaN-feature
+        # tickers despite the predictor being unable to evaluate them.
+        if p.get("status") == "unscoreable":
+            continue
         cr = p.get("combined_rank")
         alpha = p.get("predicted_alpha", 0) or 0
         p["gbm_veto"] = (alpha < 0 and cr is not None and cr > n_preds / 2)

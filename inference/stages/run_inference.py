@@ -306,6 +306,48 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
         }
 
         if meta_model is not None and meta_model.is_fitted:
+            # Ridge does not accept NaN. Detect upstream NaN (stale ArcticDB
+            # row, newly-added ticker with insufficient history for a
+            # long-window feature, macro gap, etc.) and emit an explicit
+            # "unscoreable" entry instead of crashing the whole invocation.
+            # Executor honors gbm_veto=True via existing main.py veto branch,
+            # matching the "cannot score ⇒ cannot trust ⇒ refuse position"
+            # intent of the coverage-gap guard (mnemon #94).
+            nan_features = sorted(
+                name for name, val in meta_features.items()
+                if val is None or (isinstance(val, float) and np.isnan(val))
+            )
+            if nan_features:
+                log.warning(
+                    "Unscoreable: %s has NaN in meta_features %s — emitting "
+                    "unscoreable prediction; executor will hard-veto via gbm_veto=True.",
+                    ticker, nan_features,
+                )
+                entry = {
+                    "ticker": ticker,
+                    "status": "unscoreable",
+                    "unscoreable_reason": f"nan_meta_features:{','.join(nan_features)}",
+                    "predicted_direction": "UNSCOREABLE",
+                    "prediction_confidence": 0.0,
+                    "predicted_alpha": 0.0,
+                    "p_up": 0.0,
+                    "p_flat": 0.0,
+                    "p_down": 0.0,
+                    "gbm_veto": True,
+                    "mse_rank": None,
+                    "model_rank": None,
+                    "combined_rank": None,
+                    "research_calibrator_prob": round(research_cal_prob, 4),
+                    "momentum_confirmation": round(momentum_score, 6),
+                    "expected_move": round(expected_move, 6),
+                    "meta_model_version": "v3.0",
+                }
+                if ticker in ctx.ticker_data_age:
+                    entry["price_data_age_days"] = ctx.ticker_data_age[ticker]
+                if ctx.ticker_sources:
+                    entry["watchlist_source"] = ctx.ticker_sources.get(ticker, "unknown")
+                ctx.predictions.append(entry)
+                continue
             alpha = float(meta_model.predict_single(meta_features))
         else:
             # Fallback: weighted average of Layer 1 outputs. Prior regime-based
@@ -419,7 +461,10 @@ def _rescale_cross_sectional(ctx: "PipelineContext") -> None:
         "retrain ships an isotonic calibrator to S3."
     )
     _META_ALPHA_CLIP = 0.02  # 2% — reasonable expected range for 5d alpha
-    alphas = [p.get("predicted_alpha", 0) or 0 for p in ctx.predictions]
+    # Unscoreable entries carry alpha=0 as a placeholder, not a signal — exclude
+    # them from max_abs and leave their direction/confidence untouched.
+    scoreable = [p for p in ctx.predictions if p.get("status") != "unscoreable"]
+    alphas = [p.get("predicted_alpha", 0) or 0 for p in scoreable]
     if not alphas:
         return
     max_abs = max(abs(a) for a in alphas)
@@ -428,7 +473,7 @@ def _rescale_cross_sectional(ctx: "PipelineContext") -> None:
         "Meta confidence rescaling: max_abs_alpha=%.6f  meta_clip=%.6f  (floor=%.3f)",
         max_abs, meta_clip, _META_ALPHA_CLIP,
     )
-    for p in ctx.predictions:
+    for p in scoreable:
         a = p.get("predicted_alpha", 0) or 0
         p_up = float(np.clip(0.5 + a / (2.0 * meta_clip), 0.0, 1.0))
         p_down = 1.0 - p_up
