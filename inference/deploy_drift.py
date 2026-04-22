@@ -17,7 +17,8 @@ import logging
 import re
 import urllib.error
 import urllib.request
-from typing import Optional
+from dataclasses import dataclass
+from typing import Optional, Union
 
 log = logging.getLogger(__name__)
 
@@ -28,6 +29,55 @@ _SF_ARN_TEMPLATE = (
 # `[git:<40 hex>]` prefix injected by alpha-engine-data/infrastructure/
 # deploy-infrastructure.sh into the SF Comment field at deploy time.
 _GIT_PREFIX_RE = re.compile(r"^\[git:([0-9a-f]{7,40})\]")
+
+# CloudFormation terminal / failed states. A stack sitting in any of these
+# cannot be trusted to actually hold the resources its template declares,
+# so the drift probe must distinguish this condition from "stack exists
+# with no git-sha tag" (legacy deploy warn-path) and fire the hard-fail
+# branch of the SF DeployDriftGate.
+#
+# Keep in sync with CloudFormation's published state machine
+# (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/using-cfn-describing-stacks.html).
+_CFN_TERMINAL_FAILED_STATES = frozenset({
+    "CREATE_FAILED",
+    "ROLLBACK_COMPLETE",       # ← 2026-04-20 incident mode
+    "ROLLBACK_FAILED",
+    "DELETE_FAILED",
+    "UPDATE_ROLLBACK_FAILED",
+    "UPDATE_ROLLBACK_COMPLETE",
+    "IMPORT_ROLLBACK_FAILED",
+    "IMPORT_ROLLBACK_COMPLETE",
+})
+
+
+@dataclass(frozen=True)
+class StackStateError:
+    """Sentinel for ``_read_stack_tag`` return when we can't trust the stack.
+
+    Distinguishes:
+      - ``stack_not_exists`` — describe_stacks found nothing (or raised
+        ValidationError "does not exist"). Stack is absent entirely.
+      - ``stack_in_terminal_state`` — stack exists but is in a terminal
+        failed state (ROLLBACK_COMPLETE etc.) and cannot be trusted to
+        hold its declared resources. This is what tripped the
+        2026-04-20 orchestration-stack recovery.
+      - ``describe_stacks_error`` — boto3 itself raised (IAM, network).
+        Treated as "can't prove healthy" → route to hard-fail.
+
+    The ``no_git_sha_tag_legacy`` case is NOT a StackStateError — that's
+    a legitimate legacy-deploy warn path where the stack is healthy and
+    tagged correctly by older tooling; returned as a plain ``None``.
+    """
+    reason: str           # stack_not_exists | stack_in_terminal_state | describe_stacks_error
+    detail: str = ""      # stack status name or exception class name
+    stack_status: Optional[str] = None  # populated for terminal-state
+
+    def to_dict(self) -> dict:
+        return {
+            "reason": self.reason,
+            "detail": self.detail,
+            "stack_status": self.stack_status,
+        }
 
 
 def _fetch_origin_main_sha(
@@ -67,20 +117,85 @@ def _read_sf_comment(state_machine_arn: str) -> Optional[str]:
         return None
 
 
-def _read_stack_tag(stack_name: str, tag_key: str = "git-sha") -> Optional[str]:
-    """describe-stacks → Tags[git-sha]. None on error or missing tag."""
+def _read_stack_tag(
+    stack_name: str, tag_key: str = "git-sha",
+) -> Union[str, StackStateError, None]:
+    """describe-stacks → Tags[git-sha], distinguishing four states:
+
+    - ``str``                       stack healthy, tag present → return SHA
+    - ``None``                      stack healthy, tag absent → legacy-deploy
+                                    warn path (NOT drift)
+    - ``StackStateError`` (reason=stack_not_exists)
+                                    stack absent entirely — SF must hard-fail
+    - ``StackStateError`` (reason=stack_in_terminal_state)
+                                    stack in ROLLBACK_COMPLETE / *_FAILED →
+                                    cannot be trusted; SF must hard-fail
+    - ``StackStateError`` (reason=describe_stacks_error)
+                                    boto3 raised (IAM, network); can't prove
+                                    healthy — SF must hard-fail
+
+    Previously this function conflated all four into ``None``, which made
+    the SF's DeployDriftGate silently pass when the stack was catastrophically
+    broken — exactly the 2026-04-20 orchestration-stack ROLLBACK_COMPLETE
+    scenario that required an emergency recovery.
+    """
     import boto3
+    from botocore.exceptions import ClientError
     try:
         cfn = boto3.client("cloudformation")
         resp = cfn.describe_stacks(StackName=stack_name)
-        stacks = resp.get("Stacks") or []
-        if not stacks:
-            return None
-        for tag in stacks[0].get("Tags") or []:
-            if tag.get("Key") == tag_key:
-                return tag.get("Value")
-    except Exception as exc:  # noqa: BLE001
+    except ClientError as exc:
+        err_code = exc.response.get("Error", {}).get("Code", "")
+        err_msg = str(exc)
+        # boto3 surfaces "stack does not exist" as ValidationError with this
+        # exact substring. Distinguish it from generic API failures so the
+        # SF can report the clearer "stack_not_exists" reason code.
+        if (err_code == "ValidationError" and "does not exist" in err_msg):
+            log.warning("describe_stacks: %s does not exist", stack_name)
+            return StackStateError(
+                reason="stack_not_exists",
+                detail=f"{stack_name} not found",
+            )
         log.warning("describe_stacks failed for %s: %s", stack_name, exc)
+        return StackStateError(
+            reason="describe_stacks_error",
+            detail=f"{exc.__class__.__name__}: {err_msg[:200]}",
+        )
+    except Exception as exc:  # noqa: BLE001 — non-ClientError (SDK bug, etc.)
+        log.warning("describe_stacks failed for %s: %s", stack_name, exc)
+        return StackStateError(
+            reason="describe_stacks_error",
+            detail=f"{exc.__class__.__name__}: {str(exc)[:200]}",
+        )
+
+    stacks = resp.get("Stacks") or []
+    if not stacks:
+        # describe_stacks returned 0 stacks without raising — shouldn't happen
+        # with a StackName lookup, but preserve the distinct reason.
+        return StackStateError(
+            reason="stack_not_exists",
+            detail=f"{stack_name} not returned by describe_stacks",
+        )
+
+    stack = stacks[0]
+    stack_status = stack.get("StackStatus", "")
+    if stack_status in _CFN_TERMINAL_FAILED_STATES:
+        log.error(
+            "Stack %s is in terminal state %s — describe_stacks resources "
+            "cannot be trusted. Probe will report cf_drift=true with "
+            "reason=stack_in_terminal_state so the SF DeployDriftGate fires.",
+            stack_name, stack_status,
+        )
+        return StackStateError(
+            reason="stack_in_terminal_state",
+            detail=f"{stack_name} is in {stack_status}",
+            stack_status=stack_status,
+        )
+
+    for tag in stack.get("Tags") or []:
+        if tag.get("Key") == tag_key:
+            return tag.get("Value")
+    # Stack healthy, tag absent — legacy-deploy warn path, NOT drift.
     return None
 
 
@@ -118,7 +233,7 @@ def check_deploy_drift(
 
     sf_comment = _read_sf_comment(sf_arn) or ""
     sf_sha = _extract_sf_sha(sf_comment)
-    stack_sha = _read_stack_tag(stack_name)
+    stack_read = _read_stack_tag(stack_name)
     upstream = _fetch_origin_main_sha(repo, branch=branch)
 
     sf_drift = (
@@ -126,11 +241,32 @@ def check_deploy_drift(
         and sf_sha is not None
         and not _shas_match(sf_sha, upstream)
     )
-    cf_drift = (
-        upstream is not None
-        and stack_sha is not None
-        and not _shas_match(stack_sha, upstream)
-    )
+
+    # Interpret stack_read tri-state:
+    #   str               → healthy stack with tag; compare to upstream
+    #   None              → healthy stack, tag absent (legacy-deploy warn)
+    #   StackStateError   → stack not usable; cf_drift=true with reason code
+    if isinstance(stack_read, StackStateError):
+        stack_sha = None
+        stack_stamp_present = False
+        cf_drift = True
+        cf_drift_reason = stack_read.reason
+        cf_drift_detail = stack_read.detail
+        cf_stack_status = stack_read.stack_status
+    else:
+        stack_sha = stack_read  # str | None
+        stack_stamp_present = stack_sha is not None
+        cf_drift = (
+            upstream is not None
+            and stack_sha is not None
+            and not _shas_match(stack_sha, upstream)
+        )
+        cf_drift_reason = (
+            "sha_mismatch" if cf_drift else
+            ("no_git_sha_tag_legacy" if stack_sha is None else "in_sync")
+        )
+        cf_drift_detail = ""
+        cf_stack_status = None
 
     return {
         "repo": repo,
@@ -139,8 +275,11 @@ def check_deploy_drift(
         "sf_sha": sf_sha,
         "sf_stamp_present": sf_sha is not None,
         "stack_sha": stack_sha,
-        "stack_stamp_present": stack_sha is not None,
+        "stack_stamp_present": stack_stamp_present,
         "sf_drift": sf_drift,
         "cf_drift": cf_drift,
+        "cf_drift_reason": cf_drift_reason,
+        "cf_drift_detail": cf_drift_detail,
+        "cf_stack_status": cf_stack_status,
         "has_drift": sf_drift or cf_drift,
     }
