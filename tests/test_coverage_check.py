@@ -102,18 +102,42 @@ def test_no_predictions_file_means_all_buy_candidates_missing():
 
 
 def test_no_signals_file_is_not_a_gap():
-    # If signals.json is absent we can't measure coverage. Return has_gap=False
-    # so the SF Choice state proceeds to PredictorHealthCheck, which will catch
-    # the upstream problem (no fresh signals). We don't want to double-alert.
+    # If both date-specific AND latest signals paths are absent we can't
+    # measure coverage. Return has_gap=False so the SF Choice state proceeds
+    # to PredictorHealthCheck, which will catch the upstream problem (no
+    # fresh signals). We don't want to double-alert.
     mock_boto3 = _mock_s3_client({
         "predictor/predictions/2026-04-20.json": _predictions_json(["AAPL"]),
-        # signals key intentionally absent
+        # both signals keys intentionally absent
     })
     with patch.dict("sys.modules", {"boto3": mock_boto3}):
         result = compute_coverage_delta("bucket", "2026-04-20")
     assert result["has_gap"] is False
     assert result["signals_present"] is False
     assert result["n_buy_candidates"] == 0
+
+
+def test_falls_back_to_signals_latest_when_date_specific_missing():
+    # 2026-04-23 regression: research writes signals/{SAT-date}/signals.json
+    # once per week, so on weekdays the date-specific path is absent. Without
+    # this fallback, check_coverage always returned 0 buy_candidates on
+    # weekdays → SF self-heal never fired → executor hit coverage gap on its
+    # own and halted. This test encodes the fix.
+    mock_boto3 = _mock_s3_client({
+        # date-specific signals path absent (weekday)
+        "signals/latest.json": _signals_json(
+            ["AAPL", "BIIB", "LLY", "ROST", "SNDK", "VLO", "WDC", "XEL"]
+        ),
+        "predictor/predictions/2026-04-23.json": _predictions_json(["AAPL"]),
+    })
+    with patch.dict("sys.modules", {"boto3": mock_boto3}):
+        result = compute_coverage_delta("bucket", "2026-04-23")
+    assert result["has_gap"] is True
+    assert result["signals_present"] is True
+    assert result["n_buy_candidates"] == 8
+    assert result["missing_tickers"] == [
+        "BIIB", "LLY", "ROST", "SNDK", "VLO", "WDC", "XEL",
+    ]
 
 
 def test_both_absent_is_no_gap():
