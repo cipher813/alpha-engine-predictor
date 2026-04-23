@@ -73,7 +73,12 @@ def compute_coverage_delta(
 
     Semantics
     ---------
-    - If signals.json is absent: treat as empty buy_candidates (no gap). The
+    - signals.json lookup matches the executor's read_signals_with_fallback:
+      try signals/{date}/signals.json first, then signals/latest.json. Research
+      writes only on Saturdays, so weekday runs rely on the latest pointer.
+      Without this fallback, weekday check_coverage always saw 0 buy_candidates
+      and the SF self-heal Choice never fired — 2026-04-23 incident.
+    - If both paths are absent: treat as empty buy_candidates (no gap). The
       upstream pipeline will have failed elsewhere before we reach the
       coverage check.
     - If predictions.json is absent: buy_candidates are all "missing". The
@@ -83,6 +88,8 @@ def compute_coverage_delta(
         date_str = datetime.now().strftime("%Y-%m-%d")
 
     signals = _read_s3_json(bucket, f"signals/{date_str}/signals.json")
+    if signals is None:
+        signals = _read_s3_json(bucket, "signals/latest.json")
     predictions_doc = _read_s3_json(bucket, f"predictor/predictions/{date_str}.json")
 
     buy_tickers = _extract_tickers((signals or {}).get("buy_candidates") or [])
