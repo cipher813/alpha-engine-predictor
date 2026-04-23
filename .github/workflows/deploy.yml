@@ -1,20 +1,16 @@
 name: Deploy
 
 on:
+  # No path filter — every main commit rebuilds the Lambda so the baked
+  # GIT_SHA stamp matches origin/main HEAD. The inference/preflight drift
+  # probe (PR #44) hard-fails the weekday pipeline when Lambda SHA != main
+  # HEAD, so any non-image PR (IAM, docs, tests, infra shell) that didn't
+  # retrigger this workflow would silently reform drift and halt tomorrow's
+  # 13:05 UTC run. ~3-5 min of Docker rebuild per merge is the right
+  # trade-off vs pipeline halts the next morning. Mirrors alpha-engine-data
+  # deploy-infrastructure.yml pattern (PR #86).
   push:
     branches: [main]
-    paths:
-      # Only rebuild + redeploy when code or infra that actually lands in the
-      # Docker image changes. Training-only code does not trigger redeploy
-      # because training runs on a spot instance that clones fresh on boot.
-      - 'inference/**'
-      - 'model/**'
-      - 'data/**'
-      - 'config.py'
-      - 'requirements*.txt'
-      - 'Dockerfile*'
-      - 'infrastructure/deploy.sh'
-      - '.github/workflows/deploy.yml'
   workflow_dispatch:
 
 concurrency:
