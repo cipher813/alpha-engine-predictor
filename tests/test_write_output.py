@@ -275,3 +275,89 @@ class TestReadExistingPredictions:
             result = _read_existing_predictions("bucket", "2026-04-20")
         assert len(result) == 2
         assert [p["ticker"] for p in result] == ["AAPL", "MSFT"]
+
+
+class TestEmailGating:
+    """Email is sent on exactly the terminal invocation — first run when
+    no coverage-gap re-invoke is expected, or the supplemental re-invoke
+    itself. Prevents duplicate morning briefings (two emails on 2026-04-24
+    incident)."""
+
+    def _ctx(self, *, explicit_tickers):
+        from inference.pipeline import PipelineContext
+        return PipelineContext(
+            date_str="2026-04-24",
+            bucket="bucket",
+            dry_run=False,
+            predictions=[
+                {"ticker": "A", "predicted_alpha": 0.01, "combined_rank": 1,
+                 "predicted_direction": "UP", "prediction_confidence": 0.55},
+                {"ticker": "B", "predicted_alpha": -0.01, "combined_rank": 2,
+                 "predicted_direction": "DOWN", "prediction_confidence": 0.55},
+            ],
+            signals_data={},  # empty so the hard-fail coverage guard passes
+            explicit_tickers=explicit_tickers,
+        )
+
+    @patch.object(wo, "get_veto_threshold", return_value=0.65)
+    @patch.object(wo, "_load_gbm_meta", return_value={})
+    @patch.object(wo, "write_predictions")
+    @patch.object(wo, "send_predictor_email", return_value=True)
+    @patch("inference.coverage_check.compute_coverage_delta")
+    def test_first_invocation_no_gap_sends(
+        self, mock_delta, mock_send, _w, _m1, _m2,
+    ):
+        mock_delta.return_value = {
+            "has_gap": False, "missing_count": 0, "missing_tickers": [],
+        }
+        wo.run(self._ctx(explicit_tickers=[]))
+        assert mock_send.called
+
+    @patch.object(wo, "get_veto_threshold", return_value=0.65)
+    @patch.object(wo, "_load_gbm_meta", return_value={})
+    @patch.object(wo, "write_predictions")
+    @patch.object(wo, "send_predictor_email", return_value=True)
+    @patch("inference.coverage_check.compute_coverage_delta")
+    def test_first_invocation_with_gap_defers(
+        self, mock_delta, mock_send, _w, _m1, _m2,
+    ):
+        mock_delta.return_value = {
+            "has_gap": True, "missing_count": 7,
+            "missing_tickers": ["VLO", "LLY", "XEL", "BIIB", "ROST", "SNDK", "WDC"],
+        }
+        wo.run(self._ctx(explicit_tickers=[]))
+        assert not mock_send.called
+
+    @patch.object(wo, "get_veto_threshold", return_value=0.65)
+    @patch.object(wo, "_load_gbm_meta", return_value={})
+    @patch.object(wo, "write_predictions")
+    @patch.object(wo, "_read_existing_predictions", return_value=[])
+    @patch.object(wo, "send_predictor_email", return_value=True)
+    @patch("inference.coverage_check.compute_coverage_delta")
+    def test_supplemental_invocation_always_sends(
+        self, mock_delta, mock_send, _r, _w, _m1, _m2,
+    ):
+        # Even if the coverage-delta would report a gap, the supplemental
+        # invocation is terminal — it must send the email regardless.
+        mock_delta.return_value = {
+            "has_gap": True, "missing_count": 1, "missing_tickers": ["ZZZ"],
+        }
+        wo.run(self._ctx(explicit_tickers=["VLO", "LLY"]))
+        assert mock_send.called
+        # And compute_coverage_delta should not be consulted on the
+        # supplemental path (we already know we're terminal).
+        assert not mock_delta.called
+
+    @patch.object(wo, "get_veto_threshold", return_value=0.65)
+    @patch.object(wo, "_load_gbm_meta", return_value={})
+    @patch.object(wo, "write_predictions")
+    @patch.object(wo, "send_predictor_email", return_value=True)
+    @patch("inference.coverage_check.compute_coverage_delta")
+    def test_coverage_delta_failure_fails_open(
+        self, mock_delta, mock_send, _w, _m1, _m2,
+    ):
+        mock_delta.side_effect = RuntimeError("S3 transient")
+        wo.run(self._ctx(explicit_tickers=[]))
+        # If we can't determine whether a re-invoke is coming, send the
+        # email rather than risk silencing the morning briefing entirely.
+        assert mock_send.called

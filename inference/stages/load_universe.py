@@ -217,14 +217,24 @@ def run(ctx: PipelineContext) -> None:
     # ── Explicit-tickers (supplemental-scoring) short-circuit ────────────────
     if ctx.explicit_tickers:
         ctx.tickers = list(ctx.explicit_tickers)
-        try:
-            _, ctx.signals_data = get_universe_tickers(ctx.bucket, ctx.date_str)
-        except Exception as exc:
+        # The supplemental invocation is the terminal one in the Step Function
+        # chain — its email carries the Research Brief. Research writes signals
+        # on Saturdays, so `signals/{weekday}/signals.json` is absent; walk the
+        # same fallback chain `compute_coverage_delta` uses so the brief
+        # renders on weekday re-invokes.
+        from inference.coverage_check import _read_s3_json
+        ctx.signals_data = (
+            _read_s3_json(ctx.bucket, "population/latest.json")
+            or _read_s3_json(ctx.bucket, f"signals/{ctx.date_str}/signals.json")
+            or _read_s3_json(ctx.bucket, "signals/latest.json")
+            or {}
+        )
+        if not ctx.signals_data:
             log.warning(
-                "Supplemental mode: signals.json load failed (%s) — "
-                "proceeding without research context", exc,
+                "Supplemental mode: no signals payload found (population/latest, "
+                "signals/%s, signals/latest all empty) — email will omit the "
+                "Research Brief", ctx.date_str,
             )
-            ctx.signals_data = {}
         # Annotate sources from signals_data when possible
         buy_set = {
             e.get("ticker", "").upper()
