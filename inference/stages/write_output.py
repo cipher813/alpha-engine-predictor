@@ -825,13 +825,50 @@ def run(ctx: PipelineContext) -> None:
                       dry_run=ctx.dry_run, veto_threshold=veto_thresh, fd=ctx.fd)
 
     # ── Send email ───────────────────────────────────────────────────────────
+    # Goal: exactly one morning briefing per day, reflecting the final merged
+    # predictions.json (including any coverage-gap supplementals).
+    #
+    # The weekday Step Function invokes PredictorInference up to twice:
+    #   1. First invocation (explicit_tickers=[]) scores the research population.
+    #   2. `check_coverage` Choice state re-invokes with `tickers=[…]` when
+    #      signals.json has buy_candidates not scored by run 1.
+    #
+    # Rule:
+    #   - Supplemental invocation (explicit_tickers non-empty): always send.
+    #     This is the terminal write; predictions.json is now complete.
+    #   - First invocation: send only if no coverage-gap re-invoke will follow.
+    #     Detect this by running the same delta `check_coverage` will run —
+    #     if `has_gap`, defer and let the supplemental invocation send.
     if not ctx.dry_run:
-        email_sent = send_predictor_email(
-            ctx.predictions, metrics, ctx.date_str,
-            signals_data=ctx.signals_data, veto_threshold=veto_thresh,
-        )
-        if not email_sent:
-            log.warning("Predictor email failed to send (Gmail + SES both failed)")
+        should_send = True
+        if not ctx.explicit_tickers:
+            try:
+                from inference.coverage_check import compute_coverage_delta
+                delta = compute_coverage_delta(ctx.bucket, ctx.date_str)
+                if delta.get("has_gap"):
+                    should_send = False
+                    log.info(
+                        "Deferring morning email — coverage-gap re-invoke "
+                        "expected for %d ticker(s): %s",
+                        delta.get("missing_count", 0),
+                        ", ".join(delta.get("missing_tickers", [])[:10])
+                        + ("…" if delta.get("missing_count", 0) > 10 else ""),
+                    )
+            except Exception as exc:
+                # Fail-open on the gating check: if we can't determine whether
+                # a re-invoke is coming, prefer sending over losing the email.
+                log.warning(
+                    "Coverage-delta check for email gating failed (%s) — "
+                    "sending email from this invocation", exc,
+                )
+
+        if should_send:
+            email_sent = send_predictor_email(
+                ctx.predictions, metrics, ctx.date_str,
+                signals_data=ctx.signals_data, veto_threshold=veto_thresh,
+            )
+            if not email_sent:
+                log.warning("Predictor email failed to send (Gmail + SES both failed)")
 
     # ── Health status ────────────────────────────────────────────────────────
     try:
