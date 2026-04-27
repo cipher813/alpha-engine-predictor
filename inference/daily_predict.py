@@ -45,10 +45,14 @@ log = logging.getLogger(__name__)
 # ── Backward-compatible re-exports ──────────────────────────────────────────
 # These functions have moved to their natural stage modules. Re-exported here
 # so that tests, handler.py, and offline mode monkey-patching continue to work.
+#
+# Note (2026-04-27, v2 cleanup): the v2 ``load_gbm_local`` / ``load_gbm_s3``
+# helpers were deleted along with the rest of the v2 inference path —
+# ``META_MODEL_ENABLED=True`` in the prod config means the dispatcher in
+# ``inference/stages/load_model.py`` only ever calls ``_load_meta_models``.
+# Offline mode's monkey-patch of those helpers (below) was already a no-op
+# because the meta path doesn't go through them.
 
-from inference.stages.load_model import (  # noqa: E402, F401
-    load_gbm_local, load_gbm_s3,
-)
 from inference.stages.load_universe import (  # noqa: E402, F401
     get_universe_tickers, load_watchlist,
 )
@@ -241,9 +245,14 @@ if __name__ == "__main__":
                 rng = np.random.RandomState(42)
                 return rng.uniform(-0.02, 0.02, size=X.shape[0])
 
-        # Stub model loaders — patch stage module where they're actually called
-        _lm.load_gbm_s3 = lambda *a, **k: _DummyScorer()
-        _lm.load_gbm_local = lambda *a, **k: _DummyScorer()
+        # NOTE (2026-04-27, v2 cleanup): the v2 _load_gbm path is gone.
+        # Production routes to _load_meta_models which doesn't go through
+        # load_gbm_local/load_gbm_s3 (it has its own _dl helper). Offline
+        # mode's model-load step is therefore not stubbed end-to-end against
+        # v3 — predictions in offline mode will fail at meta-model load
+        # unless this branch is extended. Keeping the offline plumbing in
+        # place so other stubs (universe / prices / watchlist) can still
+        # be exercised; full v3 stub is tracked as separate ROADMAP work.
 
         # Stub watchlist: 10 sample tickers
         _OFFLINE_TICKERS = ["AAPL", "MSFT", "GOOGL", "AMZN", "META",

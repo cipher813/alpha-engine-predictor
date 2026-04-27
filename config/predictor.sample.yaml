@@ -42,7 +42,6 @@ gbm:
   n_estimators: 100                # LightGBM default
   early_stopping_rounds: 20
   ic_ir_gate: 0.20                 # IC IR threshold for model promotion
-  ensemble_lambdarank: true        # train both MSE + lambdarank and ensemble predictions
   tuned_params:
     objective: regression
     metric: mse
@@ -78,18 +77,9 @@ gbm:
       lambda_l1: 0.0               # LightGBM default
       lambda_l2: 0.0               # LightGBM default
 
-# ── CatBoost ensemble ────────────────────────────────────────────────────────
-# Train CatBoost alongside LightGBM and blend predictions.
-# Different inductive biases (ordered boosting) produce complementary predictions.
-catboost:
-  enabled: false                     # true → train CatBoost + LightGBM ensemble
-  params:
-    loss_function: RMSE
-    depth: 6
-    learning_rate: 0.05
-    l2_leaf_reg: 3.0
-    random_seed: 42
-    thread_count: 4
+# CatBoost ensemble retired 2026-04-27 alongside the v2 inference path.
+# Its only consumer was the deleted ``_load_gbm`` CatBoost optional block;
+# the v3 meta-model uses LightGBM Layer-1 heads + a ridge stacker.
 
 # ── Production gates ──────────────────────────────────────────────────────────
 gates:
@@ -172,12 +162,10 @@ feature_store:
   write_on_training: true            # upload registry.json after training
   full_universe: true                # compute technical features for all ~900 slim cache tickers
 
-# ── Multi-horizon prediction ─────────────────────────────────────────────────
-# Train separate models for multiple forward-day horizons.
-# 5d is always the primary signal. Other horizons are auxiliary.
-multi_horizon:
-  enabled: false                     # true → train 1d/5d/10d/20d models
-  horizons: [1, 5, 10, 20]          # forward-day horizons to train
+# Multi-horizon prediction retired 2026-04-27 alongside the v2 inference
+# path. The v3 meta-model trains a single horizon (``forward_days`` above)
+# and ranks via the ridge stacker; the auxiliary horizon loaders that
+# consumed ``multi_horizon`` were deleted with ``_load_gbm``.
 
 # ── Confidence calibration ───────────────────────────────────────────────────
 # Replaces linear confidence mapping with calibrated probabilities.

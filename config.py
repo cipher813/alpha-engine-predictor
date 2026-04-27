@@ -42,15 +42,12 @@ S3_BUCKET = "alpha-engine-research"
 MODEL_WEIGHTS_KEY = "predictor/weights/latest.pt"
 MODEL_WEIGHTS_DATED_KEY = "predictor/weights/{date}.pt"
 
-GBM_WEIGHTS_KEY      = "predictor/weights/gbm_latest.txt"
+# GBM_WEIGHTS_META_KEY remains live — ``inference/stages/write_output.py::
+# _load_gbm_meta`` reads it best-effort to populate ``last_trained`` in the
+# inference metrics payload. The v2 ``GBM_*_WEIGHTS_KEY`` siblings were
+# deleted in the v2 cleanup PR (2026-04-27) along with the v2 inference
+# path that consumed them.
 GBM_WEIGHTS_META_KEY = "predictor/weights/gbm_latest.txt.meta.json"
-
-# Ensemble model weights (MSE + lambdarank)
-GBM_MSE_WEIGHTS_KEY       = "predictor/weights/gbm_mse_latest.txt"
-GBM_MSE_WEIGHTS_META_KEY  = "predictor/weights/gbm_mse_latest.txt.meta.json"
-GBM_RANK_WEIGHTS_KEY      = "predictor/weights/gbm_rank_latest.txt"
-GBM_RANK_WEIGHTS_META_KEY = "predictor/weights/gbm_rank_latest.txt.meta.json"
-GBM_MODE_KEY              = "predictor/weights/gbm_mode.json"
 
 # Calibrator weights (isotonic regression on v3 meta-model output).
 # Path is contractual with alpha-engine-backtester retrain_alert grace
@@ -194,7 +191,6 @@ GBM_N_ESTIMATORS = _gbm_cfg["n_estimators"]
 GBM_EARLY_STOPPING_ROUNDS = _gbm_cfg["early_stopping_rounds"]
 GBM_IC_IR_GATE = _gbm_cfg["ic_ir_gate"]
 GBM_TUNED_PARAMS = _gbm_cfg["tuned_params"]
-GBM_ENSEMBLE_LAMBDARANK = _gbm_cfg.get("ensemble_lambdarank", True)
 
 # Momentum base model — the shared GBM params above are tuned for the strong
 # volatility signal. On the weak momentum target they overfit; the momentum
@@ -213,12 +209,9 @@ MOMENTUM_GBM_N_ESTIMATORS = _gbm_mom_cfg["n_estimators"]
 MOMENTUM_GBM_EARLY_STOPPING_ROUNDS = _gbm_mom_cfg["early_stopping_rounds"]
 MOMENTUM_GBM_TUNED_PARAMS = {**GBM_TUNED_PARAMS, **_gbm_mom_cfg["tuned_params"]}
 
-# ── CatBoost ensemble ──────────────────────────────────────────────────────
-_cat_cfg = _cfg.get("catboost", {})
-CATBOOST_ENABLED = _cat_cfg.get("enabled", False)
-CATBOOST_PARAMS = _cat_cfg.get("params", None)
-CATBOOST_WEIGHTS_KEY = "predictor/weights/catboost_latest.cbm"
-CATBOOST_WEIGHTS_META_KEY = "predictor/weights/catboost_latest.cbm.meta.json"
+# CatBoost ensemble config retired 2026-04-27 alongside the v2 inference
+# path — its only consumer was ``_load_gbm`` (deleted) and the LGB-Cat
+# blend mode that ``_load_meta_models`` does not implement.
 
 # ── Production gates ─────────────────────────────────────────────────────────
 _gates_cfg = _cfg["gates"]
@@ -284,10 +277,8 @@ _cal_cfg = _cfg.get("calibration", {})
 CALIBRATION_METHOD = _cal_cfg.get("method", "platt")  # "platt" or "isotonic"
 CALIBRATION_ENABLED = _cal_cfg.get("enabled", True)
 
-# ── Multi-horizon prediction ───────────────────────────────────────────────
-_mh_cfg = _cfg.get("multi_horizon", {})
-MULTI_HORIZON_ENABLED = _mh_cfg.get("enabled", False)
-MULTI_HORIZON_LIST = _mh_cfg.get("horizons", [1, 5, 10, 20])
+# Multi-horizon prediction config retired 2026-04-27 alongside the v2
+# inference path — the v3 meta-model trains one horizon (cfg.FORWARD_DAYS).
 
 # ── Meta-model architecture (v3.0) ─────────────────────────────────────────
 _meta_cfg = _cfg.get("meta_model", {})
