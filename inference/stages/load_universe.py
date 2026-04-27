@@ -21,6 +21,59 @@ _FALLBACK_TICKERS = [
 ]
 
 
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+
+def _read_buy_candidates_from_signals(
+    s3, bucket: str, date_str: str
+) -> list[str]:
+    """Read research's `buy_candidates` ticker list from signals.
+
+    Walks the same fallback chain `compute_coverage_delta` uses so weekday
+    runs see Saturday's signals: `signals/{date}/signals.json` →
+    `signals/latest.json`. Returns an empty list on any failure or empty
+    payload — the caller treats that as "no candidates to union".
+    """
+    from datetime import date as _date, timedelta as _td
+    from botocore.exceptions import ClientError
+
+    keys: list[str] = []
+    try:
+        start = _date.fromisoformat(date_str)
+        for days_back in range(6):
+            candidate = start - _td(days=days_back)
+            if candidate.weekday() >= 5:
+                continue
+            keys.append(f"signals/{candidate}/signals.json")
+    except Exception:
+        pass
+    keys.append("signals/latest.json")
+
+    for key in keys:
+        try:
+            obj = s3.get_object(Bucket=bucket, Key=key)
+            payload = json.loads(obj["Body"].read().decode("utf-8"))
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code", "")
+            if code in ("NoSuchKey", "AccessDenied", "403", "404"):
+                continue
+            raise
+        except Exception:
+            continue
+        candidates = payload.get("buy_candidates") or []
+        tickers: list[str] = []
+        for entry in candidates:
+            if isinstance(entry, dict):
+                t = entry.get("ticker")
+            else:
+                t = entry
+            if isinstance(t, str) and t:
+                tickers.append(t.upper())
+        if tickers:
+            return tickers
+    return []
+
+
 # ── Universe functions (migrated from daily_predict.py) ──────────────────────
 
 def get_universe_tickers(
@@ -112,9 +165,41 @@ def load_watchlist(
             pop_tickers = [p["ticker"] for p in data.get("population", []) if "ticker" in p]
             if pop_tickers:
                 sources = {t.upper(): "population" for t in pop_tickers}
+                # Union research's signals.buy_candidates so the main pass
+                # scores them inline. Without this, any buy_candidate not in
+                # the predictor's population required a second supplemental
+                # Lambda invocation via the Step Function's coverage-gap
+                # Choice state — fragile for manual recovery (the operator
+                # must remember the second call) and adds latency to the
+                # weekday SF (~+30s per cold-start). The supplemental path
+                # remains in place as a safety net for races (signals
+                # updated between this read and check_coverage), but on the
+                # happy path it now sees `has_gap=False` and never fires.
+                # See 2026-04-27 incident — manual recovery was blocked by
+                # the executor's coverage-gap gate after the SF aborted on
+                # the MorningEnrich SSM TimedOut, requiring a second hand-
+                # crafted Lambda invoke for the 6 missing buy_candidates.
+                buy_tickers = _read_buy_candidates_from_signals(
+                    s3, s3_bucket, date_str
+                )
+                if buy_tickers:
+                    new_tickers = []
+                    for t in buy_tickers:
+                        u = t.upper()
+                        if u in sources:
+                            sources[u] = "both"
+                        else:
+                            sources[u] = "buy_candidate"
+                            new_tickers.append(u)
+                    log.info(
+                        "Watchlist: unioned %d buy_candidates from signals "
+                        "(%d new beyond population)",
+                        len(buy_tickers), len(new_tickers),
+                    )
                 tickers = sorted(sources.keys())
                 log.info(
-                    "Watchlist: loaded %d tickers from population/latest.json",
+                    "Watchlist: loaded %d tickers from population/latest.json"
+                    " (+ buy_candidates union)",
                     len(tickers),
                 )
                 return tickers, sources, data
