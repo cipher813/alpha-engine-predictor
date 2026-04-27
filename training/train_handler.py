@@ -647,7 +647,7 @@ def main(
         API calls by ~125×.
     3.  Send training summary email.
 
-    Returns the result dict from run_gbm_training().
+    Returns the result dict from run_meta_training().
     """
     if date_str is None:
         date_str = datetime.now().strftime("%Y-%m-%d")
