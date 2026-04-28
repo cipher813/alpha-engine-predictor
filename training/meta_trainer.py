@@ -73,6 +73,174 @@ def _load_momentum_params_from_s3(bucket: str) -> dict | None:
         return None
 
 
+# ── Research-signal feature lookup (added 2026-04-28) ────────────────────────
+# Pre-2026-04-28 the meta-trainer hardcoded the four per-ticker research
+# features (`research_calibrator_prob`, `research_composite_score`,
+# `research_conviction`, `sector_macro_modifier`) to constants — see the
+# row construction in run_meta_training. With zero training-time variance
+# Ridge correctly zeroed those coefficients, so per-ticker variance in
+# meta-model output came almost exclusively from `expected_move`. The
+# isotonic calibrator's plateau over [+0.002, +0.005] then collapsed every
+# ticker on a typical day to a single p_up bin (~0.5119), which surfaced
+# 2026-04-28 as 27 UP / 0 DOWN with identical confidence. Helpers below
+# load the historical weekly signals snapshots from S3 and populate real
+# values per (test_date, ticker) tuple.
+
+# Sector-name canonicalization. Research's per-ticker `universe[].sector`
+# uses GICS-style names ("Health Care", "Information Technology") while
+# `sector_modifiers` is keyed on shorter labels ("Healthcare", "Technology").
+# The map is sourced from research's actual output; any new sector must be
+# added here AND in research's sector_modifiers writer in tandem.
+_SECTOR_NAME_CANONICAL = {
+    "Health Care": "Healthcare",
+    "Information Technology": "Technology",
+    "Financials": "Financial",
+}
+
+
+def _load_signals_history(s3, bucket: str) -> dict[str, dict]:
+    """Load every ``signals/{date}/signals.json`` snapshot from S3.
+
+    Returns ``{date_str: signals_payload_dict}`` covering the full S3 history.
+    Each payload preserves the original JSON: ``universe`` list, top-level
+    ``sector_modifiers`` and ``sector_ratings``, ``buy_candidates``, etc.
+    Failures on individual dates log + skip; an empty result raises (per
+    no-silent-fails — training without research history would silently
+    revert to the bug we're trying to fix).
+    """
+    paginator = s3.get_paginator("list_objects_v2")
+    date_prefixes: list[str] = []
+    for page in paginator.paginate(Bucket=bucket, Prefix="signals/", Delimiter="/"):
+        for cp in page.get("CommonPrefixes") or []:
+            # CommonPrefix["Prefix"] looks like "signals/2026-03-05/"
+            parts = cp["Prefix"].rstrip("/").split("/")
+            if len(parts) != 2:
+                continue
+            date_str = parts[1]
+            if (
+                len(date_str) == 10
+                and date_str[4] == "-"
+                and date_str[7] == "-"
+            ):
+                date_prefixes.append(date_str)
+
+    history: dict[str, dict] = {}
+    for date_str in sorted(date_prefixes):
+        try:
+            obj = s3.get_object(
+                Bucket=bucket, Key=f"signals/{date_str}/signals.json"
+            )
+            history[date_str] = json.loads(obj["Body"].read())
+        except Exception as exc:
+            log.warning(
+                "Could not load signals/%s/signals.json: %s — skipping",
+                date_str, exc,
+            )
+
+    if not history:
+        raise RuntimeError(
+            "No signals.json snapshots found under "
+            f"s3://{bucket}/signals/. Meta-trainer requires real research "
+            "history to populate per-ticker research features. Either the "
+            "bucket is wrong or no Research run has ever produced output."
+        )
+
+    log.info(
+        "Loaded %d signals snapshots from s3://%s/signals/ (range: %s → %s)",
+        len(history), bucket, min(history), max(history),
+    )
+    return history
+
+
+def _build_signals_lookup_by_test_date(
+    signals_history: dict[str, dict],
+    test_dates: list,
+) -> dict[str, dict | None]:
+    """Map every test_date to the most-recent-prior signals snapshot.
+
+    Signals are written weekly (Saturday SF). On any weekday the "active"
+    research view is the most recent prior Saturday's signals.json. This
+    function is called once before the walk-forward loop so per-row
+    lookups are O(1) dict reads.
+
+    Returns ``{test_date_str: signals_payload | None}`` — None for dates
+    that predate the first available signals snapshot.
+    """
+    import bisect
+
+    snapshot_dates = sorted(signals_history.keys())
+    lookup: dict[str, dict | None] = {}
+    for td in set(test_dates):
+        td_str = td if isinstance(td, str) else str(td)
+        i = bisect.bisect_right(snapshot_dates, td_str)
+        if i == 0:
+            lookup[td_str] = None
+        else:
+            lookup[td_str] = signals_history[snapshot_dates[i - 1]]
+    return lookup
+
+
+def _extract_research_features(
+    signals_payload: dict | None,
+    ticker: str,
+    research_cal,
+) -> dict | None:
+    """Extract the four per-ticker research features from a signals payload.
+
+    Returns ``None`` when the payload is absent, the ticker is missing
+    from the snapshot's ``universe`` list, or the score field is missing
+    — caller drops the row from the L2 training set rather than silently
+    fill with constants (per ``feedback_no_silent_fails``).
+
+    Returns a dict with the four feature keys when extraction succeeds:
+      - ``research_calibrator_prob``: ``research_cal.predict(score)`` if the
+        calibrator is fitted, else ``score / 100`` as a smooth fallback.
+      - ``research_composite_score``: ``score / 100``.
+      - ``research_conviction``: ``{"rising": 1, "stable": 0, "declining": -1}``.
+      - ``sector_macro_modifier``: ``sector_modifiers[canonical_sector] - 1``.
+    """
+    if signals_payload is None:
+        return None
+
+    ticker_sig = next(
+        (
+            s for s in signals_payload.get("universe", [])
+            if s.get("ticker") == ticker
+        ),
+        None,
+    )
+    if ticker_sig is None:
+        return None
+
+    raw_score = ticker_sig.get("score")
+    if raw_score is None:
+        return None
+    score_norm = float(raw_score) / 100.0
+
+    conv = ticker_sig.get("conviction", "stable")
+    conviction = {
+        "rising": 1.0, "stable": 0.0, "declining": -1.0,
+    }.get(conv, 0.0)
+
+    sector = ticker_sig.get("sector", "") or ""
+    sector_canonical = _SECTOR_NAME_CANONICAL.get(sector, sector)
+    sector_modifier = float(
+        signals_payload.get("sector_modifiers", {}).get(sector_canonical, 1.0)
+    ) - 1.0
+
+    if research_cal is not None and getattr(research_cal, "is_fitted", False):
+        cal_prob = float(research_cal.predict(raw_score))
+    else:
+        cal_prob = score_norm
+
+    return {
+        "research_calibrator_prob": cal_prob,
+        "research_composite_score": score_norm,
+        "research_conviction": conviction,
+        "sector_macro_modifier": sector_modifier,
+    }
+
+
 def run_meta_training(
     data_dir: str,
     bucket: str,
@@ -364,6 +532,51 @@ def run_meta_training(
     except Exception as e:
         log.warning("Could not load research calibrator data: %s — using priors", e)
 
+    # ── Step 5b: Fit research calibrator (moved before walk-forward 2026-04-28) ─
+    # Originally fitted at the end of training (Step 8). Moved here so the
+    # calibrator is available during fold-row construction below — without it
+    # the four research features get hardcoded to constants and Ridge zeros
+    # their coefficients (root cause of the 27 UP / 0 DOWN collapse on
+    # 2026-04-28). The calibrator is fitted ONCE on full score_performance
+    # history; this introduces minor walk-forward leakage (a future iteration
+    # should fit per-fold). Acceptable for a v1 fix because score_performance
+    # only spans the post-2026-03-05 signals window — the same window every
+    # row construction below pulls from — so the leakage is bounded to the
+    # narrow window where any single bucket's hit_rate computation could see
+    # ~7-8 weeks of forward outcomes vs the test_date.
+    prod_calibrator = ResearchCalibrator()
+    if len(research_scores) >= 10:
+        prod_calibrator.fit(research_scores, research_beat_spy)
+    else:
+        log.info(
+            "Research calibrator: insufficient data (%d rows) — using neutral "
+            "priors. Per-row research_calibrator_prob will fall back to "
+            "score_norm in row construction.",
+            len(research_scores),
+        )
+
+    # ── Step 5c: Load signals.json history for per-row research feature lookup ─
+    # Each weekly snapshot at signals/{YYYY-MM-DD}/signals.json carries the
+    # research universe (per-ticker score / conviction / sector) and the
+    # top-level sector_modifiers map. Walk-forward row construction below
+    # joins (test_date, ticker) → most-recent-prior snapshot to pull real
+    # values for the four meta-model research features.
+    try:
+        import boto3 as _boto3_sig
+        _s3_signals = _boto3_sig.client("s3")
+        signals_history = _load_signals_history(_s3_signals, bucket)
+        signals_lookup = _build_signals_lookup_by_test_date(
+            signals_history, [str(d) for d in sorted(set(all_dates))]
+        )
+    except Exception as exc:
+        # Hard-fail per feedback_no_silent_fails — a training run that
+        # silently falls back to constants is the bug we are fixing.
+        raise RuntimeError(
+            f"Failed to load signals history from S3 for meta-trainer: {exc}. "
+            "Without research history the meta-model collapses to expected_move + "
+            "macro features only (the 2026-04-28 incident). Refusing to proceed."
+        ) from exc
+
     # ── Step 6: Walk-forward validation ──────────────────────────────────────
     log.info("Walk-forward validation...")
     unique_dates = sorted(set(all_dates))
@@ -427,6 +640,11 @@ def run_meta_training(
     oos_meta_rows = []  # list of dicts with meta-features + actual outcome
     fold_results = []
     mom_fold_ics = []
+    # Counters for the research-signal join (added 2026-04-28 alongside
+    # the real-signals lookup). Tracked here, logged after the fold loop.
+    n_rows_dropped_no_signals_snapshot = 0  # test_date predates first signals
+    n_rows_dropped_ticker_missing = 0       # ticker absent from snapshot's universe
+    n_rows_with_real_signals = 0            # rows actually retained for L2 training
     vol_fold_ics = []
 
     for i, fold in enumerate(folds):
@@ -477,15 +695,36 @@ def run_meta_training(
                 for meta_name in MACRO_FEATURE_META_MAP.values():
                     macro_row[meta_name] = 0.0
 
+            # Lookup the most-recent-prior weekly signals snapshot for this
+            # test_date (built once before the fold loop in Step 5c).
+            signals_payload = signals_lookup.get(str(test_date))
+
             for idx in date_indices:
                 local_idx = np.where(te == idx)[0][0]
+                ticker = all_tickers[idx]
+
+                # Extract real research features from signals.json. Drops
+                # the row when no snapshot exists for the test_date or the
+                # ticker is missing from the snapshot's universe — per
+                # `feedback_no_silent_fails` we refuse to silently fill
+                # with constants (the pre-2026-04-28 bug behavior). L1
+                # models above still train on the full (date, ticker)
+                # set; only L2 narrows to rows where research signals
+                # were actually present in production.
+                if signals_payload is None:
+                    n_rows_dropped_no_signals_snapshot += 1
+                    continue
+                research_features = _extract_research_features(
+                    signals_payload, ticker, prod_calibrator
+                )
+                if research_features is None:
+                    n_rows_dropped_ticker_missing += 1
+                    continue
+
                 row = {
                     "momentum_score": float(mom_preds[local_idx]),
                     "expected_move": float(vol_preds[local_idx]),
-                    "research_calibrator_prob": 0.5,  # placeholder (v0 lookup applied later)
-                    "research_composite_score": 0.5,  # not available in price-only training
-                    "research_conviction": 0.0,
-                    "sector_macro_modifier": 0.0,
+                    **research_features,
                     "actual_fwd": float(y_fwd[idx]),
                     **macro_row,  # raw macro features
                 }
@@ -493,6 +732,7 @@ def run_meta_training(
                 for hi, h in enumerate(_DIAGNOSTIC_HORIZONS):
                     row[f"actual_fwd_{h}d"] = float(y_fwd_horizons[idx, hi])
                 oos_meta_rows.append(row)
+                n_rows_with_real_signals += 1
 
         elapsed = time.time() - fold_start
         fold_results.append({
@@ -502,6 +742,35 @@ def run_meta_training(
         })
         log.info("  Fold %d/%d: mom_IC=%.4f  vol_IC=%.4f  (%.1fs)",
                  i + 1, len(folds), mom_ic, vol_ic, elapsed)
+
+    # ── Step 6b: Research-signal join summary (added 2026-04-28) ────────────
+    # Before-fix the meta-trainer hardcoded constants for the four research
+    # features and Ridge zeroed their coefficients. Surface the join stats
+    # so a future regression — empty signals history, sector-name drift in
+    # research's output, etc — fails loud instead of silently rebuilding
+    # the original collapse bug.
+    n_rows_total = (
+        n_rows_with_real_signals
+        + n_rows_dropped_no_signals_snapshot
+        + n_rows_dropped_ticker_missing
+    )
+    log.info(
+        "Research-signal join: kept=%d  dropped_no_snapshot=%d  "
+        "dropped_ticker_missing=%d  total_walked=%d",
+        n_rows_with_real_signals,
+        n_rows_dropped_no_signals_snapshot,
+        n_rows_dropped_ticker_missing,
+        n_rows_total,
+    )
+    if n_rows_with_real_signals == 0:
+        raise RuntimeError(
+            "Meta-trainer: 0 rows survived the research-signal join. "
+            "Either no test_date in the walk-forward folds maps to a "
+            "signals.json snapshot, or every signals snapshot has an "
+            "empty universe / unmappable sector. Investigate before "
+            "retraining; do not silently fall back to placeholder "
+            "constants (pre-2026-04-28 bug)."
+        )
 
     # ── Step 7: Train meta-model on pooled OOS ───────────────────────────────
     log.info("Training meta-model on %d OOS rows...", len(oos_meta_rows))
@@ -631,13 +900,9 @@ def run_meta_training(
     # baselines (majority-class, random, persistence) rather than absolute
     # thresholds.
 
-    # Research calibrator (v0 — lookup table)
-    prod_calibrator = ResearchCalibrator()
-    if len(research_scores) >= 10:
-        prod_calibrator.fit(research_scores, research_beat_spy)
-    else:
-        log.info("Research calibrator: insufficient data (%d rows) — using neutral priors",
-                 len(research_scores))
+    # Research calibrator (`prod_calibrator`) was fitted earlier in Step 5b
+    # so it could be consumed during walk-forward row construction. By this
+    # point it is already in its final form; nothing to do here.
 
     # ── Step 9: Upload to S3 ─────────────────────────────────────────────────
     # Gate promotion on the meta-model composite IC rather than requiring
