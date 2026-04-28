@@ -105,6 +105,23 @@ class TestStreamingSourceInvariants:
             "OOM regresses under a different name."
         )
 
+    def test_all_dates_uses_pd_datetimeindex_wrapper(self, meta_trainer_source):
+        """Lock the 2026-04-28 hotfix: ``all_dates`` must be assigned via
+        ``pd.DatetimeIndex(...).tolist()`` so the result is a list of
+        ``pd.Timestamp`` objects, not ints. Regression detector for any
+        future refactor that drops the wrapper."""
+        # Permissive whitespace: account for newlines/indentation around
+        # the assignment (the implementation has a long comment block
+        # immediately above so the line is alone on its source line).
+        pattern = re.compile(
+            r"all_dates\s*=\s*pd\.DatetimeIndex\(\s*date_unsorted\s*\[\s*sort_idx\s*\]\s*\)\s*\.tolist\(\)"
+        )
+        assert pattern.search(meta_trainer_source), (
+            "all_dates must be built via pd.DatetimeIndex(date_unsorted[sort_idx]).tolist() "
+            "— bare .tolist() on datetime64[ns] returns nanosecond ints, which broke "
+            "signals_lookup and the walk-forward calibrator filter on 2026-04-28."
+        )
+
     def test_explicit_chunk_cleanup_after_concat(self, meta_trainer_source):
         """After ``np.concatenate`` the chunk lists hold the same data
         as the contiguous arrays — leaving them alive doubles RSS
@@ -194,6 +211,41 @@ class TestStreamingBehavior:
 
         # Stable sort preserves AAPL before MSFT (insertion order)
         assert sorted_tickers == ["AAPL", "AAPL", "MSFT", "MSFT"]
+
+    def test_all_dates_preserves_pd_timestamp_type(self):
+        """Regression test for the 2026-04-28 v2 retraining failure: the
+        original streaming refactor used ``date_unsorted[sort_idx].tolist()``
+        which on ``datetime64[ns]`` numpy arrays returns Python ints
+        (nanoseconds-since-epoch), not ``pd.Timestamp`` objects. That
+        broke two downstream consumers:
+
+        1. ``signals_lookup`` lexicographic bisect — int strings like
+           "1524009600000000000" sort before "2026-03-05" → 0 matches.
+        2. ``np.datetime64(int_str, "D")`` reparses 19-digit strings as
+           absurd years → walk-forward calibrator filter flipped
+           True/False unpredictably across folds.
+
+        Symptom in production: 1,755,798 rows walked, 0 kept, hard-fail.
+        Fix: wrap sorted dates in ``pd.DatetimeIndex(...).tolist()``.
+        """
+        dates = pd.to_datetime(["2026-01-05", "2026-01-07", "2026-01-09"]).to_numpy()
+        # Bare .tolist() — what we accidentally shipped in PR #57
+        bare_list = dates.tolist()
+        assert all(isinstance(d, int) for d in bare_list), (
+            "Bare .tolist() on datetime64[ns] should return ints — if this "
+            "test starts failing, numpy's behavior changed and the wrap "
+            "below may no longer be necessary."
+        )
+        # Fixed path — what the trainer must use
+        fixed_list = pd.DatetimeIndex(dates).tolist()
+        assert all(isinstance(d, pd.Timestamp) for d in fixed_list)
+        # And string-form is ISO date with time component, not 19-digit int
+        for d in fixed_list:
+            assert "-" in str(d), (
+                f"str(pd.Timestamp) must contain '-' (ISO format); got {str(d)!r}. "
+                f"If this fails, downstream signals_lookup bisect will compare "
+                f"int strings against '2026-03-05'-style snapshot keys and miss."
+            )
 
     def test_no_extra_dataframe_alive_during_chunk_phase(self, monkeypatch):
         """Boundary check: simulate the streaming loop with a counter
