@@ -335,15 +335,17 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
                 + 0.2 * expected_move * np.sign(momentum_score)
             )
 
-        # Research signal adjustment: meta-model was trained without research
-        # data, so its ridge coefficients for research features are zero.
-        # Apply a direct adjustment until the model is retrained with signals.
-        # Scale: research_cal_prob in [0,1] → adjustment in [-0.005, +0.005].
-        # Conviction amplifies: rising=1.5x, declining=0.5x.
-        if sig:
-            _cal_adj = (research_cal_prob - 0.5) * 0.01
-            _conv_mult = {1.0: 1.5, 0.0: 1.0, -1.0: 0.5}.get(research_conviction, 1.0)
-            alpha += _cal_adj * _conv_mult
+        # The manual research-signal adjustment that lived here pre-2026-04-28
+        # was a workaround for the meta-trainer hardcoding research features
+        # to constants — Ridge zeroed those coefficients, so the inference
+        # path patched in a small `(research_cal_prob - 0.5) * 0.01` boost
+        # post hoc. PR #55 wired real research features into training; the
+        # 2026-04-28 retraining run promoted a meta-model with non-zero
+        # coefficients on all four research features (research_calibrator_prob:
+        # +0.0064, research_composite_score: +0.0117, research_conviction:
+        # -0.0015, sector_macro_modifier: -0.0411). Keeping the manual
+        # adjustment now would double-count research signal; it's been
+        # removed.
 
         alpha = float(np.clip(alpha, -max_r, max_r))
 

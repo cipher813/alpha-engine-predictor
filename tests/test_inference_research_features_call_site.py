@@ -92,3 +92,49 @@ class TestInferenceFallbackOnMissingTicker:
             r"research_cal_prob\s*=\s*0\.5",
             run_inference_source,
         ) is not None
+
+
+class TestNoCalAdjWorkaround:
+    """Lock removal of the pre-2026-04-28 manual research adjustment that
+    used to live at run_inference.py:319-327. With non-zero research
+    coefficients in the trained meta-model, the manual ``_cal_adj`` boost
+    double-counts research signal — it must stay deleted."""
+
+    def test_no_cal_adj_variable(self, run_inference_source):
+        assert "_cal_adj" not in run_inference_source, (
+            "The _cal_adj manual research adjustment was removed 2026-04-28 "
+            "after the retrained meta-model produced non-zero coefficients "
+            "for all four research features (research_calibrator_prob, "
+            "research_composite_score, research_conviction, "
+            "sector_macro_modifier). Keeping it would double-count research "
+            "signal. If a future PR needs to add a similar adjustment, do "
+            "so via the meta-model retraining, not via inference-side patches."
+        )
+
+    def test_no_conv_mult_variable(self, run_inference_source):
+        """``_conv_mult`` was the conviction-amplification multiplier
+        (rising=1.5x, declining=0.5x) used only by the workaround."""
+        assert "_conv_mult" not in run_inference_source
+
+    def test_no_research_cal_prob_minus_half_pattern(self, run_inference_source):
+        """The signature shape of the workaround was
+        ``(research_cal_prob - 0.5) * 0.01`` — forbid that exact pattern
+        from regressing into inference even under a different variable
+        name. Allow exactly one occurrence in active code (the no-meta-
+        model fallback branch); forbid more."""
+        # Strip line comments so the test doesn't catch its own
+        # explanatory text describing the removed workaround.
+        active_code = "\n".join(
+            line for line in run_inference_source.splitlines()
+            if not line.lstrip().startswith("#")
+        )
+        bad = re.compile(
+            r"\(\s*research_cal_prob\s*-\s*0\.5\s*\)\s*\*"
+        )
+        matches = bad.findall(active_code)
+        assert len(matches) <= 1, (
+            f"Found {len(matches)} occurrences of the (research_cal_prob "
+            f"- 0.5) * <const> pattern in active code; expected at most 1 "
+            f"(the no-meta-model fallback branch). The post-meta-model "
+            f"adjustment was removed 2026-04-28."
+        )
