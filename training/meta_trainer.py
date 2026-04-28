@@ -282,14 +282,40 @@ def run_meta_training(
         "(required: %d columns)...",
         len(_required_features),
     )
-    ticker_features: dict[str, pd.DataFrame] = {}
+    # ── Step 2 + Step 3: streaming parquet → arrays (rewritten 2026-04-28) ────
+    # Pre-rewrite this loop populated ``ticker_features: dict[str, DataFrame]``
+    # holding all ~900 labeled DataFrames (~700 KB each ≈ 630 MB) AND a
+    # subsequent loop built a ``all_rows: list[tuple]`` of 1.77M Python
+    # tuples on top of that ≈ another 265 MB AND `np.stack` over the
+    # 1.77M tuples allocated the final arrays while everything was still
+    # alive. Peak RSS ~1.5-2.5 GB plus pandas allocator burst overhead
+    # OOM'd c5.large (4 GB) on 2026-04-28.
+    #
+    # Streaming version: per ticker we read the parquet, label, extract
+    # numpy chunks, append to lightweight per-ticker chunk lists, then
+    # drop the DataFrame so the next iteration's allocations have
+    # headroom. After the loop a single ``np.concatenate`` glues the
+    # chunks into the final arrays. Peak memory: ~one DF (~700 KB) +
+    # the chunk list (~140 MB across all tickers) ≈ ~600 MB total
+    # working set. Functionally identical to the previous code: same
+    # rows, same sort order (by date, ascending), same shapes.
     reject_too_short: list[tuple[str, int]] = []
     reject_empty_raw: list[str] = []
     reject_missing_features: list[tuple[str, str]] = []
     reject_label_error: list[tuple[str, str]] = []
     reject_empty_labeled: list[str] = []
     n_candidates = 0
+    n_accepted = 0
     _MIN_HISTORY_ROWS = 265  # ~1 year of trading days — required for walk-forward folds
+
+    # Per-ticker chunk accumulators. Each list element is the per-ticker
+    # numpy slice; final concat happens after the loop.
+    date_chunks: list[np.ndarray] = []
+    ticker_chunks: list[np.ndarray] = []
+    mom_chunks: list[np.ndarray] = []
+    vol_chunks: list[np.ndarray] = []
+    fwd_chunks: list[np.ndarray] = []
+    fwd_horizons_chunks: list[np.ndarray] = []
 
     for path in all_parquets:
         ticker = path.stem
@@ -348,20 +374,48 @@ def run_meta_training(
             for h in _DIAGNOSTIC_HORIZONS:
                 labeled[f"forward_return_{h}d"] = float("nan")
 
-        ticker_features[ticker] = labeled
+        # Extract this ticker's slice into numpy chunks; the DataFrame
+        # is then garbage-collectable when the loop iterates.
+        n_rows = len(labeled.index)
+        date_chunks.append(labeled.index.to_numpy())
+        ticker_chunks.append(np.full(n_rows, ticker, dtype=object))
+        mom_chunks.append(
+            labeled[cfg.MOMENTUM_FEATURES].to_numpy(dtype=np.float32)
+        )
+        vol_chunks.append(
+            labeled[cfg.VOLATILITY_FEATURES].to_numpy(dtype=np.float32)
+        )
+        fwd_chunks.append(
+            labeled["forward_return_5d"].to_numpy(dtype=np.float32)
+        )
+        fwd_horizons_chunks.append(np.column_stack([
+            labeled.get(
+                f"forward_return_{h}d",
+                pd.Series(float("nan"), index=labeled.index),
+            ).to_numpy(dtype=np.float32)
+            for h in _DIAGNOSTIC_HORIZONS
+        ]))
+        n_accepted += 1
+
+        # Explicit cleanup — the per-ticker DataFrame and intermediate
+        # views are no longer referenced; freeing them here keeps the
+        # next iteration's allocations bounded by one DF's worth of
+        # peak memory rather than the cumulative sum across 900 tickers
+        # (the 2026-04-28 OOM root cause).
+        del labeled, raw_df, close_for_horizon, bench_for_horizon
 
     log.info(
         "Feature read complete: %d accepted / %d candidates  "
         "(rejected: too_short=%d  empty_raw=%d  missing_features=%d  "
         "label_error=%d  empty_labeled=%d)",
-        len(ticker_features), n_candidates,
+        n_accepted, n_candidates,
         len(reject_too_short), len(reject_empty_raw),
         len(reject_missing_features), len(reject_label_error), len(reject_empty_labeled),
     )
 
-    if len(ticker_features) == 0:
-        # Hard-fail with diagnostics rather than letting np.stack emit its
-        # cryptic "need at least one array to stack" on the empty list.
+    if n_accepted == 0:
+        # Hard-fail with diagnostics rather than letting np.concatenate
+        # emit its cryptic "need at least one array" error on the empty list.
         def _preview(rows, limit=5):
             return ", ".join(str(r) for r in rows[:limit]) + (
                 f"  ... (+{len(rows) - limit} more)" if len(rows) > limit else ""
@@ -383,36 +437,35 @@ def run_meta_training(
             f"[{_preview(reject_empty_labeled)}]"
         )
 
-    # ── Step 3: Build arrays for momentum + volatility models ────────────────
-    # Flatten per-ticker DataFrames into (X, y, dates) arrays. Multi-horizon
-    # forward returns are carried as a parallel column array for the
-    # post-training IC diagnostic; not used by training itself.
-    all_rows = []
-    for ticker, df in ticker_features.items():
-        mom_vals = df[cfg.MOMENTUM_FEATURES].to_numpy(dtype=np.float32)
-        vol_vals = df[cfg.VOLATILITY_FEATURES].to_numpy(dtype=np.float32)
-        fwd = df["forward_return_5d"].to_numpy(dtype=np.float32)
-        fwd_horizons = np.column_stack([
-            df.get(f"forward_return_{h}d", pd.Series(float("nan"), index=df.index))
-              .to_numpy(dtype=np.float32)
-            for h in _DIAGNOSTIC_HORIZONS
-        ])
-        dates = df.index
-        for j in range(len(dates)):
-            all_rows.append((
-                dates[j], ticker,
-                mom_vals[j], vol_vals[j],
-                float(fwd[j]),
-                fwd_horizons[j],  # shape = (len(_DIAGNOSTIC_HORIZONS),)
-            ))
+    # Concatenate per-ticker chunks → single arrays in date-then-ticker
+    # order, then sort by date so walk-forward iteration matches the
+    # legacy behavior. argsort over a numpy datetime array is O(N log N)
+    # in C; the prior code did Python-level sort over 1.77M tuples.
+    date_unsorted = np.concatenate(date_chunks)
+    ticker_unsorted = np.concatenate(ticker_chunks)
+    X_mom_unsorted = np.concatenate(mom_chunks, axis=0)
+    X_vol_unsorted = np.concatenate(vol_chunks, axis=0)
+    y_fwd_unsorted = np.concatenate(fwd_chunks)
+    y_fwd_horizons_unsorted = np.concatenate(fwd_horizons_chunks, axis=0)
 
-    all_rows.sort(key=lambda r: r[0])
-    all_dates = [r[0] for r in all_rows]
-    all_tickers = [r[1] for r in all_rows]
-    X_mom = np.stack([r[2] for r in all_rows])
-    X_vol = np.stack([r[3] for r in all_rows])
-    y_fwd = np.array([r[4] for r in all_rows], dtype=np.float32)
-    y_fwd_horizons = np.stack([r[5] for r in all_rows])  # shape = (N, n_horizons) — diagnostic only
+    # Free the chunk lists — referenced data has been copied into the
+    # contiguous arrays above. Without this `del` the chunks linger
+    # through walk-forward and double the RSS we just reduced.
+    del date_chunks, ticker_chunks, mom_chunks, vol_chunks
+    del fwd_chunks, fwd_horizons_chunks
+
+    # Stable sort by date so ties keep ticker-order deterministic for
+    # snapshot tests + reproducibility.
+    sort_idx = np.argsort(date_unsorted, kind="stable")
+    all_dates = date_unsorted[sort_idx].tolist()
+    all_tickers = ticker_unsorted[sort_idx].tolist()
+    X_mom = X_mom_unsorted[sort_idx]
+    X_vol = X_vol_unsorted[sort_idx]
+    y_fwd = y_fwd_unsorted[sort_idx]
+    y_fwd_horizons = y_fwd_horizons_unsorted[sort_idx]
+
+    del date_unsorted, ticker_unsorted
+    del X_mom_unsorted, X_vol_unsorted, y_fwd_unsorted, y_fwd_horizons_unsorted
 
     # Winsorize
     if cfg.LABEL_CLIP:
