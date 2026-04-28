@@ -457,7 +457,29 @@ def run_meta_training(
     # Stable sort by date so ties keep ticker-order deterministic for
     # snapshot tests + reproducibility.
     sort_idx = np.argsort(date_unsorted, kind="stable")
-    all_dates = date_unsorted[sort_idx].tolist()
+    # Wrap the sorted dates in ``pd.DatetimeIndex(...).tolist()`` so
+    # ``all_dates`` is a list of ``pd.Timestamp`` objects, matching the
+    # pre-streaming behavior. Bare ``.tolist()`` on a ``datetime64[ns]``
+    # numpy array returns nanosecond-since-epoch ints (Python int can
+    # represent ns precision; datetime.datetime cannot, so numpy
+    # downgrades to int rather than truncate). Surfaced 2026-04-28 in
+    # the v2 retraining run where ``str(int_ns)`` produced strings like
+    # "1524009600000000000", which downstream sites consume in two
+    # ways:
+    #   1. ``signals_lookup`` keys, which compare lexicographically
+    #      against snapshot keys like "2026-03-05" — a 1-prefixed int
+    #      string sorts before any 2-prefixed date string, so bisect
+    #      always returned 0 → every row dropped from the L2 training
+    #      set (1,755,798 rows in the failing run).
+    #   2. The walk-forward calibrator's ``np.datetime64(int_str, "D")``
+    #      reparses the 19-digit string as a year, returning bizarre
+    #      datetimes like year 8.8e15 AD. The resulting comparison
+    #      flipped True/False unpredictably across folds (Fold 1 = 42,
+    #      Fold 3 = 0, Fold 4 = 42, Fold 6 = 0, …).
+    # ``pd.DatetimeIndex(arr).tolist()`` returns ``list[pd.Timestamp]``
+    # which preserves nanosecond precision *and* round-trips cleanly to
+    # the ISO string forms downstream code expects.
+    all_dates = pd.DatetimeIndex(date_unsorted[sort_idx]).tolist()
     all_tickers = ticker_unsorted[sort_idx].tolist()
     X_mom = X_mom_unsorted[sort_idx]
     X_vol = X_vol_unsorted[sort_idx]
