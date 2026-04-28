@@ -196,9 +196,15 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
         log.error("Macro feature build failed: %s — using zero-fill defaults", e)
 
     # ── Step 2: Load research signals for calibrator ─────────────────────────
-    # Read signals/latest.json for composite scores and conviction.
+    # Read signals/latest.json for composite scores, conviction, and the
+    # top-level sector_modifiers dict. Both the per-ticker view and the full
+    # payload are kept — `extract_research_features` reads sector_modifiers
+    # from the top level (not from per-ticker entries; the latter was the
+    # `run_inference.py:293` bug that always returned 0.0 sector_modifier
+    # for every ticker, regardless of research's sector ratings).
     import json
     research_signals = {}
+    research_signals_payload: dict | None = None
     try:
         import boto3 as _b3_sig
         _s3_sig = _b3_sig.client("s3")
@@ -207,6 +213,7 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
                 Bucket=ctx.bucket, Key="signals/latest.json"
             )
             sig_data = json.loads(sig_obj["Body"].read())
+            research_signals_payload = sig_data
             for sig in sig_data.get("universe", []):
                 ticker = sig.get("ticker")
                 if ticker:
@@ -279,20 +286,32 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
                 if ticker == ctx.tickers[0]:
                     log.warning("Volatility model predict failed for %s: %s", ticker, _vol_exc)
 
-        # Layer 1C: Research calibrator
-        research_cal_prob = 0.5  # neutral default
-        research_score_norm = 0.5
-        research_conviction = 0.0
-        sector_modifier = 0.0
+        # Layer 1C: Research calibrator + research-feature extraction
+        # Centralized in ``model.research_features.extract_research_features``
+        # so this call site stays in lockstep with the meta-trainer's
+        # row-construction lookup. Pre-2026-04-28 this block reimplemented
+        # the lookup inline and contained a bug where ``sector_modifiers``
+        # was read from the per-ticker dict (always missing) instead of
+        # the top-level signals payload — the helper reads from the full
+        # payload, fixing it. None return triggers the same neutral
+        # defaults the legacy inline path used so a missing ticker
+        # doesn't break inference.
+        from model.research_features import extract_research_features
+
         sig = research_signals.get(ticker)
-        if sig:
-            raw_score = sig.get("score") or 50
-            research_score_norm = raw_score / 100.0
-            conv = sig.get("conviction", "stable")
-            research_conviction = {"rising": 1.0, "stable": 0.0, "declining": -1.0}.get(conv, 0.0)
-            sector_modifier = sig.get("sector_modifiers", {}).get(sig.get("sector", ""), 1.0) - 1.0
-            if research_cal is not None and research_cal.is_fitted:
-                research_cal_prob = research_cal.predict(raw_score)
+        rf = extract_research_features(
+            research_signals_payload, ticker, research_cal,
+        )
+        if rf is not None:
+            research_cal_prob = rf["research_calibrator_prob"]
+            research_score_norm = rf["research_composite_score"]
+            research_conviction = rf["research_conviction"]
+            sector_modifier = rf["sector_macro_modifier"]
+        else:
+            research_cal_prob = 0.5  # neutral default
+            research_score_norm = 0.5
+            research_conviction = 0.0
+            sector_modifier = 0.0
 
         # Layer 2: Meta-model
         meta_features = {

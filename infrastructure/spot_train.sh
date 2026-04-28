@@ -61,7 +61,14 @@ fi
 AWS_REGION="${AWS_REGION:-us-east-1}"
 S3_BUCKET="${S3_BUCKET:-alpha-engine-research}"
 BRANCH="${BRANCH:-main}"
-INSTANCE_TYPE="c5.xlarge"
+# c5.large = 2 vCPU / 4 GB RAM. Right-sized 2026-04-28: meta-trainer
+# steady-state is ~1–1.5 GB (~540 MB ticker DataFrames + ~200-400 MB
+# numpy arrays + LightGBM DMatrix overhead). c5.xlarge was inherited from
+# the v2-era CatBoost + multi-horizon stack (deleted in PR #54). Override
+# via ``--instance-type`` if a future feature pushes peak memory past
+# ~3 GB; if a run OOMs at this size, bump back to c5.xlarge and add a
+# RSS check to the training preflight.
+INSTANCE_TYPE="c5.large"
 AMI_ID="ami-0c421724a94bba6d6"  # Amazon Linux 2023 x86_64 (Python 3.12)
 # Spot-side watchdog budget: meta-trainer typically completes 40-70 min;
 # include pip install + smoke + full run. 90 min with headroom. Bump

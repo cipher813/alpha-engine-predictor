@@ -86,16 +86,16 @@ def _load_momentum_params_from_s3(bucket: str) -> dict | None:
 # load the historical weekly signals snapshots from S3 and populate real
 # values per (test_date, ticker) tuple.
 
-# Sector-name canonicalization. Research's per-ticker `universe[].sector`
-# uses GICS-style names ("Health Care", "Information Technology") while
-# `sector_modifiers` is keyed on shorter labels ("Healthcare", "Technology").
-# The map is sourced from research's actual output; any new sector must be
-# added here AND in research's sector_modifiers writer in tandem.
-_SECTOR_NAME_CANONICAL = {
-    "Health Care": "Healthcare",
-    "Information Technology": "Technology",
-    "Financials": "Financial",
-}
+# Per-ticker feature extraction + sector-name canonical map live in
+# ``model/research_features.py`` so both training and inference call
+# the same code path (inference's ``run_inference.py:293`` had the same
+# top-level-vs-per-ticker bug as the original placeholder this PR closes).
+# The local underscore-prefixed names are kept as private aliases so the
+# existing test imports keep working.
+from model.research_features import (
+    SECTOR_NAME_CANONICAL as _SECTOR_NAME_CANONICAL,
+    extract_research_features as _extract_research_features,
+)
 
 
 def _load_signals_history(s3, bucket: str) -> dict[str, dict]:
@@ -178,67 +178,6 @@ def _build_signals_lookup_by_test_date(
         else:
             lookup[td_str] = signals_history[snapshot_dates[i - 1]]
     return lookup
-
-
-def _extract_research_features(
-    signals_payload: dict | None,
-    ticker: str,
-    research_cal,
-) -> dict | None:
-    """Extract the four per-ticker research features from a signals payload.
-
-    Returns ``None`` when the payload is absent, the ticker is missing
-    from the snapshot's ``universe`` list, or the score field is missing
-    — caller drops the row from the L2 training set rather than silently
-    fill with constants (per ``feedback_no_silent_fails``).
-
-    Returns a dict with the four feature keys when extraction succeeds:
-      - ``research_calibrator_prob``: ``research_cal.predict(score)`` if the
-        calibrator is fitted, else ``score / 100`` as a smooth fallback.
-      - ``research_composite_score``: ``score / 100``.
-      - ``research_conviction``: ``{"rising": 1, "stable": 0, "declining": -1}``.
-      - ``sector_macro_modifier``: ``sector_modifiers[canonical_sector] - 1``.
-    """
-    if signals_payload is None:
-        return None
-
-    ticker_sig = next(
-        (
-            s for s in signals_payload.get("universe", [])
-            if s.get("ticker") == ticker
-        ),
-        None,
-    )
-    if ticker_sig is None:
-        return None
-
-    raw_score = ticker_sig.get("score")
-    if raw_score is None:
-        return None
-    score_norm = float(raw_score) / 100.0
-
-    conv = ticker_sig.get("conviction", "stable")
-    conviction = {
-        "rising": 1.0, "stable": 0.0, "declining": -1.0,
-    }.get(conv, 0.0)
-
-    sector = ticker_sig.get("sector", "") or ""
-    sector_canonical = _SECTOR_NAME_CANONICAL.get(sector, sector)
-    sector_modifier = float(
-        signals_payload.get("sector_modifiers", {}).get(sector_canonical, 1.0)
-    ) - 1.0
-
-    if research_cal is not None and getattr(research_cal, "is_fitted", False):
-        cal_prob = float(research_cal.predict(raw_score))
-    else:
-        cal_prob = score_norm
-
-    return {
-        "research_calibrator_prob": cal_prob,
-        "research_composite_score": score_norm,
-        "research_conviction": conviction,
-        "sector_macro_modifier": sector_modifier,
-    }
 
 
 def run_meta_training(
@@ -509,6 +448,7 @@ def run_meta_training(
     # ── Step 5: Load research calibrator data from S3 ────────────────────────
     research_scores = np.array([])
     research_beat_spy = np.array([])
+    research_score_dates = np.array([], dtype="datetime64[D]")
     try:
         import boto3
         s3 = boto3.client("s3")
@@ -517,33 +457,46 @@ def run_meta_training(
         db_tmp = Path(tempfile.gettempdir()) / "research_train.db"
         s3.download_file(bucket, "research.db", str(db_tmp))
         conn = sqlite3.connect(str(db_tmp))
+        # score_date pulled in 2026-04-28 (PR #56) so the walk-forward
+        # calibrator below can filter to entries dated <= train_end_date
+        # per fold and avoid leaking forward beat_spy_10d outcomes into
+        # earlier folds' research_calibrator_prob lookups.
         sp_df = pd.read_sql_query(
-            "SELECT score, beat_spy_10d FROM score_performance "
-            "WHERE beat_spy_10d IS NOT NULL AND score IS NOT NULL",
+            "SELECT score, beat_spy_10d, score_date FROM score_performance "
+            "WHERE beat_spy_10d IS NOT NULL AND score IS NOT NULL "
+            "AND score_date IS NOT NULL",
             conn,
         )
         conn.close()
         if not sp_df.empty:
             research_scores = sp_df["score"].to_numpy()
             research_beat_spy = sp_df["beat_spy_10d"].to_numpy().astype(int)
-            log.info("Research calibrator data: %d rows from score_performance", len(sp_df))
+            research_score_dates = pd.to_datetime(
+                sp_df["score_date"]
+            ).to_numpy().astype("datetime64[D]")
+            log.info(
+                "Research calibrator data: %d rows from score_performance "
+                "(date range: %s → %s)",
+                len(sp_df),
+                str(research_score_dates.min()) if len(research_score_dates) else "n/a",
+                str(research_score_dates.max()) if len(research_score_dates) else "n/a",
+            )
         else:
             log.info("score_performance table empty — research calibrator will use priors")
     except Exception as e:
         log.warning("Could not load research calibrator data: %s — using priors", e)
 
-    # ── Step 5b: Fit research calibrator (moved before walk-forward 2026-04-28) ─
-    # Originally fitted at the end of training (Step 8). Moved here so the
-    # calibrator is available during fold-row construction below — without it
-    # the four research features get hardcoded to constants and Ridge zeros
-    # their coefficients (root cause of the 27 UP / 0 DOWN collapse on
-    # 2026-04-28). The calibrator is fitted ONCE on full score_performance
-    # history; this introduces minor walk-forward leakage (a future iteration
-    # should fit per-fold). Acceptable for a v1 fix because score_performance
-    # only spans the post-2026-03-05 signals window — the same window every
-    # row construction below pulls from — so the leakage is bounded to the
-    # narrow window where any single bucket's hit_rate computation could see
-    # ~7-8 weeks of forward outcomes vs the test_date.
+    # ── Step 5b: Production research calibrator (fit on full data) ───────────
+    # Two distinct calibrators are needed:
+    #   1. ``prod_calibrator`` — fit on the full score_performance history,
+    #      uploaded to S3 at the end of training. This is what inference
+    #      reads at runtime via research_calibrator.json.
+    #   2. ``fold_calibrator`` — fit per fold inside the walk-forward loop
+    #      below using only score_performance entries dated <= train_end_date.
+    #      Used to compute research_calibrator_prob for that fold's test rows
+    #      so the meta-model never sees forward-looking calibration during
+    #      training (the leakage that the original 2026-04-28 fix accepted
+    #      and PR #56 closes).
     prod_calibrator = ResearchCalibrator()
     if len(research_scores) >= 10:
         prod_calibrator.fit(research_scores, research_beat_spy)
@@ -652,6 +605,42 @@ def run_meta_training(
         tr = fold["train_idx"]
         te = fold["test_idx"]
 
+        # Per-fold research calibrator (added 2026-04-28, PR #56). Fit only
+        # on score_performance entries dated <= train_end_date so the
+        # walk-forward construction never sees forward-looking calibration
+        # for the test fold's rows. Falls through to ``prod_calibrator`` if
+        # we don't have enough train-fold history (e.g. the very first fold
+        # with score_performance entries) — that path keeps the leakage we
+        # accepted in the original 2026-04-28 fix and tags it explicitly so
+        # operators see when it triggers.
+        fold_calibrator = None
+        if len(research_score_dates) > 0:
+            train_end_np = np.datetime64(fold["train_end"], "D")
+            train_mask = research_score_dates <= train_end_np
+            n_train_cal = int(train_mask.sum())
+            if n_train_cal >= 10:
+                fold_calibrator = ResearchCalibrator()
+                fold_calibrator.fit(
+                    research_scores[train_mask],
+                    research_beat_spy[train_mask],
+                )
+                log.info(
+                    "  Fold %d/%d: research calibrator fit on %d train-fold rows "
+                    "(score_date <= %s)",
+                    i + 1, len(folds), n_train_cal, fold["train_end"],
+                )
+            else:
+                log.warning(
+                    "  Fold %d/%d: only %d score_performance rows dated <= %s — "
+                    "falling back to prod_calibrator (leakage). Per-row "
+                    "research_calibrator_prob may use slightly forward-looking "
+                    "calibration for this fold.",
+                    i + 1, len(folds), n_train_cal, fold["train_end"],
+                )
+                fold_calibrator = prod_calibrator
+        else:
+            fold_calibrator = prod_calibrator
+
         # Train momentum model (low-capacity — see mom_tuned_params above)
         n_sub = int(len(tr) * 0.85)
         mom_scorer = GBMScorer(params=mom_tuned_params, n_estimators=mom_n_est,
@@ -715,7 +704,7 @@ def run_meta_training(
                     n_rows_dropped_no_signals_snapshot += 1
                     continue
                 research_features = _extract_research_features(
-                    signals_payload, ticker, prod_calibrator
+                    signals_payload, ticker, fold_calibrator
                 )
                 if research_features is None:
                     n_rows_dropped_ticker_missing += 1
