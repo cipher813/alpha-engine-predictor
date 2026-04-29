@@ -593,6 +593,19 @@ def run_meta_training(
             len(research_scores),
         )
 
+    # Subsample IC gate — time-based holdout: fit a temporary calibrator on
+    # the first ~80% of score_performance by date, evaluate Pearson IC on
+    # the last 20%, compare to score/100 passthrough baseline. Production
+    # ``prod_calibrator`` (fit on full data above) is unaffected — this is
+    # purely a promotion-decision input. See model/subsample_validator.py.
+    from model.subsample_validator import validate_research_calibrator
+    research_subsample_result = validate_research_calibrator(
+        scores=research_scores,
+        beat_spy=research_beat_spy,
+        score_dates=research_score_dates,
+    )
+    research_subsample_result.log()
+
     # ── Step 5c: Load signals.json history for per-row research feature lookup ─
     # Each weekly snapshot at signals/{YYYY-MM-DD}/signals.json carries the
     # research universe (per-ticker score / conviction / sector) and the
@@ -1004,7 +1017,9 @@ def run_meta_training(
     mom_subsample_result.log()
     vol_subsample_result.log()
     subsample_gate_passed = (
-        mom_subsample_result.passed and vol_subsample_result.passed
+        mom_subsample_result.passed
+        and vol_subsample_result.passed
+        and research_subsample_result.passed
     )
 
     # Regime classifier removed from the critical path 2026-04-16. Its
@@ -1049,13 +1064,14 @@ def run_meta_training(
     # poisoning the data layer was actively shipping.
     promoted = meta_ic_passed and subsample_gate_passed
     log.info(
-        "Promotion gate: meta_IC=%.4f %s %.4f (meta=%s) AND "
-        "short-history subsample (mom=%s, vol=%s) → %s "
+        "Promotion gate: meta_IC=%.4f %s %.4f (meta=%s) AND component "
+        "subsample (mom=%s, vol=%s, research=%s) → %s "
         "(walk-forward for reference: mom_median=%.4f, vol_median=%.4f)",
         meta_model._val_ic, ">=" if meta_ic_passed else "<", _meta_ic_gate,
         "PASS" if meta_ic_passed else "BLOCK",
         "PASS" if mom_subsample_result.passed else "BLOCK",
         "PASS" if vol_subsample_result.passed else "BLOCK",
+        "PASS" if research_subsample_result.passed else "BLOCK",
         "PROMOTE" if promoted else "BLOCK",
         mom_median_ic, vol_median_ic,
     )
@@ -1200,6 +1216,13 @@ def run_meta_training(
                 "baseline_ic": round(vol_subsample_result.baseline_ic, 6),
                 "passed": vol_subsample_result.passed,
                 "skip_reason": vol_subsample_result.skip_reason,
+            },
+            "research_calibrator": {
+                "n": research_subsample_result.n,
+                "component_ic": round(research_subsample_result.component_ic, 6),
+                "baseline_ic": round(research_subsample_result.baseline_ic, 6),
+                "passed": research_subsample_result.passed,
+                "skip_reason": research_subsample_result.skip_reason,
             },
             "gate_passed": subsample_gate_passed,
         },
