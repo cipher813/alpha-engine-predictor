@@ -493,6 +493,16 @@ def run_meta_training(
     if cfg.LABEL_CLIP:
         y_fwd = np.clip(y_fwd, -cfg.LABEL_CLIP, cfg.LABEL_CLIP)
 
+    # Capture NaN masks BEFORE rank-normalization erases them (NaN inputs
+    # become rank 1.0 after argsort → numpy puts NaN at the end). Used by
+    # the short-history subsample IC gate at promotion time — see
+    # ``model.subsample_validator`` and the gate block below the
+    # production-train step.
+    X_mom_raw = X_mom.copy()
+    X_vol_raw = X_vol.copy()
+    mom_nan_mask = np.any(np.isnan(X_mom_raw), axis=1)
+    vol_nan_mask = np.any(np.isnan(X_vol_raw), axis=1)
+
     # Cross-sectional rank normalize (per-date, per-feature)
     X_mom = cross_sectional_rank_normalize(X_mom, all_dates)
     X_vol = cross_sectional_rank_normalize(X_vol, all_dates)
@@ -952,6 +962,51 @@ def run_meta_training(
     vol_test_ic = float(np.corrcoef(vol_test_preds, np.abs(y_fwd[val_end:]))[0, 1]) if len(vol_test_preds) > 1 else 0.0
     log.info("Volatility production: test_IC=%.4f  best_iter=%d", vol_test_ic, prod_vol._best_iteration)
 
+    # ── Step 8b: Short-history subsample IC gate ─────────────────────────────
+    # Per ROADMAP P1 "NaN-feature handling audit + short-history subsample
+    # validation" + feedback_component_baseline_validation: each L1 GBM
+    # must beat a named simple-fallback baseline on the short-history
+    # subsample (rows where any L1 input was NaN before rank-norm),
+    # otherwise the GBM isn't earning its complexity on the slice that
+    # mimics inference-time short-history tickers (SNDK-class).
+    #
+    # Hard-fail block: if any component fails its subsample gate, the
+    # whole deploy is blocked. The meta-model is structurally trained on
+    # the L1 outputs; promoting a stack with a regressed component would
+    # ship a model with a known weakness on short-history tickers, which
+    # the data layer is now actively shipping (PR #78).
+    from model.subsample_validator import (
+        momentum_baseline_predict, volatility_baseline_predict,
+        validate_component,
+    )
+    mom_subsample_mask_test = mom_nan_mask[val_end:]
+    vol_subsample_mask_test = vol_nan_mask[val_end:]
+    mom_baseline_preds = momentum_baseline_predict(
+        X_mom_raw[val_end:], cfg.MOMENTUM_FEATURES,
+    )
+    vol_baseline_preds = volatility_baseline_predict(
+        X_vol_raw[val_end:], cfg.VOLATILITY_FEATURES,
+    )
+    mom_subsample_result = validate_component(
+        component_name="momentum",
+        component_preds=mom_test_preds,
+        baseline_preds=mom_baseline_preds,
+        y_true=y_fwd[val_end:],
+        subsample_mask=mom_subsample_mask_test,
+    )
+    vol_subsample_result = validate_component(
+        component_name="volatility",
+        component_preds=vol_test_preds,
+        baseline_preds=vol_baseline_preds,
+        y_true=np.abs(y_fwd[val_end:]),
+        subsample_mask=vol_subsample_mask_test,
+    )
+    mom_subsample_result.log()
+    vol_subsample_result.log()
+    subsample_gate_passed = (
+        mom_subsample_result.passed and vol_subsample_result.passed
+    )
+
     # Regime classifier removed from the critical path 2026-04-16. Its
     # Tier 0 implementation (multinomial logistic on 6 macro features) could
     # not clear an honest baseline — walk-forward OOS accuracy of 39.5% sat
@@ -986,11 +1041,21 @@ def run_meta_training(
     # Threshold matches the v2 single-model path (cfg.WF_MEDIAN_IC_GATE,
     # default 0.02 per config.py, configurable via predictor.yaml).
     _meta_ic_gate = cfg.WF_MEDIAN_IC_GATE
-    promoted = meta_model._val_ic >= _meta_ic_gate
+    meta_ic_passed = meta_model._val_ic >= _meta_ic_gate
+    # Composite gate: meta-IC AND per-component subsample-IC. Both must
+    # pass for promotion. The short-history subsample gate is what was
+    # missing pre-2026-04-29 — meta_ic≥0.02 alone proved 2026-04-28 that
+    # the ensemble could "work" while the components had silent NaN
+    # poisoning the data layer was actively shipping.
+    promoted = meta_ic_passed and subsample_gate_passed
     log.info(
-        "Meta-model promotion gate: meta_IC=%.4f %s %.4f → %s "
+        "Promotion gate: meta_IC=%.4f %s %.4f (meta=%s) AND "
+        "short-history subsample (mom=%s, vol=%s) → %s "
         "(walk-forward for reference: mom_median=%.4f, vol_median=%.4f)",
-        meta_model._val_ic, ">=" if promoted else "<", _meta_ic_gate,
+        meta_model._val_ic, ">=" if meta_ic_passed else "<", _meta_ic_gate,
+        "PASS" if meta_ic_passed else "BLOCK",
+        "PASS" if mom_subsample_result.passed else "BLOCK",
+        "PASS" if vol_subsample_result.passed else "BLOCK",
         "PROMOTE" if promoted else "BLOCK",
         mom_median_ic, vol_median_ic,
     )
@@ -1120,6 +1185,23 @@ def run_meta_training(
             "n_folds": len(folds),
             "folds": fold_results,
             "passes_wf": mom_median_ic > 0 and vol_median_ic > 0,
+        },
+        "short_history_subsample": {
+            "momentum": {
+                "n": mom_subsample_result.n,
+                "component_ic": round(mom_subsample_result.component_ic, 6),
+                "baseline_ic": round(mom_subsample_result.baseline_ic, 6),
+                "passed": mom_subsample_result.passed,
+                "skip_reason": mom_subsample_result.skip_reason,
+            },
+            "volatility": {
+                "n": vol_subsample_result.n,
+                "component_ic": round(vol_subsample_result.component_ic, 6),
+                "baseline_ic": round(vol_subsample_result.baseline_ic, 6),
+                "passed": vol_subsample_result.passed,
+                "skip_reason": vol_subsample_result.skip_reason,
+            },
+            "gate_passed": subsample_gate_passed,
         },
         # Compat fields for email/summary (reuse existing reporting)
         "test_ic": round(meta_model._val_ic, 6),
