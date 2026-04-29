@@ -401,6 +401,20 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
     log.info("Meta-inference complete: %d predictions, %d skipped", len(ctx.predictions), ctx.n_skipped)
 
 
+_MIN_UNIQUE_P_UP_BINS = 3
+"""Variance-fallback threshold for the calibrator-active branch of
+_rescale_cross_sectional. If the calibrator's batch outputs collapse to
+fewer than this many unique p_up bins, fall through to the linear
+heuristic. K=3 catches the 2026-04-28 collapse class (1 unique bin)
+without false-engaging on small healthy batches that legitimately
+cluster (e.g. a 5-ticker holiday batch where isotonic plateaus could
+naturally produce 2 bins). Paired with `_MIN_BATCH_SIZE_FOR_VARIANCE_GATE`
+below — the gate is suppressed for tiny batches where N < threshold is
+structurally expected."""
+
+_MIN_BATCH_SIZE_FOR_VARIANCE_GATE = 5
+
+
 def _rescale_cross_sectional(ctx: "PipelineContext") -> None:
     """Heuristic cross-sectional confidence rescaling (calibrator-guarded).
 
@@ -411,6 +425,16 @@ def _rescale_cross_sectional(ctx: "PipelineContext") -> None:
     heuristic — a silent regression of the calibration work. In that case
     this function is a no-op.
 
+    **Variance fallback (2026-04-29):** when the calibrator IS loaded but
+    its outputs on the current batch collapse to fewer than
+    ``_MIN_UNIQUE_P_UP_BINS`` unique p_up values (the 2026-04-28
+    calibrator-collapse pathology), the skip is suppressed and the batch
+    falls through to the linear heuristic so cross-sectional variance is
+    recovered for today's predictions. The fallback firing is a loud
+    signal that calibrator training has degenerated; investigate at
+    leisure but don't block today's inference. Closes ROADMAP P1
+    "calibrator collapse" investigation step #5.
+
     Without a calibrator (legacy fallback path), rescaling is mandatory:
     meta ridge outputs cluster in ~[-0.01, +0.01], narrower than
     LABEL_CLIP (±0.15). Linear p_up values collapse toward 0.5 for
@@ -420,18 +444,39 @@ def _rescale_cross_sectional(ctx: "PipelineContext") -> None:
     _cal = getattr(ctx, "calibrator", None)
     _calibrated = _cal is not None and getattr(_cal, "is_fitted", False)
     if _calibrated:
-        log.info(
-            "Skipping cross-sectional rescaling — isotonic calibrator active "
-            "(method=%s, ECE_after=%.4f)",
-            _cal.method, _cal._ece_after or 0.0,
-        )
-        return
+        # Variance gate: count unique p_up bins (rounded to inference
+        # precision — matches the 4dp rounding done at write time).
+        p_up_values = [p.get("p_up", 0.5) or 0.5 for p in ctx.predictions]
+        unique_count = len({round(v, 4) for v in p_up_values})
+        n_preds = len(p_up_values)
 
-    log.warning(
-        "No calibrator loaded — applying linear heuristic cross-sectional "
-        "rescaling. This path should only fire before the first post-migration "
-        "retrain ships an isotonic calibrator to S3."
-    )
+        if (
+            n_preds >= _MIN_BATCH_SIZE_FOR_VARIANCE_GATE
+            and unique_count < _MIN_UNIQUE_P_UP_BINS
+        ):
+            log.error(
+                "VARIANCE FALLBACK ENGAGED: calibrator outputs collapsed to "
+                "%d unique p_up bins across %d tickers (threshold=%d). "
+                "This is the 2026-04-28 calibrator-collapse pathology — "
+                "investigate calibrator + meta-model training. Falling "
+                "through to linear heuristic rescale to recover variance "
+                "for today's batch.",
+                unique_count, n_preds, _MIN_UNIQUE_P_UP_BINS,
+            )
+            # Fall through to the linear rescaling block below.
+        else:
+            log.info(
+                "Skipping cross-sectional rescaling — isotonic calibrator "
+                "active (method=%s, ECE_after=%.4f, unique_p_up_bins=%d)",
+                _cal.method, _cal._ece_after or 0.0, unique_count,
+            )
+            return
+    else:
+        log.warning(
+            "No calibrator loaded — applying linear heuristic cross-sectional "
+            "rescaling. This path should only fire before the first "
+            "post-migration retrain ships an isotonic calibrator to S3."
+        )
     _META_ALPHA_CLIP = 0.02  # 2% — reasonable expected range for 5d alpha
     alphas = [p.get("predicted_alpha", 0) or 0 for p in ctx.predictions]
     if not alphas:

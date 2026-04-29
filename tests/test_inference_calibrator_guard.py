@@ -113,3 +113,131 @@ def test_rescaling_noop_for_unfitted_calibrator():
     assert abs(bbb["p_up"] - 0.5) < 1e-6, (
         "Unfitted calibrator must be treated as absent; heuristic should have rewritten."
     )
+
+
+# ── Variance fallback (2026-04-29, ROADMAP P1 calibrator-collapse step #5) ──
+#
+# When the calibrator IS loaded but its batch outputs collapse to fewer than
+# _MIN_UNIQUE_P_UP_BINS unique values (the 2026-04-28 pathology — 27 tickers
+# all at p_up=0.5119), the skip is suppressed and the batch falls through to
+# the linear heuristic. Test count distinguishes:
+#   * collapse case   → fallback engages, values rewritten
+#   * small batch     → fallback suppressed (would false-engage on 4-ticker
+#                       holiday batches with calibrator plateau)
+#   * healthy batch   → fallback clears, calibrator output preserved
+
+
+def _collapsed_predictions(n: int = 27, p_up_value: float = 0.5119):
+    """Reproduce the 2026-04-28 pathology: N tickers all assigned the same
+    calibrator-output p_up value. predicted_alpha varies (so the linear
+    fallback CAN produce variance), but per-ticker p_up has collapsed."""
+    preds = []
+    for i in range(n):
+        # Vary predicted_alpha symmetrically so the linear fallback's
+        # cross-sectional rescale produces real variance — that's the
+        # whole point of the fallback engaging.
+        alpha = (i - n / 2) * 0.001  # spans roughly [-0.013, +0.013]
+        preds.append({
+            "ticker": f"T{i:02d}",
+            "predicted_alpha": alpha,
+            "p_up": p_up_value,
+            "p_down": 1.0 - p_up_value,
+            "predicted_direction": "UP",
+            "prediction_confidence": p_up_value,
+        })
+    return preds
+
+
+def test_variance_fallback_engages_on_collapse(caplog):
+    """Calibrator loaded but batch p_up collapses to 1 unique bin →
+    variance fallback engages, linear heuristic rewrites values, loud
+    error log fires."""
+    import logging
+    from inference.stages.run_inference import _rescale_cross_sectional
+
+    preds = _collapsed_predictions(n=27, p_up_value=0.5119)
+    ctx = _StubCtx(calibrator=_StubCalibrator(), predictions=preds)
+
+    with caplog.at_level(logging.ERROR):
+        _rescale_cross_sectional(ctx)
+
+    # Loud error log fires — operator must see this.
+    assert any(
+        "VARIANCE FALLBACK ENGAGED" in rec.message
+        for rec in caplog.records
+    ), (
+        "Expected loud ERROR log when calibrator collapsed to 1 unique bin "
+        f"across 27 tickers. Captured logs: {[r.message for r in caplog.records]}"
+    )
+
+    # Values must have been rewritten — p_up across the batch should now
+    # span a range, not be stuck at 0.5119.
+    p_ups = sorted({p["p_up"] for p in ctx.predictions})
+    assert len(p_ups) > 1, (
+        f"Variance fallback engaged but batch p_up still has {len(p_ups)} "
+        f"unique value(s) — linear heuristic didn't fire. p_ups={p_ups}"
+    )
+    # Linear heuristic uses META_ALPHA_CLIP=0.02 floor; with alphas spanning
+    # [-0.013, +0.013] meta_clip=0.02 → p_up ≈ 0.5 + a/0.04. Min/max should
+    # span ~[0.175, 0.825].
+    assert min(p_ups) < 0.4 and max(p_ups) > 0.6, (
+        f"Linear fallback should produce p_up spanning [<0.4, >0.6], got "
+        f"[{min(p_ups):.4f}, {max(p_ups):.4f}]"
+    )
+
+
+def test_variance_fallback_suppressed_for_small_batch():
+    """Small batches (N < 5) skip the variance gate entirely. A 4-ticker
+    holiday batch where calibrator outputs naturally cluster in 1-2
+    isotonic plateaus must NOT fire the fallback — that would be a
+    false-engage."""
+    from inference.stages.run_inference import _rescale_cross_sectional
+
+    # 4 tickers, 1 unique bin — would trip the gate if not for the
+    # _MIN_BATCH_SIZE_FOR_VARIANCE_GATE=5 floor.
+    preds = _collapsed_predictions(n=4, p_up_value=0.5119)
+    ctx = _StubCtx(calibrator=_StubCalibrator(), predictions=preds)
+    original = [dict(p) for p in ctx.predictions]
+
+    _rescale_cross_sectional(ctx)
+
+    # No rewrite — calibrator's collapsed output is preserved untouched.
+    assert ctx.predictions == original, (
+        "Variance gate should be suppressed for small batches (N < 5). "
+        "A 4-ticker batch with 1 unique p_up bin must NOT trigger the "
+        "linear-fallback rewrite — that would clobber calibrator output "
+        "on holiday batches where small N + isotonic plateau is normal."
+    )
+
+
+def test_variance_fallback_clears_for_healthy_batch():
+    """Calibrator loaded with healthy variance (>=3 unique bins) →
+    fallback clears, existing skip-rescale behavior preserved."""
+    from inference.stages.run_inference import _rescale_cross_sectional
+
+    # 27 tickers spanning 5 distinct p_up bins — comfortably above
+    # _MIN_UNIQUE_P_UP_BINS=3.
+    p_up_values = [0.45, 0.48, 0.51, 0.55, 0.62]
+    preds = []
+    for i in range(27):
+        p_up = p_up_values[i % len(p_up_values)]
+        preds.append({
+            "ticker": f"T{i:02d}",
+            "predicted_alpha": (p_up - 0.5) * 0.04,
+            "p_up": p_up,
+            "p_down": 1.0 - p_up,
+            "predicted_direction": "UP" if p_up >= 0.5 else "DOWN",
+            "prediction_confidence": max(p_up, 1.0 - p_up),
+        })
+    ctx = _StubCtx(calibrator=_StubCalibrator(), predictions=preds)
+    original = [dict(p) for p in ctx.predictions]
+
+    _rescale_cross_sectional(ctx)
+
+    # Healthy batch — calibrator output preserved, no rewrite.
+    assert ctx.predictions == original, (
+        "Healthy batch (5 unique p_up bins, N=27) should skip "
+        "cross-sectional rescaling and preserve calibrator output. "
+        f"Got {len({p['p_up'] for p in ctx.predictions})} unique "
+        f"p_up bins post-call."
+    )
