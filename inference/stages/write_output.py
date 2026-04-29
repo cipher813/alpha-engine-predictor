@@ -291,7 +291,7 @@ def _build_predictor_email(
     is_meta       = metrics.get("inference_mode") == "meta" or "meta" in model_version.lower()
 
     # Single list sorted by combined_rank (best first)
-    sorted_preds = sorted(predictions, key=lambda p: p.get("combined_rank") or p.get("mse_rank") or 999)
+    sorted_preds = sorted(predictions, key=lambda p: p.get("combined_rank") or 999)
 
     # Counts for subject line
     ups   = [p for p in predictions if p.get("predicted_direction") == "UP"]
@@ -356,10 +356,6 @@ def _build_predictor_email(
     TD = 'style="padding:4px 8px; border:1px solid #ddd;"'
     TDR = 'style="padding:4px 8px; border:1px solid #ddd; text-align:right;"'
     TABLE = 'style="border-collapse:collapse; width:100%; font-family:monospace; font-size:12px;"'
-
-    def _rank_str(p: dict, key: str = "model_rank") -> str:
-        r = p.get(key)
-        return f"{r}" if r is not None else "—"
 
     def _dir_badge(p: dict) -> str:
         d = p.get("predicted_direction", "")

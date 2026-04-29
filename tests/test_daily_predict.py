@@ -32,8 +32,7 @@ class TestBuildPredictorEmail:
                 "predicted_alpha": 0.05 - i * 0.025,
                 "predicted_direction": directions[i % 3],
                 "prediction_confidence": 0.7 + i * 0.05,
-                "mse_rank": i + 1,
-                "model_rank": n - i,
+                "combined_rank": float(i + 1),
                 "watchlist_source": "tracked" if i % 2 == 0 else "buy_candidate",
             })
         return preds
@@ -115,8 +114,6 @@ class TestBuildPredictorEmail:
                 "predicted_alpha": 0.05,
                 "predicted_direction": "UP",
                 "prediction_confidence": 0.70,
-                "mse_rank": 1,
-                "model_rank": 1,
                 "combined_rank": 1.0,
                 "watchlist_source": "tracked",
             },
@@ -125,8 +122,6 @@ class TestBuildPredictorEmail:
                 "predicted_alpha": -0.05,
                 "predicted_direction": "DOWN",
                 "prediction_confidence": 0.95,
-                "mse_rank": 2,
-                "model_rank": 2,
                 "combined_rank": 2.0,  # > n_preds/2 (2 > 1)
                 "watchlist_source": "tracked",
             },
@@ -186,8 +181,6 @@ class TestBuildPredictorEmail:
             "predicted_alpha": 0.02,
             "predicted_direction": "UP",
             "prediction_confidence": 0.60,
-            "mse_rank": 1,
-            "model_rank": 1,
             "combined_rank": 1.0,
             "watchlist_source": "tracked",
         }]
