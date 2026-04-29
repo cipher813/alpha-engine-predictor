@@ -106,15 +106,10 @@ def run(ctx: PipelineContext) -> None:
 
     log.info("Inference complete: %d predictions  %d skipped", len(ctx.predictions), ctx.n_skipped)
 
-    # Compute combined_rank
-    for p in ctx.predictions:
-        mse_r = p.get("mse_rank")
-        lr_r = p.get("model_rank")
-        if mse_r is not None and lr_r is not None:
-            p["combined_rank"] = round((mse_r + lr_r) / 2, 1)
-
-    # Sort by combined_rank (ascending = best first), fall back to mse_rank
-    ctx.predictions.sort(key=lambda p: p.get("combined_rank") or p.get("mse_rank") or 999)
+    # combined_rank is assigned per-prediction inside _run_meta_inference
+    # (sorted by predicted_alpha desc, then 1..N). Re-sort here so the
+    # outer caller sees the same best-first order.
+    ctx.predictions.sort(key=lambda p: p.get("combined_rank") or 999)
 
     # Feature store writes removed — standalone compute.py handles this now.
     # See feature_store/compute.py and alpha-engine-data-feature-store-260402.md
@@ -375,8 +370,6 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
             "p_up": round(p_up, 4),
             "p_flat": 0.0,
             "p_down": round(p_down, 4),
-            "mse_rank": None,
-            "model_rank": None,
             "combined_rank": None,
             # Meta-model detail (new fields, additive)
             "research_calibrator_prob": round(research_cal_prob, 4),
