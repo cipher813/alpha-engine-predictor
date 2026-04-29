@@ -36,6 +36,17 @@
         "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-saturday-pipeline",
         "arn:aws:states:us-east-1:711398986525:stateMachine:alpha-engine-weekday-pipeline"
       ]
+    },
+    {
+      "Sid": "PutAlphaEngineMetrics",
+      "Effect": "Allow",
+      "Action": "cloudwatch:PutMetricData",
+      "Resource": "*",
+      "Condition": {
+        "StringLike": {
+          "cloudwatch:namespace": "AlphaEngine/*"
+        }
+      }
     }
   ]
 }
