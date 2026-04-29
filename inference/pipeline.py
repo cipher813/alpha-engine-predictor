@@ -86,6 +86,7 @@ class PipelineContext:
     # ── Results (set by run_inference) ───────────────────────────────────────
     predictions: list = field(default_factory=list)
     n_skipped: int = 0
+    n_nan_imputed_tickers: int = 0
     store_rows: list = field(default_factory=list)  # feature store rows
 
     # ── GBM feature columns (set by run_inference) ───────────────────────────
