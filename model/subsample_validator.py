@@ -34,9 +34,14 @@ clear to justify its complexity):
   - **Volatility**: realized 20-day volatility passthrough — directly
     correlates with future absolute return.
 
-The research calibrator gate is tracked as a separate follow-up
-(different training pipeline; ``model/research_calibrator.py`` fits
-on score_performance, not the X_mom/X_vol matrices).
+The research calibrator uses a different gate shape (time-based
+holdout instead of NaN-mask subsample) — see
+``validate_research_calibrator`` below. Reason: the calibrator's input
+is a scalar ``score`` that LLM-derives from news/fundamentals, so it
+doesn't have a "short-history" equivalent the way OHLCV-rolling-window
+features do. The right question for that component is whether the
+fitted calibrator beats the ``score / 100`` passthrough on a held-out
+slice.
 """
 
 from __future__ import annotations
@@ -149,6 +154,116 @@ def volatility_baseline_predict(
         feature_names,
     )
     return np.zeros(X_vol_raw.shape[0], dtype=np.float64)
+
+
+def research_calibrator_baseline_predict(scores: np.ndarray) -> np.ndarray:
+    """Named baseline for the research calibrator: ``score / 100``
+    passthrough. This is the same fallback ``research_features.py:111``
+    uses when the calibrator isn't fitted, so the gate asks "does the
+    fitted calibrator beat the smooth passthrough the inference path
+    already knows how to use when the calibrator is absent?".
+    """
+    return np.asarray(scores, dtype=np.float64) / 100.0
+
+
+def validate_research_calibrator(
+    scores: np.ndarray,
+    beat_spy: np.ndarray,
+    score_dates: np.ndarray,
+    holdout_frac: float = 0.2,
+    min_n: int = MIN_SUBSAMPLE_SIZE,
+) -> ComponentValidation:
+    """Time-based holdout IC gate for the research calibrator.
+
+    Unlike the L1 GBM gates (which use a NaN-mask subsample to mimic
+    short-history tickers), the research calibrator's input is a scalar
+    ``score`` that doesn't have a short-history equivalent — LLM scoring
+    operates on news/fundamentals regardless of OHLCV history. The
+    relevant gate is whether the fitted calibrator beats the passthrough
+    baseline on a held-out slice.
+
+    Parameters
+    ----------
+    scores
+        1-D array of historical research scores from score_performance.
+    beat_spy
+        1-D array of binary outcomes (beat_spy_10d, 1=hit / 0=miss).
+    score_dates
+        1-D ``datetime64`` array same length as scores; used to sort
+        rows for the time-based holdout.
+    holdout_frac
+        Fraction of rows (sorted by date) to hold out as the gate's
+        test slice. Default 0.2 = last 20% by date.
+    min_n
+        Skip the gate if either fit-set or holdout-set is too small to
+        produce meaningful IC.
+
+    Returns
+    -------
+    ComponentValidation. ``passed=True`` when the held-out calibrator
+    IC >= held-out baseline IC, OR when the gate was skipped for size.
+    The production ``prod_calibrator`` fitted on FULL data is unaffected
+    by this gate — the gate only validates that the calibrator approach
+    (Platt-bucket lookup) beats the score-passthrough baseline.
+    """
+    from model.research_calibrator import ResearchCalibrator
+
+    scores = np.asarray(scores, dtype=np.float64).ravel()
+    beat_spy = np.asarray(beat_spy, dtype=np.int32).ravel()
+    score_dates = np.asarray(score_dates).ravel()
+
+    if not (scores.shape == beat_spy.shape == score_dates.shape):
+        raise ValueError(
+            f"validate_research_calibrator: shape mismatch — "
+            f"scores={scores.shape}, beat_spy={beat_spy.shape}, "
+            f"dates={score_dates.shape}"
+        )
+
+    n_total = scores.size
+    if n_total < 2 * min_n:
+        return ComponentValidation(
+            component="research_calibrator", n=n_total,
+            component_ic=0.0, baseline_ic=0.0, passed=True,
+            skip_reason=(
+                f"total {n_total} rows < 2*min_n={2*min_n} (need at "
+                f"least min_n in each of fit + holdout)"
+            ),
+        )
+
+    sort_idx = np.argsort(score_dates, kind="stable")
+    scores_s = scores[sort_idx]
+    beat_s = beat_spy[sort_idx]
+    n_holdout = max(int(round(n_total * holdout_frac)), min_n)
+    n_holdout = min(n_holdout, n_total - min_n)
+    n_fit = n_total - n_holdout
+
+    fit_scores = scores_s[:n_fit]
+    fit_beat = beat_s[:n_fit]
+    test_scores = scores_s[n_fit:]
+    test_beat = beat_s[n_fit:]
+
+    gate_calibrator = ResearchCalibrator()
+    gate_calibrator.fit(fit_scores, fit_beat)
+    if not gate_calibrator.is_fitted:
+        return ComponentValidation(
+            component="research_calibrator", n=n_total,
+            component_ic=0.0, baseline_ic=0.0, passed=True,
+            skip_reason=(
+                f"gate calibrator failed to fit on {n_fit} rows "
+                "(insufficient bucket coverage)"
+            ),
+        )
+
+    component_preds = gate_calibrator.predict_batch(test_scores)
+    baseline_preds = research_calibrator_baseline_predict(test_scores)
+
+    component_ic = _safe_pearson_ic(component_preds, test_beat.astype(np.float64))
+    baseline_ic = _safe_pearson_ic(baseline_preds, test_beat.astype(np.float64))
+    passed = component_ic >= baseline_ic
+    return ComponentValidation(
+        component="research_calibrator", n=int(test_beat.size),
+        component_ic=component_ic, baseline_ic=baseline_ic, passed=passed,
+    )
 
 
 def validate_component(

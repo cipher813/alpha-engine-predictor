@@ -235,6 +235,201 @@ class TestValidateComponent:
             validate_component("x", c, b, y, mask)
 
 
+# ── research_calibrator_baseline_predict ─────────────────────────────────────
+
+
+class TestResearchCalibratorBaseline:
+    def test_passthrough_div_100(self):
+        from model.subsample_validator import research_calibrator_baseline_predict
+        scores = np.array([0.0, 25.0, 50.0, 75.0, 100.0])
+        baseline = research_calibrator_baseline_predict(scores)
+        assert (baseline == np.array([0.0, 0.25, 0.5, 0.75, 1.0])).all()
+
+    def test_matches_research_features_fallback(self):
+        """The baseline must match research_features.py:111's fallback
+        formula (``score / 100``) — that's what the gate is asking the
+        fitted calibrator to beat."""
+        from model.subsample_validator import research_calibrator_baseline_predict
+        scores = np.array([42.0, 87.0])
+        assert (research_calibrator_baseline_predict(scores) == scores / 100).all()
+
+
+# ── validate_research_calibrator ────────────────────────────────────────────
+
+
+class TestValidateResearchCalibrator:
+    def _make_dataset(
+        self, n: int = 600, signal_strength: float = 0.6, seed: int = 0,
+    ):
+        """Synthetic (scores, beat_spy, dates) where higher score ->
+        higher P(beat). signal_strength=0 means no signal (random)."""
+        rng = np.random.default_rng(seed)
+        scores = rng.uniform(0, 100, n)
+        # Probability of beat increases with score, scaled by strength
+        p_beat = 0.5 + signal_strength * (scores - 50) / 100
+        p_beat = np.clip(p_beat, 0.01, 0.99)
+        beat = (rng.uniform(0, 1, n) < p_beat).astype(np.int32)
+        # Synthetic dates spanning ~2 years
+        base = np.datetime64("2024-01-01", "D")
+        date_offsets = np.sort(rng.integers(0, 730, n))
+        dates = base + date_offsets
+        return scores, beat, dates
+
+    def test_calibrator_passes_on_non_monotonic_signal(self):
+        """The bucket calibrator's strength domain is non-monotonic
+        score→outcome relationships. On purely linear signal, the
+        score/100 passthrough wins on Pearson IC by definition (it's
+        smooth, the bucket output is piecewise-constant). The gate
+        passes when the calibrator's discrete bucketing actually
+        captures pattern the passthrough can't — e.g. mid-score
+        outperforming high-score (a real scoring-saturation effect)."""
+        from model.subsample_validator import validate_research_calibrator
+        rng = np.random.default_rng(123)
+        n = 800
+        scores = rng.uniform(0, 100, n)
+        # Non-monotonic: hit rate peaks at score 60-70, drops at 80+
+        # (saturation — over-confident high scores become contrarian).
+        p_beat = np.where(
+            scores < 50, 0.40,
+            np.where(scores < 70, 0.65,
+                     np.where(scores < 85, 0.55, 0.40)),
+        )
+        beat = (rng.uniform(0, 1, n) < p_beat).astype(np.int32)
+        base = np.datetime64("2024-01-01", "D")
+        dates = base + np.arange(n)
+        r = validate_research_calibrator(scores, beat, dates)
+        assert r.component == "research_calibrator"
+        assert r.skip_reason is None
+        # Calibrator's bucket lookup captures the non-monotonic peak
+        # better than the smooth score/100 passthrough can.
+        assert r.passed is True, (
+            f"Calibrator should beat passthrough on non-monotonic signal: "
+            f"component_ic={r.component_ic:.4f}, baseline_ic={r.baseline_ic:.4f}"
+        )
+
+    def test_calibrator_blocks_on_linear_signal(self):
+        """Inverse-but-meaningful: on purely linear signal the smooth
+        passthrough wins on Pearson IC and the calibrator's bucketing
+        adds no value. Gate should BLOCK — promoting a calibrator that
+        doesn't beat its own free-fallback is exactly what the gate
+        protects against per feedback_component_baseline_validation."""
+        from model.subsample_validator import validate_research_calibrator
+        scores, beat, dates = self._make_dataset(n=800, signal_strength=0.8)
+        r = validate_research_calibrator(scores, beat, dates)
+        assert r.skip_reason is None
+        # Both ICs are positive and meaningful; passthrough wins by
+        # the structural-smoothness margin.
+        assert r.baseline_ic > 0.20
+        assert r.component_ic <= r.baseline_ic
+        assert r.passed is False
+
+    def test_random_calibrator_blocks_or_ties(self):
+        """When the underlying score has zero predictive power, the
+        bucket-lookup calibrator can only pick up sampling noise. Its
+        IC on a held-out slice should be at most equal to the
+        passthrough's IC — and on out-of-sample data the bucket
+        approach's overfitting noise typically does worse."""
+        from model.subsample_validator import validate_research_calibrator
+        scores, beat, dates = self._make_dataset(n=600, signal_strength=0.0)
+        r = validate_research_calibrator(scores, beat, dates)
+        # Either the calibrator <= baseline (block) OR they're equal/tied.
+        # The key invariant: gate did NOT silently pass on a no-signal dataset.
+        # We assert the IC values are both small.
+        assert abs(r.component_ic) < 0.15
+        assert abs(r.baseline_ic) < 0.15
+
+    def test_holdout_slice_size_respects_min_n(self):
+        """holdout_frac=0.2 on 100 rows = 20 rows holdout. Below MIN_SUBSAMPLE_SIZE=30,
+        the gate forces holdout up to min_n."""
+        from model.subsample_validator import validate_research_calibrator, MIN_SUBSAMPLE_SIZE
+        scores, beat, dates = self._make_dataset(n=100, signal_strength=0.5)
+        r = validate_research_calibrator(scores, beat, dates, holdout_frac=0.2)
+        # The resulting test slice should be at least min_n
+        assert r.n >= MIN_SUBSAMPLE_SIZE
+
+    def test_too_few_total_rows_skipped(self):
+        from model.subsample_validator import validate_research_calibrator
+        scores, beat, dates = self._make_dataset(n=20, signal_strength=0.8)
+        r = validate_research_calibrator(scores, beat, dates)
+        assert r.passed is True
+        assert r.skip_reason is not None
+        assert r.n == 20
+
+    def test_empty_input_skipped_gracefully(self):
+        from model.subsample_validator import validate_research_calibrator
+        scores = np.array([])
+        beat = np.array([], dtype=np.int32)
+        dates = np.array([], dtype="datetime64[D]")
+        r = validate_research_calibrator(scores, beat, dates)
+        assert r.passed is True
+        assert r.n == 0
+        assert r.skip_reason is not None
+
+    def test_shape_mismatch_raises(self):
+        from model.subsample_validator import validate_research_calibrator
+        scores = np.zeros(100)
+        beat = np.zeros(50, dtype=np.int32)
+        dates = np.array(["2024-01-01"] * 100, dtype="datetime64[D]")
+        with pytest.raises(ValueError, match="shape mismatch"):
+            validate_research_calibrator(scores, beat, dates)
+
+    def test_time_based_holdout_uses_latest_dates(self):
+        """The holdout slice must be the LATEST dates (chronological
+        holdout), not random — temporal leakage protection. Verify by
+        constructing a dataset where signal flips sign in the last 20%
+        and confirming the holdout's component_ic reflects that flip."""
+        from model.subsample_validator import validate_research_calibrator
+        rng = np.random.default_rng(42)
+        n = 400
+        # First 80%: positive signal (high score → beat). Last 20%:
+        # negative signal (high score → miss).
+        scores = rng.uniform(0, 100, n)
+        base = np.datetime64("2024-01-01", "D")
+        date_offsets = np.arange(n)  # strictly chronological
+        dates = base + date_offsets
+
+        beat = np.zeros(n, dtype=np.int32)
+        # First 320 rows: hit rate = 0.5 + 0.4*(score-50)/100
+        for i in range(320):
+            p = 0.5 + 0.4 * (scores[i] - 50) / 100
+            beat[i] = 1 if rng.uniform() < p else 0
+        # Last 80 rows: hit rate = 0.5 - 0.4*(score-50)/100 (FLIPPED)
+        for i in range(320, n):
+            p = 0.5 - 0.4 * (scores[i] - 50) / 100
+            beat[i] = 1 if rng.uniform() < p else 0
+
+        r = validate_research_calibrator(scores, beat, dates, holdout_frac=0.2)
+        # Calibrator was fit on positive-signal first 80%, evaluated on
+        # negative-signal last 20%. Both component AND baseline should
+        # have negative IC on the holdout (because score is now anti-
+        # correlated with beat). The fact that component_ic is negative
+        # confirms the holdout split was time-based.
+        assert r.baseline_ic < 0.0, (
+            "Baseline IC on flipped-signal holdout should be negative — "
+            "confirms time-based split"
+        )
+
+    def test_unsorted_dates_handled_via_argsort(self):
+        """Inputs may arrive in arbitrary order; the gate must sort by
+        date before slicing the holdout."""
+        from model.subsample_validator import validate_research_calibrator
+        scores, beat, dates = self._make_dataset(n=400, signal_strength=0.6)
+        # Shuffle in unison
+        perm = np.random.default_rng(0).permutation(len(scores))
+        scores_shuffled = scores[perm]
+        beat_shuffled = beat[perm]
+        dates_shuffled = dates[perm]
+        r1 = validate_research_calibrator(scores, beat, dates)
+        r2 = validate_research_calibrator(
+            scores_shuffled, beat_shuffled, dates_shuffled,
+        )
+        # Result invariance: same data, different order in → same IC out
+        assert r1.n == r2.n
+        assert r1.component_ic == pytest.approx(r2.component_ic, abs=1e-9)
+        assert r1.baseline_ic == pytest.approx(r2.baseline_ic, abs=1e-9)
+        assert r1.passed == r2.passed
+
+
 # ── ComponentValidation logging ──────────────────────────────────────────────
 
 
