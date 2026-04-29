@@ -39,6 +39,41 @@ def _safe_get_numeric(latest: pd.Series, key: str, default: float) -> float:
         return float(default)
 
 
+def _emit_nan_feature_tickers_metric(count: int) -> None:
+    """Emit ``AlphaEngine/Predictor/nan_feature_tickers_count`` gauge.
+
+    Best-effort: CloudWatch errors WARN but never fail inference. The
+    counter itself is already in CloudWatch Logs (per-ticker WARN +
+    inference-complete summary), so a metric-emission failure leaves
+    a paper trail. Always emits — including value=0 — so alarm
+    baselines are continuous rather than gappy.
+
+    Parallel shape to executor's ``_emit_unscored_count_metric`` and
+    ``_emit_admission_refused_metric``. Same namespace
+    (``AlphaEngine/Predictor``) used by the existing executor-side
+    coverage-gap gauge.
+    """
+    try:
+        import boto3
+        cw = boto3.client("cloudwatch")
+        cw.put_metric_data(
+            Namespace="AlphaEngine/Predictor",
+            MetricData=[{
+                "MetricName": "nan_feature_tickers_count",
+                "Value": float(count),
+                "Unit": "Count",
+            }],
+        )
+    except Exception as exc:  # noqa: BLE001 — observability, must never block inference
+        log.warning(
+            "CloudWatch nan_feature_tickers_count metric failed: %s. "
+            "Counter still surfaces via the inference-complete summary log "
+            "and per-ticker WARN; investigate the IAM grant if this fires "
+            "every run.",
+            exc,
+        )
+
+
 def _sanitize_meta_features(features: dict) -> tuple[dict, list[str]]:
     """Replace NaN values in a meta-features dict with 0.0 (neutral default
     matching ``predict_single``'s ``.get(f, 0.0)`` for missing keys).
@@ -458,6 +493,10 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
         "%d tickers had NaN meta-features (neutral-imputed)",
         len(ctx.predictions), ctx.n_skipped, ctx.n_nan_imputed_tickers,
     )
+    # Always emit the gauge — including value=0 — so alarm baselines
+    # are continuous. CloudWatch missing-data is harder to alarm on
+    # than a steady 0 stream.
+    _emit_nan_feature_tickers_metric(ctx.n_nan_imputed_tickers)
 
 
 _MIN_UNIQUE_P_UP_BINS = 3
