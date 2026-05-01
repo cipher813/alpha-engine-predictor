@@ -43,10 +43,40 @@ import os
 import sys
 from pathlib import Path
 
-# Load secrets from SSM Parameter Store (must run before any os.environ.get)
+# Load secrets from SSM Parameter Store (must run before any os.environ.get
+# AND before setup_logging — flow-doctor.yaml's ${FLOW_DOCTOR_GITHUB_TOKEN}
+# resolves at flow_doctor.init() time inside setup_logging).
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from ssm_secrets import load_secrets
 load_secrets()
+
+# Structured logging + flow-doctor singleton via alpha-engine-lib (shared
+# pattern across all 5 entrypoints; see executor/main.py for reference).
+# When FLOW_DOCTOR_ENABLED=1, attaches a FlowDoctorHandler at ERROR so
+# every log.error() call routes through flow-doctor's dispatch (email +
+# optional GitHub issue) without explicit fd.report() plumbing.
+#
+# Path resolution: LAMBDA_TASK_ROOT (=/var/task in the Lambda image,
+# where Dockerfile COPYs flow-doctor.yaml) takes precedence; falls back
+# to two-dirs-up from this file for local dev (inference/handler.py →
+# repo root). Mirrors alpha-engine-research/lambda/handler.py.
+#
+# exclude_patterns starts empty by deliberate convention: add patterns
+# only after observing real ERROR-level noise from a Lambda invocation.
+from alpha_engine_lib.logging import setup_logging
+_FLOW_DOCTOR_EXCLUDE_PATTERNS: list[str] = []
+_FLOW_DOCTOR_YAML = os.path.join(
+    os.environ.get(
+        "LAMBDA_TASK_ROOT",
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    ),
+    "flow-doctor.yaml",
+)
+setup_logging(
+    "predictor",
+    flow_doctor_yaml=_FLOW_DOCTOR_YAML,
+    exclude_patterns=_FLOW_DOCTOR_EXCLUDE_PATTERNS,
+)
 
 log = logging.getLogger(__name__)
 
@@ -66,21 +96,27 @@ def handler(event: dict, context) -> dict:
     """
     os.environ.setdefault("S3_BUCKET", "alpha-engine-research")
     os.environ.setdefault("XDG_CACHE_HOME", "/tmp")
-
-    # Structured logging + flow-doctor via alpha-engine-lib (shared with
-    # alpha-engine-data). Replaces the duplicated local log_config.py.
-    from alpha_engine_lib.logging import setup_logging
-    setup_logging(
-        "predictor",
-        flow_doctor_yaml=str(Path(__file__).parent.parent / "flow-doctor.yaml"),
-    )
+    # setup_logging already ran at module-top (see comment near the
+    # alpha_engine_lib.logging import). Apply the standard log level here.
     logging.getLogger().setLevel(logging.INFO)
 
     # Preflight — fail fast on env / connectivity / ArcticDB freshness
     # before loading models or touching inference. See PR #5 and
     # inference/preflight.py.
+    #
+    # Action-aware dispatch: drift-check is a Step Function gate that only
+    # needs env + image-SHA validation. Running the full preflight here
+    # (200s universe scan + 5 macro reads + model-weights check) caused
+    # the 2026-05-01 SF DeployDriftCheck timeout cascade. Other actions
+    # need the full preflight before doing real work.
     from inference.preflight import PredictorPreflight
-    PredictorPreflight(bucket=os.environ.get("S3_BUCKET", "alpha-engine-research")).run()
+    _bucket = os.environ.get("S3_BUCKET", "alpha-engine-research")
+    _action = event.get("action", "predict")
+    _pf = PredictorPreflight(bucket=_bucket)
+    if _action == "check_deploy_drift":
+        _pf.run_for_drift_gate()
+    else:
+        _pf.run()
 
     fd = None
 

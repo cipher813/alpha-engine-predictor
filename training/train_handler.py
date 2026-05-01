@@ -60,6 +60,27 @@ from ssm_secrets import load_secrets
 
 load_secrets()
 
+# Structured logging + flow-doctor singleton via alpha-engine-lib (shared
+# pattern across all 5 entrypoints; see executor/main.py for reference).
+# Module-top so import-time errors in numpy / lightgbm / catboost below
+# (heavy GBM imports) are also captured by flow-doctor's ERROR handler.
+# Training runs on EC2 spot (NOT Lambda) — no LAMBDA_TASK_ROOT, so the
+# yaml path resolves via two-dirs-up from this file (training/train_handler.py
+# → repo root, where flow-doctor-training.yaml lives).
+#
+# exclude_patterns starts empty by deliberate convention; add patterns
+# only after observing real ERROR-level noise during training runs.
+from alpha_engine_lib.logging import setup_logging
+_FLOW_DOCTOR_EXCLUDE_PATTERNS: list[str] = []
+_FLOW_DOCTOR_YAML = str(
+    Path(__file__).resolve().parent.parent / "flow-doctor-training.yaml"
+)
+setup_logging(
+    "predictor-training",
+    flow_doctor_yaml=_FLOW_DOCTOR_YAML,
+    exclude_patterns=_FLOW_DOCTOR_EXCLUDE_PATTERNS,
+)
+
 import numpy as np
 
 log = logging.getLogger(__name__)
@@ -652,16 +673,8 @@ def main(
     if date_str is None:
         date_str = datetime.now().strftime("%Y-%m-%d")
 
-    fd = None
-
-    # Structured logging + flow-doctor via alpha-engine-lib (same as
-    # inference handler). Training runs on EC2 spot which doesn't
-    # configure logging elsewhere, so this needs to happen at entry.
-    from alpha_engine_lib.logging import setup_logging
-    setup_logging(
-        "predictor-training",
-        flow_doctor_yaml=str(Path(__file__).parent.parent / "flow-doctor-training.yaml"),
-    )
+    # setup_logging already ran at module-top (see comment near the
+    # alpha_engine_lib.logging import). Apply standard log level here.
     logging.getLogger().setLevel(logging.INFO)
 
     # Preflight — fail fast on env / connectivity / ArcticDB staleness
