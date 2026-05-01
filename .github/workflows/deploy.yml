@@ -92,3 +92,10 @@ jobs:
             --function-name alpha-engine-predictor-inference \
             --query "Configuration.[LastModified,CodeSha256]" \
             --output text
+
+      - name: Append to system-wide deploy changelog
+        if: always()
+        uses: cipher813/alpha-engine-docs/.github/actions/append-changelog@main
+        with:
+          deploy_status: ${{ job.status == 'success' && 'success' || 'failure' }}
+          deploy_workflow: deploy.yml
