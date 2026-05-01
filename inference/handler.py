@@ -43,12 +43,9 @@ import os
 import sys
 from pathlib import Path
 
-# Load secrets from SSM Parameter Store (must run before any os.environ.get
-# AND before setup_logging — flow-doctor.yaml's ${FLOW_DOCTOR_GITHUB_TOKEN}
-# resolves at flow_doctor.init() time inside setup_logging).
+# Ensure the project root is on sys.path so sibling modules (ssm_secrets)
+# can be imported below. Cheap; safe at module-top.
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-from ssm_secrets import load_secrets
-load_secrets()
 
 # Structured logging + flow-doctor singleton via alpha-engine-lib (shared
 # pattern across all 5 entrypoints; see executor/main.py for reference).
@@ -63,6 +60,13 @@ load_secrets()
 #
 # exclude_patterns starts empty by deliberate convention: add patterns
 # only after observing real ERROR-level noise from a Lambda invocation.
+#
+# Why module-top is safe even though load_secrets is deferred below:
+# flow-doctor.yaml only references EMAIL_SENDER / EMAIL_RECIPIENTS /
+# GMAIL_APP_PASSWORD, all populated by Lambda's `--environment` block
+# (set by deploy.sh from .env) BEFORE the Python interpreter starts.
+# load_secrets() pulls separate SSM-backed secrets (e.g. ANTHROPIC_API_KEY)
+# that flow_doctor.init() does not consult.
 from alpha_engine_lib.logging import setup_logging
 _FLOW_DOCTOR_EXCLUDE_PATTERNS: list[str] = []
 _FLOW_DOCTOR_YAML = os.path.join(
@@ -80,6 +84,29 @@ setup_logging(
 
 log = logging.getLogger(__name__)
 
+# Expensive init is deferred to the first handler invocation to keep
+# Lambda's cold-start init phase under the 10-second hard timeout.
+# `load_secrets()` is an SSM round-trip (~1-2s) and the v72 canary
+# failure (statusCode=0, FunctionError= empty) most plausibly traced
+# to this plus the heavy LightGBM / CatBoost / scikit-learn module-top
+# imports tipping over the 10s init wall — same class as the
+# 2026-04-11 research-handler timeout that motivated this pattern.
+# Moving load_secrets to the handler body pays the same cost on the
+# first invocation but in the configurable 15-minute handler budget
+# instead of the rigid 10s init wall. Idempotent via the `_init_done` flag.
+# Mirrors alpha-engine-research/lambda/handler.py:_ensure_init.
+_init_done = False
+
+
+def _ensure_init() -> None:
+    """Run expensive init once, on the first handler invocation."""
+    global _init_done
+    if _init_done:
+        return
+    from ssm_secrets import load_secrets
+    load_secrets()
+    _init_done = True
+
 
 def handler(event: dict, context) -> dict:
     """
@@ -94,6 +121,10 @@ def handler(event: dict, context) -> dict:
                                  existing predictions/{date}.json. Used by the
                                  weekday Step Function's coverage-gap re-invoke.
     """
+    # Run the deferred SSM secrets fetch on the first invocation. Warm
+    # containers pay zero cost via the _init_done flag.
+    _ensure_init()
+
     os.environ.setdefault("S3_BUCKET", "alpha-engine-research")
     os.environ.setdefault("XDG_CACHE_HOME", "/tmp")
     # setup_logging already ran at module-top (see comment near the
