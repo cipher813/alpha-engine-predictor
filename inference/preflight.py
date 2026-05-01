@@ -93,6 +93,11 @@ class PredictorPreflight(BasePreflight):
     - ``macro/VIX``, ``macro/VIX3M``, ``macro/TNX``, ``macro/IRX`` fresh
       (same threshold). These feed regime and vol features; stale readings
       would silently corrupt every prediction in the batch.
+    - ``universe/*`` per-ticker freshness scan (≤5 days). Inference reads
+      per-ticker OHLCV from the universe library; the partial-write class
+      (2026-04-21 ASGN/MOH) leaves macro.SPY fresh while individual
+      tickers stall. Without the scan, predictions silently degrade for
+      the stalled tickers without any upstream signal.
     """
 
     def run(self) -> None:
@@ -116,6 +121,16 @@ class PredictorPreflight(BasePreflight):
         # signal — better to abort here and let the Step Function alarm fire.
         for symbol in ("SPY", "VIX", "VIX3M", "TNX", "IRX"):
             self.check_arcticdb_fresh("macro", symbol, max_stale_days=4)
+
+        # Per-ticker universe-freshness scan. Lambda timeout is generous
+        # enough to absorb the ~5-10s scan cost (15min ceiling for the
+        # full inference Lambda). Catches the partial-write class that
+        # macro/SPY's single-symbol check misses — same primitive that
+        # alpha-engine ExecutorPreflight uses (PR #123, 2026-04-30).
+        # 5d threshold is one day more permissive than macro to account
+        # for legitimate per-ticker lag (DST/cross-listing edge cases);
+        # backtester + executor use the same default for the same reason.
+        self.check_arcticdb_universe_fresh("universe", max_stale_days=5)
 
     # ── Deploy-drift check ───────────────────────────────────────────────────
 
