@@ -100,7 +100,35 @@ class PredictorPreflight(BasePreflight):
       the stalled tickers without any upstream signal.
     """
 
+    # Path of the producer-side universe-freshness receipt (written by
+    # alpha-engine-data/builders/daily_append.py after each successful
+    # MorningEnrich + EOD DataPhase1 run). Reading the receipt is O(1)
+    # vs the ~200s the per-ticker scan costs in-Lambda. See
+    # alpha-engine-data PR #119 for the producer side.
+    UNIVERSE_FRESHNESS_RECEIPT_KEY = "health/universe_freshness.json"
+    UNIVERSE_FRESHNESS_RECEIPT_MAX_AGE_DAYS = 1
+
+    def run_for_drift_gate(self) -> None:
+        """Minimal preflight for ``action=check_deploy_drift`` only.
+
+        The drift-check action is a Step Function gate — its job is to
+        compare the deployed image/SF/CF SHAs to ``origin/main`` HEAD,
+        nothing more. It has no business validating ticker freshness or
+        loading model weights. Running the full preflight here turned a
+        ~3s gate into a ~200s gate (the 2026-05-01 SF timeout cascade)
+        once PR #68 added the universe scan.
+
+        Strict subset of ``run()``:
+          - env vars
+          - S3 bucket reachability
+          - image-SHA drift
+        """
+        self.check_env_vars("AWS_REGION")
+        self.check_s3_bucket()
+        self.check_deploy_drift()
+
     def run(self) -> None:
+        """Full preflight for ``action=predict`` + ``action=check_coverage``."""
         self.check_env_vars("AWS_REGION")
         self.check_s3_bucket()
         self.check_deploy_drift()
@@ -122,15 +150,56 @@ class PredictorPreflight(BasePreflight):
         for symbol in ("SPY", "VIX", "VIX3M", "TNX", "IRX"):
             self.check_arcticdb_fresh("macro", symbol, max_stale_days=4)
 
-        # Per-ticker universe-freshness scan. Lambda timeout is generous
-        # enough to absorb the ~5-10s scan cost (15min ceiling for the
-        # full inference Lambda). Catches the partial-write class that
-        # macro/SPY's single-symbol check misses — same primitive that
-        # alpha-engine ExecutorPreflight uses (PR #123, 2026-04-30).
-        # 5d threshold is one day more permissive than macro to account
-        # for legitimate per-ticker lag (DST/cross-listing edge cases);
-        # backtester + executor use the same default for the same reason.
-        self.check_arcticdb_universe_fresh("universe", max_stale_days=5)
+        # Universe-freshness: read the producer-side receipt instead of
+        # rescanning ~900 tickers ourselves. alpha-engine-data's
+        # daily_append() writes this receipt after every successful
+        # MorningEnrich/EOD pass and hard-fails its own step on any stale
+        # symbol — strictly stronger guarantee than the scan-on-read
+        # pattern PR #68 used. See alpha-engine-data PR #119.
+        self.check_universe_freshness_receipt()
+
+    def check_universe_freshness_receipt(self) -> None:
+        """Read + validate the producer-side universe-freshness receipt.
+
+        Hard-fails when:
+          - the receipt is missing entirely (producer never ran or failed)
+          - the receipt is older than 1 day (stale producer)
+          - ``all_fresh`` is not True (defensive — the producer hard-fails
+            on stale symbols and only writes the receipt on success, so
+            ``all_fresh=false`` should never appear, but check anyway)
+        """
+        import json as _json
+        import boto3 as _boto3
+        from botocore.exceptions import ClientError as _ClientError
+
+        # Existence + age check via the lib primitive (single S3 head_object).
+        self.check_s3_key(
+            self.UNIVERSE_FRESHNESS_RECEIPT_KEY,
+            max_age_days=self.UNIVERSE_FRESHNESS_RECEIPT_MAX_AGE_DAYS,
+        )
+
+        # Body parse — confirm the producer reported all-fresh. Producer
+        # contract is "only written on success" so this is belt-and-braces.
+        try:
+            body = _boto3.client("s3").get_object(
+                Bucket=self.bucket,
+                Key=self.UNIVERSE_FRESHNESS_RECEIPT_KEY,
+            )["Body"].read()
+            payload = _json.loads(body)
+        except (_ClientError, _json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"Pre-flight: universe-freshness receipt at "
+                f"s3://{self.bucket}/{self.UNIVERSE_FRESHNESS_RECEIPT_KEY} "
+                f"could not be parsed: {exc}"
+            ) from exc
+
+        if payload.get("all_fresh") is not True:
+            raise RuntimeError(
+                f"Pre-flight: universe-freshness receipt reports "
+                f"all_fresh={payload.get('all_fresh')!r} — "
+                f"producer should have hard-failed before writing this. "
+                f"Receipt: {payload}"
+            )
 
     # ── Deploy-drift check ───────────────────────────────────────────────────
 

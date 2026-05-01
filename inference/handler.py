@@ -79,8 +79,20 @@ def handler(event: dict, context) -> dict:
     # Preflight — fail fast on env / connectivity / ArcticDB freshness
     # before loading models or touching inference. See PR #5 and
     # inference/preflight.py.
+    #
+    # Action-aware dispatch: drift-check is a Step Function gate that only
+    # needs env + image-SHA validation. Running the full preflight here
+    # (200s universe scan + 5 macro reads + model-weights check) caused
+    # the 2026-05-01 SF DeployDriftCheck timeout cascade. Other actions
+    # need the full preflight before doing real work.
     from inference.preflight import PredictorPreflight
-    PredictorPreflight(bucket=os.environ.get("S3_BUCKET", "alpha-engine-research")).run()
+    _bucket = os.environ.get("S3_BUCKET", "alpha-engine-research")
+    _action = event.get("action", "predict")
+    _pf = PredictorPreflight(bucket=_bucket)
+    if _action == "check_deploy_drift":
+        _pf.run_for_drift_gate()
+    else:
+        _pf.run()
 
     fd = None
 
