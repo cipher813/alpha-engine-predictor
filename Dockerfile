@@ -55,5 +55,14 @@ COPY inference/ inference/
 COPY training/ training/
 COPY store/ store/
 
+# flow-doctor.yaml at LAMBDA_TASK_ROOT is loaded by setup_logging() at
+# module-top of inference/handler.py. The path resolves via:
+#   os.environ.get("LAMBDA_TASK_ROOT", os.path.dirname(os.path.dirname(...)))
+# Mirrors alpha-engine-research / alpha-engine-data Dockerfiles.
+# (flow-doctor-training.yaml is NOT shipped here — training runs on EC2
+# spot, not Lambda; that yaml is read from the repo root via the local
+# checkout that spot_train.sh sets up.)
+COPY flow-doctor.yaml ./
+
 # Lambda handler entry point
 CMD ["inference.handler.handler"]
