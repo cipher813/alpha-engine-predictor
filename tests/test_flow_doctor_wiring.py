@@ -263,6 +263,55 @@ class TestEntrypointModuleTopWiring:
         )
 
 
+class TestColdStartDeferral:
+    """inference/handler.py must defer load_secrets() to first invocation
+    via _ensure_init(), keeping cold-start under Lambda's 10s init wall.
+
+    The pre-fixup state (PR #70 first commit) called load_secrets at
+    module-top, which combined with module-top setup_logging +
+    flow_doctor.init() + heavy LightGBM/CatBoost imports plausibly
+    pushed cold-start over the 10s init timeout — manifested as
+    canary version 72 returning statusCode=0, FunctionError= empty.
+    Mirrors alpha-engine-research/lambda/handler.py's pattern.
+    """
+
+    @staticmethod
+    def _strip_comments_and_docstrings(text: str) -> str:
+        import re
+        stripped = re.sub(r'"""[\s\S]*?"""', "", text)
+        stripped = re.sub(r"^\s*#.*$", "", stripped, flags=re.MULTILINE)
+        return stripped
+
+    def test_inference_handler_does_not_call_load_secrets_at_module_top(self):
+        text = (REPO_ROOT / "inference" / "handler.py").read_text()
+        body = self._strip_comments_and_docstrings(text)
+        ensure_def_idx = body.find("def _ensure_init(")
+        assert ensure_def_idx != -1, "_ensure_init() must be defined at module-top"
+        # Anything before _ensure_init's def must NOT call load_secrets()
+        # (the import is fine; only the call is expensive).
+        prefix = body[:ensure_def_idx]
+        assert "load_secrets()" not in prefix, (
+            "inference/handler.py calls load_secrets() at module-top; defer "
+            "it inside _ensure_init() to keep cold-start under Lambda's "
+            "10s init timeout"
+        )
+
+    def test_inference_handler_calls_ensure_init_first_in_handler(self):
+        text = (REPO_ROOT / "inference" / "handler.py").read_text()
+        handler_idx = text.find("def handler(")
+        assert handler_idx != -1
+        body = text[handler_idx:]
+        ensure_call_idx = body.find("_ensure_init()")
+        preflight_idx = body.find("PredictorPreflight(")
+        assert ensure_call_idx != -1, (
+            "handler() must call _ensure_init() to fire deferred SSM load"
+        )
+        assert ensure_call_idx < preflight_idx, (
+            "_ensure_init() must run before PredictorPreflight (preflight "
+            "uses ANTHROPIC_API_KEY etc. that load_secrets populates)"
+        )
+
+
 class TestDockerfileShipsFlowDoctorYaml:
     """The Lambda image must COPY flow-doctor.yaml into LAMBDA_TASK_ROOT.
 
