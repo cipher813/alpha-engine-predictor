@@ -10,9 +10,9 @@ Stacked meta-ensemble that predicts 5-day market-relative alpha — three Layer-
 
 | File | What it does |
 |---|---|
-| [`inference/handler.py`](inference/handler.py) | Daily inference Lambda handler — Saturday/weekday SF invokes this |
+| [`inference/handler.py`](inference/handler.py) | Daily inference Lambda handler — weekday SF invokes this |
 | [`inference/daily_predict.py`](inference/daily_predict.py) | Full prediction pipeline + morning briefing email |
-| [`training/train_handler.py`](training/train_handler.py) | Weekly training entry — EC2 spot from Saturday SF |
+| [`training/train_handler.py`](training/train_handler.py) | Weekly training entry — EC2 spot from weekly SF |
 | [`training/meta_trainer.py`](training/meta_trainer.py) | Trains the 3 L1 components + L2 Ridge with walk-forward validation |
 | [`scripts/dry_run_meta_training.py`](scripts/dry_run_meta_training.py) | Local dry-run harness for training |
 
@@ -66,7 +66,7 @@ Stacked meta-ensemble that predicts 5-day market-relative alpha — three Layer-
 
 | Mode | Where | Command |
 |---|---|---|
-| Production training | EC2 spot (c5.large) | Saturday Step Function |
+| Production training | EC2 spot (c5.large) | weekly Step Function |
 | Production inference | Lambda (daily 6:07 AM PT) | Weekday Step Function |
 | Local dry-run training | venv | `python scripts/dry_run_meta_training.py` |
 | Local dry-run inference | venv | `python inference/daily_predict.py --local --dry-run` |
