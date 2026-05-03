@@ -29,19 +29,14 @@ RUN dnf install -y libgomp && dnf clean all
 ARG GIT_SHA=unknown
 RUN echo "${GIT_SHA}" > /var/task/GIT_SHA.txt
 
-# Stage alpha-engine-lib from a local vendor directory. deploy.sh (or a
-# local sibling clone) populates vendor/alpha-engine-lib before the
-# Docker build. This mirrors the alpha-engine-config staging pattern —
-# both private repos reach the build context without the Dockerfile
-# needing a GitHub PAT or Docker build secret.
-COPY vendor/alpha-engine-lib /tmp/alpha-engine-lib
-
 # Copy and install Python requirements first for better layer caching.
+# alpha-engine-lib is installed from public git+https (lib was flipped
+# public 2026-05-03; previous versions vendored a local copy).
 COPY requirements-lambda.txt .
 
-RUN pip install --no-cache-dir /tmp/alpha-engine-lib[arcticdb,flow_doctor] && \
+RUN pip install --no-cache-dir "alpha-engine-lib[arcticdb,flow_doctor] @ git+https://github.com/cipher813/alpha-engine-lib@v0.2.4" && \
     pip install --no-cache-dir -r requirements-lambda.txt && \
-    rm -rf /root/.cache/pip /tmp/alpha-engine-lib
+    rm -rf /root/.cache/pip
 
 # Copy application code
 COPY retry.py .

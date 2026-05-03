@@ -248,11 +248,9 @@ ssh -A $SSH_OPTS -i "$KEY_FILE" ec2-user@"$PUBLIC_IP" \
 
 # ── Copy local config + .env to EC2 ──────────────────────────────────────────
 # .env carries non-secret runtime config (EMAIL_*, S3_BUCKET, etc.) consumed
-# by the training workload. The alpha-engine-lib PAT is NO LONGER sourced
-# from .env — the spot fetches it from SSM at pip-install time (see DEPS
-# block). Matches spot_data_weekly.sh + spot_backtest.sh. Removes the
-# "ALPHA_ENGINE_LIB_TOKEN typo on dispatcher breaks spots" class of failure
-# (hit 2026-04-20 on the backtester spot, same-shape risk here).
+# by the training workload. alpha-engine-lib was flipped public 2026-05-03,
+# so the spot installs it directly from git+https with no auth — earlier
+# versions of this script fetched a PAT from SSM /alpha-engine/lib-token.
 echo "==> Uploading config/predictor.yaml and .env..."
 scp $SSH_OPTS -i "$KEY_FILE" \
   "$REPO_ROOT/config/predictor.yaml" \
@@ -280,28 +278,14 @@ fi
 
 $PIP install --upgrade pip -q
 
-# Source .env for non-secret runtime vars. The alpha-engine-lib PAT comes
-# from SSM below — keeps the secret off the dispatcher + off the SCP wire.
+# Source .env for non-secret runtime vars.
 set -a
 source /home/ec2-user/predictor/.env
 set +a
 
-# Fetch alpha-engine-lib PAT from SSM Parameter Store. The spot's IAM
-# profile (alpha-engine-executor-profile) grants ssm:GetParameter on
-# /alpha-engine/*. Token is scoped to a local shell var, never exported,
-# unset immediately after git config. Matches spot_data_weekly.sh.
-LIB_TOKEN=$(aws ssm get-parameter --name /alpha-engine/lib-token --with-decryption --query 'Parameter.Value' --output text --region us-east-1 2>/dev/null || echo "")
-if [ -z "$LIB_TOKEN" ]; then
-  echo "ERROR: could not fetch /alpha-engine/lib-token from SSM — required for alpha-engine-lib pip install"
-  exit 1
-fi
-
-git config --global url."https://x-access-token:${LIB_TOKEN}@github.com/cipher813/alpha-engine-lib".insteadOf "https://github.com/cipher813/alpha-engine-lib"
-unset LIB_TOKEN
-
-# Filter out private packages (flow-doctor) that aren't on PyPI. alpha-engine-lib
-# is a git+https URL in requirements.txt and is resolved via the URL rewrite
-# above (private repo, no PyPI).
+# alpha-engine-lib is public; pip resolves the git+https URL in
+# requirements.txt without auth. Filter out private packages (flow-doctor)
+# that aren't on PyPI.
 grep -v '^flow-doctor' requirements.txt | $PIP install -q -r /dev/stdin
 echo "Dependencies installed."
 $PIP list --format=columns | grep -iE 'numpy|pandas|lightgbm|catboost|scikit-learn|scipy|shap|pyyaml|alpha-engine-lib' || true
