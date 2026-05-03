@@ -4,7 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Tests](https://img.shields.io/badge/tests-135_passing-brightgreen.svg)]()
 
-> Meta-model (4 specialized GBMs + ridge) predicts 5-day market-relative returns. Produces directional predictions (UP/FLAT/DOWN) with confidence scores, and provides a veto gate that blocks entry into declining positions.
+> Stacked meta-ensemble — three Layer-1 specialized models (LightGBM momentum + LightGBM volatility + research-score calibrator) feed a Layer-2 Ridge meta-learner alongside research-context and raw macro features — predicts 5-day market-relative returns. Produces directional predictions (UP/FLAT/DOWN) with confidence scores, and provides a veto gate that blocks entry into declining positions.
 
 **Part of the [Nous Ergon](https://nousergon.ai) autonomous trading system.**
 See the [system overview](https://github.com/cipher813/alpha-engine#readme) for how all modules connect, or the [full documentation index](https://github.com/cipher813/alpha-engine-docs#readme).
@@ -97,10 +97,12 @@ All tests run without network access or AWS credentials.
 ┌────────────────────────────────────────────────────┐
 │     Weekly Retraining (Saturday, Step Function)     │
 │  ArcticDB prices → feature_engineer → dataset      │
-│  → 4 specialized GBMs (momentum, mean-rev,         │
-│    volatility, regime) + ridge meta-learner         │
+│  → 3 Layer-1 models (LightGBM momentum + LightGBM  │
+│    volatility + research-score calibrator)         │
+│    + L2 Ridge meta-learner                          │
 │  → walk-forward validation (5 folds, IC gate)      │
-│  → promote weights to S3 if IC > 0.05              │
+│  → promote weights to S3 if IC + per-component     │
+│    subsample gates pass                             │
 │  → drift detection + retrain alerts                │
 └────────────────────────────────────────────────────┘
                           │
@@ -123,7 +125,7 @@ All tests run without network access or AWS credentials.
 └────────────────────────────────────────────────────┘
 ```
 
-**v3.0 Meta-Model** (deployed 2026-04-01): 4 specialized GBMs (momentum, mean-reversion, volatility, regime) combined via ridge meta-learner. Walk-forward validated across 5 folds. IC ~4x single GBM baseline.
+**v3.0 Meta-Model** (deployed 2026-04-01): 3 specialized Layer-1 models — LightGBM momentum, LightGBM volatility, and a research-score calibrator (currently a bucket lookup table with a GBM v1 upgrade on the roadmap) — feed a Layer-2 Ridge meta-learner alongside research-context and raw macro features. A 4th L1 model (RegimePredictor) was pruned 2026-04-16 after walk-forward validation showed 39.5% OOS accuracy below majority class; a Tier-1 regime model upgrade will return once it clears its named baseline. Walk-forward validated across 5 folds with per-component subsample gates.
 
 **Feedback Loop** (added 2026-04-07): Drift detection (feature z-scores, prediction clustering), ensemble mode evaluation, feature pruning, and retrain alerts (5 trigger conditions → email notification).
 
@@ -133,7 +135,7 @@ All tests run without network access or AWS credentials.
 
 ## How Training Works
 
-Training runs **weekly on Monday** via Lambda. The GBM learns to predict 5-day sector-relative returns from historical price data.
+Training runs **weekly on Saturday** via EC2 spot. The Layer-1 LightGBM components learn to predict 5-day sector-relative returns from historical price data; their out-of-fold predictions become inputs to the Layer-2 Ridge meta-learner.
 
 1. **Data**: Multi-year OHLCV parquets (one per ticker, plus SPY, VIX, sector ETFs, treasuries, gold, oil)
 2. **Features**: 36 rolling technical, macro-interaction, and alternative data indicators computed per row (252-row warmup for 52-week rolling windows)
@@ -150,14 +152,14 @@ An MLP (PyTorch) model is also available but not active. Activate by setting `mo
 
 ## How Inference Works
 
-Inference runs **daily on weekdays** at 6:15 AM PT. Although the GBM weights are frozen (weekly retrain), predictions change every day because the input features are recomputed from fresh price data.
+Inference runs **daily on weekdays** at 6:15 AM PT. Although the ensemble weights are frozen (weekly retrain), predictions change every day because the input features are recomputed from fresh price data.
 
 1. EventBridge fires daily at 6:15 AM PT on weekdays
 2. GBM weights loaded from S3 (same weights all week until Monday retrain)
 3. Watchlist read from latest population or `signals.json` — only Research-tracked tickers are predicted
 4. **Fresh OHLCV fetched via yfinance** (2-year window per ticker) — this is the new data each day
 5. **Features recomputed from scratch** — all 36 indicators (RSI, MACD, momentum, Bollinger bands, relative volume, etc.) shift daily as new price bars are incorporated
-6. GBM predicts continuous alpha → thresholded to UP/FLAT/DOWN + confidence
+6. L1 components predict → Layer-2 Ridge meta-learner combines into continuous alpha → thresholded to UP/FLAT/DOWN + confidence
 7. Results written to `predictor/predictions/{date}.json` and `latest.json`
 
 Tickers with insufficient history for long-window features are skipped. Per-ticker failures do not abort the run.
