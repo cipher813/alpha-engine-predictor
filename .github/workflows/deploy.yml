@@ -47,18 +47,6 @@ jobs:
           path: alpha-engine-config
           token: ${{ secrets.ALPHA_ENGINE_CONFIG_TOKEN }}
 
-      # alpha-engine-lib provides BasePreflight + setup_logging (shared
-      # across modules). deploy.sh stages it into ./vendor/ and the
-      # Dockerfile installs from the local path. Fine-grained PAT with
-      # read-only Contents access on alpha-engine-lib stored as
-      # ALPHA_ENGINE_LIB_TOKEN.
-      - name: Checkout alpha-engine-lib
-        uses: actions/checkout@v4
-        with:
-          repository: cipher813/alpha-engine-lib
-          path: alpha-engine-lib
-          token: ${{ secrets.ALPHA_ENGINE_LIB_TOKEN }}
-
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
@@ -77,12 +65,10 @@ jobs:
       - name: Deploy inference Lambda (alpha-engine-predictor-inference)
         working-directory: alpha-engine-predictor
         env:
-          # deploy.sh defaults both dirs to $(dirname $(pwd))/<repo>,
-          # which resolves to $GITHUB_WORKSPACE/<repo> — exactly where the
-          # checkout steps above placed them. Explicit exports make the
-          # dependencies readable.
+          # deploy.sh defaults CONFIG_REPO_DIR to $(dirname $(pwd))/
+          # alpha-engine-config — exactly where the checkout step above
+          # placed it.
           CONFIG_REPO_DIR: ${{ github.workspace }}/alpha-engine-config
-          LIB_REPO_DIR: ${{ github.workspace }}/alpha-engine-lib
         run: bash infrastructure/deploy.sh
 
       - name: Report deployed version

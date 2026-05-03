@@ -82,41 +82,14 @@ else
 fi
 
 # ── Stage alpha-engine-lib into vendor/ ──────────────────────────────────────
-# alpha-engine-lib is a private repo that provides BasePreflight +
-# setup_logging. The Dockerfile installs it via local pip path because
-# git+https inside Docker needs a PAT secret (more ceremony than this
-# staging approach). Pattern matches the config staging above.
-LIB_REPO_DIR="${LIB_REPO_DIR:-$(dirname "$REPO_ROOT")/alpha-engine-lib}"
-LIB_STAGED_FROM_REPO=0
-
-if [ -d "vendor/alpha-engine-lib" ]; then
-  echo "Using existing vendor/alpha-engine-lib (local dev workflow)"
-else
-  if [ -d "$LIB_REPO_DIR" ]; then
-    echo "Staging vendor/alpha-engine-lib from $LIB_REPO_DIR"
-    mkdir -p vendor
-    cp -R "$LIB_REPO_DIR" vendor/alpha-engine-lib
-    LIB_STAGED_FROM_REPO=1
-  else
-    echo "ERROR: alpha-engine-lib not found — tried:"
-    echo "  vendor/alpha-engine-lib (local dev)"
-    echo "  $LIB_REPO_DIR (sibling checkout)"
-    echo "Hint: clone cipher813/alpha-engine-lib as a sibling directory,"
-    echo "      or set LIB_REPO_DIR=/path/to/alpha-engine-lib"
-    exit 1
-  fi
-fi
+# alpha-engine-lib is installed inside the Dockerfile via pip from public
+# git+https (lib was flipped public 2026-05-03). No vendor staging needed.
 
 # Cleanup staged artifacts on exit so a failed deploy doesn't leave stray
 # files in a dev laptop checkout.
 cleanup_staged_artifacts() {
   if [ "$CONFIG_STAGED_FROM_REPO" = "1" ] && [ -f config/predictor.yaml ]; then
     rm -f config/predictor.yaml
-  fi
-  if [ "$LIB_STAGED_FROM_REPO" = "1" ] && [ -d vendor/alpha-engine-lib ]; then
-    rm -rf vendor/alpha-engine-lib
-    # Remove vendor/ if it's now empty (we created it).
-    rmdir vendor 2>/dev/null || true
   fi
 }
 trap cleanup_staged_artifacts EXIT
