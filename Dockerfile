@@ -17,8 +17,9 @@
 
 FROM public.ecr.aws/lambda/python:3.12
 
-# Install libgomp (OpenMP runtime required by LightGBM).
-RUN dnf install -y libgomp && dnf clean all
+# Install libgomp (OpenMP runtime required by LightGBM) and git (required by
+# the alpha-engine-lib install below, which uses pip's git+https:// scheme).
+RUN dnf install -y libgomp git && dnf clean all
 
 # Bake the source commit SHA into the image so PredictorPreflight can detect
 # deploy drift (deployed SHA vs origin/main HEAD). Passed by deploy.sh via
