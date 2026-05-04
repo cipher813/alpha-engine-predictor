@@ -746,6 +746,10 @@ def run(ctx: PipelineContext) -> None:
     """Write predictions, metrics, email, and health status."""
 
     # ── Build metrics ────────────────────────────────────────────────────────
+    # In meta mode, ``_load_gbm_meta`` reads predictor/weights/meta/manifest.json
+    # and returns {trained_date, promoted, meta_val_ic, momentum_test_ic, ...}.
+    # In legacy gbm mode, it reads predictor/weights/gbm_latest.txt.meta.json
+    # and returns the v2 single-model shape ({trained_date, n_train, test_ic}).
     gbm_meta = _load_gbm_meta(ctx)
 
     if ctx.inference_mode == "meta":
@@ -760,16 +764,24 @@ def run(ctx: PipelineContext) -> None:
         "model_type": ctx.model_type,
         "inference_mode": ctx.inference_mode,
         "last_trained": last_trained,
-        "training_samples": gbm_meta.get("n_train") if ctx.model_type == "gbm" else None,
+        "training_samples": gbm_meta.get("n_train") if ctx.model_type == "gbm" and ctx.inference_mode != "meta" else None,
         "val_loss": round(float(ctx.val_loss), 6) if isinstance(ctx.val_loss, (int, float)) else None,
-        "ic_30d": gbm_meta.get("test_ic") if ctx.model_type == "gbm" else None,
-        "ic_ir_30d": gbm_meta.get("ic_ir") if ctx.model_type == "gbm" else None,
+        "ic_30d": gbm_meta.get("test_ic") if ctx.model_type == "gbm" and ctx.inference_mode != "meta" else None,
+        "ic_ir_30d": gbm_meta.get("ic_ir") if ctx.model_type == "gbm" and ctx.inference_mode != "meta" else None,
         "hit_rate_30d_rolling": None,
         "price_freshness": {
             "max_age_days": max(ctx.ticker_data_age.values()) if ctx.ticker_data_age else -1,
             "n_stale": sum(1 for d in ctx.ticker_data_age.values() if d > 1),
         },
     }
+    # Meta-only fields — surface manifest values directly so dashboard / ops
+    # can see promotion state and per-component ICs without parsing manifest.
+    if ctx.inference_mode == "meta":
+        metrics["promoted"] = gbm_meta.get("promoted")
+        metrics["meta_val_ic"] = gbm_meta.get("meta_val_ic")
+        metrics["momentum_test_ic"] = gbm_meta.get("momentum_test_ic")
+        metrics["volatility_test_ic"] = gbm_meta.get("volatility_test_ic")
+        metrics["research_calibrator_n_samples"] = gbm_meta.get("research_calibrator_n_samples")
 
     # ── Supplemental merge (re-invocation coverage-gap path) ────────────────
     # When invoked with explicit_tickers, merge these new predictions into the
@@ -908,17 +920,50 @@ def run(ctx: PipelineContext) -> None:
 
 
 def _load_gbm_meta(ctx: PipelineContext) -> dict:
-    """Load GBM training metadata from S3 (best-effort)."""
-    if ctx.model_type != "gbm" or ctx.local:
+    """Load GBM training metadata from S3 (best-effort).
+
+    For ``inference_mode == "meta"`` (the v3.0-meta architecture), reads
+    ``cfg.META_MANIFEST_KEY`` (``predictor/weights/meta/manifest.json``)
+    and returns it normalized into the legacy {trained_date, n_train, ...}
+    shape so the metrics builder above doesn't need to branch.
+
+    For non-meta GBM, retains the original behavior of reading
+    ``cfg.GBM_WEIGHTS_META_KEY``. The legacy GBM key tracks the v2 single
+    model that was retired with the meta-v3 cutover; if the meta manifest
+    is the active source, the legacy key is stale by definition (caught
+    2026-05-04 when ``metrics/latest.json`` reported ``trained_date:
+    2026-03-28`` against an actual 4/28 active model).
+    """
+    if ctx.local:
         return {}
     try:
         import boto3 as _boto3
         _s3 = _boto3.client("s3")
+
+        if ctx.inference_mode == "meta":
+            _resp = _s3.get_object(Bucket=ctx.bucket, Key=cfg.META_MANIFEST_KEY)
+            manifest = json.loads(_resp["Body"].read())
+            log.info("Meta manifest loaded: date=%s  promoted=%s  meta_ic=%s",
+                     manifest.get("date"), manifest.get("promoted"),
+                     manifest.get("models", {}).get("meta_model", {}).get("ic"))
+            mm = manifest.get("models", {})
+            return {
+                "trained_date": manifest.get("date"),
+                "promoted": manifest.get("promoted"),
+                "manifest_version": manifest.get("version"),
+                "meta_val_ic": mm.get("meta_model", {}).get("ic"),
+                "momentum_test_ic": mm.get("momentum", {}).get("test_ic"),
+                "volatility_test_ic": mm.get("volatility", {}).get("test_ic"),
+                "research_calibrator_n_samples": mm.get("research_calibrator", {}).get("n_samples"),
+            }
+
+        if ctx.model_type != "gbm":
+            return {}
         _resp = _s3.get_object(Bucket=ctx.bucket, Key=cfg.GBM_WEIGHTS_META_KEY)
         meta = json.loads(_resp["Body"].read())
         log.info("GBM weights meta loaded: trained_date=%s  n_train=%s",
                  meta.get("trained_date"), meta.get("n_train"))
         return meta
     except Exception as _exc:
-        log.debug("GBM weights meta not found or unreadable: %s", _exc)
+        log.debug("Training meta not found or unreadable: %s", _exc)
         return {}
