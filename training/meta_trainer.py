@@ -1100,20 +1100,40 @@ def run_meta_training(
                 "meta_model": (meta_model, "meta_model.pkl"),
                 "isotonic_calibrator": (calibrator, "isotonic_calibrator.pkl"),
             }
+            # Dated archive is always written (records what training produced
+            # regardless of gate decision). Live path is only overwritten when
+            # the promotion gate passes — otherwise live weights stay at the
+            # last-promoted snapshot. Pre-fix, both writes were unconditional,
+            # so a gate-failed run silently swapped in unblessed weights; the
+            # `promoted: false` flag in manifest became informational only.
+            # Caught 2026-05-04 after the 2026-05-02 training (meta_IC=0.090
+            # passed, momentum subsample failed → promoted=False) overwrote
+            # the 2026-04-28 collapse-fix model (val_IC=0.132). Monday daily
+            # inference produced a coarse 4-bucket bearish-collapsed
+            # distribution; the issue was only visible after rolling live
+            # weights back to the 2026-04-28 archive snapshot.
             for name, (model, filename) in models.items():
                 local_path = Path(tmp) / filename
                 model.save(local_path)
-                s3_key = f"{prefix}{filename}"
-                s3_up.upload_file(str(local_path), bucket, s3_key)
-                # Upload meta.json if exists
-                meta_path = Path(str(local_path) + ".meta.json")
-                if meta_path.exists():
-                    s3_up.upload_file(str(meta_path), bucket, f"{s3_key}.meta.json")
-                log.info("Uploaded %s → s3://%s/%s", name, bucket, s3_key)
 
-                # Dated backup
+                # Dated backup — always written
                 dated_key = f"{prefix}archive/{date_str}/{filename}"
                 s3_up.upload_file(str(local_path), bucket, dated_key)
+
+                # Live promotion — gated on composite promotion gate
+                if promoted:
+                    s3_key = f"{prefix}{filename}"
+                    s3_up.upload_file(str(local_path), bucket, s3_key)
+                    meta_path = Path(str(local_path) + ".meta.json")
+                    if meta_path.exists():
+                        s3_up.upload_file(str(meta_path), bucket, f"{s3_key}.meta.json")
+                    log.info("Uploaded %s → s3://%s/%s (PROMOTED)", name, bucket, s3_key)
+                else:
+                    log.info(
+                        "Skipped live promotion of %s — gate blocked. "
+                        "Archive only at s3://%s/%s",
+                        name, bucket, dated_key,
+                    )
 
             # Write manifest
             manifest = {
