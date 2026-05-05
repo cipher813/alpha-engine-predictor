@@ -30,16 +30,12 @@ class TrainingPreflight(BasePreflight):
     Required S3:
     - bucket reachable
 
-    Required ArcticDB:
-    - ``macro/SPY`` fresh (≤4 days stale — covers Fri→Tue long weekends).
-      If macro/SPY is stale, the upstream data path hasn't written
-      recently and training would produce a model from stale features.
-      Since training runs on Saturday against the previous week's data,
-      a 4-day threshold catches Sunday and weekday write failures without
-      false-positives on the weekend boundary.
+    Data-freshness assertion now lives upstream in ``alpha-engine-data``'s
+    DataPhase1 preflight, which runs before ``PredictorTraining`` in the
+    Saturday Step Function. If macro/universe data is stale, the data
+    step hard-fails and the SF never reaches training.
     """
 
     def run(self) -> None:
         self.check_env_vars("AWS_REGION")
         self.check_s3_bucket()
-        self.check_arcticdb_fresh("macro", "SPY", max_stale_days=4)
