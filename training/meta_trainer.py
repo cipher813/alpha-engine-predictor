@@ -91,6 +91,47 @@ def _nonoverlapping_date_mask(dates: list, horizon_trading_days: int) -> list[bo
     return mask
 
 
+def _classify_regime(macro_features: dict) -> str:
+    """Classify a row's market regime as ``bull`` / ``neutral`` / ``bear``.
+
+    Used by the Track B per-regime IC breakdown (3-of-N, audit Phase 1).
+    Inputs are the 6 raw macro features already attached to every
+    ``oos_meta_row`` — ``macro_spy_20d_return``, ``macro_spy_20d_vol``,
+    ``macro_vix_level``, ``macro_vix_term_slope``, ``macro_yield_curve_slope``,
+    ``macro_market_breadth``.
+
+    Classification rule (heuristic, single primary axis):
+
+    - ``bull``    if ``macro_spy_20d_return > +0.03`` (3% over 20 trading days)
+    - ``bear``    if ``macro_spy_20d_return < -0.03``
+    - ``neutral`` otherwise
+
+    This is a single-feature heuristic chosen for transparency. The retired
+    Tier-0 regime classifier (`model/regime_predictor.py`) used a richer
+    multi-feature model that failed honest baseline validation (39.5% OOS
+    accuracy, below majority-class baseline of 49% per memory). For this
+    diagnostic, the goal isn't a great regime model — it's *some* regime
+    label that lets us slice IC by market state and see whether the model's
+    cross-horizon ratio is regime-dependent. A simple SPY 20d-return
+    threshold is defensible and reproducible.
+
+    Future ROADMAP P1: Tier-1 regime classifier with triple-barrier
+    labeling and walk-forward purge will replace this once it clears its
+    own promotion gate. Per audit §6.2 + §6.3.
+    """
+    spy_20d = macro_features.get("macro_spy_20d_return")
+    if spy_20d is None or not isinstance(spy_20d, (int, float)):
+        return "neutral"
+    import math
+    if math.isnan(float(spy_20d)):
+        return "neutral"
+    if spy_20d > 0.03:
+        return "bull"
+    if spy_20d < -0.03:
+        return "bear"
+    return "neutral"
+
+
 def _bootstrap_ic_ci_by_date(
     predictions,
     actuals,
@@ -1019,6 +1060,21 @@ def run_meta_training(
     # Both numbers persist in the manifest; downstream analysis decides
     # which to trust for the canonical horizon decision.
     row_dates = [r.get("date") for r in oos_meta_rows]
+    # Track 3-of-N of the audit Phase 1 horizon battery: classify each row's
+    # market regime so per-horizon ICs can be sliced by regime. Heuristic
+    # is bull/neutral/bear via macro_spy_20d_return thresholds at ±3% (see
+    # _classify_regime docstring for rationale + future-replacement plan).
+    row_regimes = [_classify_regime(r) for r in oos_meta_rows]
+    regime_counts = {
+        "bull": row_regimes.count("bull"),
+        "neutral": row_regimes.count("neutral"),
+        "bear": row_regimes.count("bear"),
+    }
+    log.info(
+        "Per-row regime distribution: bull=%d  neutral=%d  bear=%d  total=%d",
+        regime_counts["bull"], regime_counts["neutral"], regime_counts["bear"],
+        len(row_regimes),
+    )
     for h in _DIAGNOSTIC_HORIZONS:
         y_h = np.array([r[f"actual_fwd_{h}d"] for r in oos_meta_rows])
         mask = np.isfinite(y_h)
@@ -1078,6 +1134,27 @@ def run_meta_training(
                     seed=42 + h + 1000,  # offset from overlap seed
                 )
 
+        # Per-regime IC slice (Track B 3-of-N). Compute IC within each of
+        # bull/neutral/bear regime buckets — operator can see whether the
+        # cross-horizon IC ratio is regime-dependent (e.g. 21d signal is
+        # 3× 5d in bull, 1.2× in bear) or stable (regime-invariant). Min
+        # sample size is 30 per regime — below that the IC is too noisy
+        # to interpret. NaN signals "insufficient sample in this regime";
+        # downstream consumers should treat the regime as unmeasured at
+        # this horizon rather than confusing low-sample noise with signal.
+        regime_ics: dict = {}
+        for regime in ("bull", "neutral", "bear"):
+            r_mask = np.array([rr == regime for rr in row_regimes]) & mask
+            if r_mask.sum() >= 30:
+                sp_r = spearmanr(meta_preds_oos_insample[r_mask], y_h[r_mask])
+                ic_r = float(sp_r.correlation) if np.isfinite(sp_r.correlation) else float("nan")
+            else:
+                ic_r = float("nan")
+            regime_ics[regime] = {
+                "spearman": ic_r,
+                "n": int(r_mask.sum()),
+            }
+
         horizon_ics[f"{h}d"] = {
             "spearman": ic,
             "n": int(mask.sum()),
@@ -1087,6 +1164,7 @@ def run_meta_training(
             "n_nonoverlap": nonoverlap_n,
             "spearman_nonoverlap_ci_lo": nonoverlap_ci_lo,
             "spearman_nonoverlap_ci_hi": nonoverlap_ci_hi,
+            "by_regime": regime_ics,
         }
 
     # Backwards-compat: keep spearman_5d / spearman_21d scalars for the
@@ -1111,6 +1189,16 @@ def run_meta_training(
         for k, v in horizon_ics.items()
     )
     log.info("Horizon IC curve (non-overlapping, 95%% CI): %s", _no_line)
+    # Per-regime breakdown — one log line per regime so operators can
+    # eyeball whether the cross-horizon ratio is regime-dependent.
+    for regime in ("bull", "neutral", "bear"):
+        _r_line = "  ".join(
+            f"{k}={v['by_regime'][regime]['spearman']:+.4f} (n={v['by_regime'][regime]['n']})"
+            if np.isfinite(v["by_regime"][regime]["spearman"])
+            else f"{k}=— (n={v['by_regime'][regime]['n']})"
+            for k, v in horizon_ics.items()
+        )
+        log.info("Horizon IC curve (%s regime): %s", regime, _r_line)
     # Flag peak horizon for quick visual in logs/email.
     _peak = max(horizon_ics.items(),
                 key=lambda kv: abs(kv[1]["spearman"]) if np.isfinite(kv[1]["spearman"]) else -1)
@@ -1456,9 +1544,27 @@ def run_meta_training(
                         round(v["spearman_nonoverlap_ci_hi"], 6)
                         if np.isfinite(v["spearman_nonoverlap_ci_hi"]) else None
                     ),
+                    # v3.5 (Track B 3/N): per-regime IC slice. Operators
+                    # eyeball whether cross-horizon IC ratios are regime-
+                    # dependent — does 21d=2.2×5d hold across bull / neutral /
+                    # bear, or is it concentrated in one regime?
+                    "by_regime": {
+                        regime: {
+                            "spearman": (
+                                round(v["by_regime"][regime]["spearman"], 6)
+                                if np.isfinite(v["by_regime"][regime]["spearman"])
+                                else None
+                            ),
+                            "n": v["by_regime"][regime]["n"],
+                        }
+                        for regime in ("bull", "neutral", "bear")
+                    },
                 }
                 for k, v in horizon_ics.items()
             },
+            # Top-level regime counts so operators can immediately see
+            # the bull/neutral/bear distribution across the OOS set.
+            "regime_distribution": regime_counts,
             "peak_horizon": _peak[0],
             "peak_spearman": round(_peak[1]["spearman"], 6) if np.isfinite(_peak[1]["spearman"]) else None,
         },
