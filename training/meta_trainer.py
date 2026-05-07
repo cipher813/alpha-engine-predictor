@@ -47,6 +47,50 @@ _MOMENTUM_PARAMS_S3_KEY = "config/predictor_momentum_params.json"
 _DIAGNOSTIC_HORIZONS = [5, 10, 15, 21, 40, 60, 90]
 
 
+def _nonoverlapping_date_mask(dates: list, horizon_trading_days: int) -> list[bool]:
+    """Return a boolean mask selecting one date per non-overlapping h-day window.
+
+    Why this matters: the existing horizon IC diagnostic in this trainer
+    samples (date, ticker) rows with a forward window that overlaps heavily
+    across consecutive dates — at h=21d, today's training row and tomorrow's
+    share 20 of 21 days of forward return. That autocorrelation inflates IC
+    point estimates compared to honest non-overlapping samples and makes
+    cross-horizon IC ratios (e.g. "21d IC = 2.2× 5d IC") harder to interpret
+    cleanly. Per the 2026-05-07 predictor audit Track B, the right fix is
+    to compute IC on both overlapping (current) and non-overlapping samples
+    so the autocorrelation contribution is visible.
+
+    Strategy: walk the sorted unique dates ascending; greedily keep a date
+    if it's at least ``horizon_trading_days`` calendar days past the most
+    recently kept date. Calendar-day spacing is a good proxy for trading-day
+    spacing at these horizons (5/10/15/21/40/60/90) and avoids needing the
+    NYSE calendar in this hot path. Returns a mask aligned to ``dates``.
+
+    The greedy "keep-if-far-enough" pattern minimizes overlap pessimistically:
+    dates dropped because their forward window overlapped with a kept date's
+    are simply not used for IC computation at that horizon. The cost is
+    sample-size; the benefit is honest IC on independent observations.
+    """
+    if not dates:
+        return []
+    # Convert to pandas Timestamps for comparable arithmetic without losing
+    # precision. The training code stores dates as pd.Timestamp objects on
+    # rows (per the row construction in Step 6); accept any sortable type.
+    import pandas as pd
+    dates_ts = [pd.Timestamp(d) for d in dates]
+    # Sort positions by date; we must build the mask in original order.
+    sort_order = sorted(range(len(dates_ts)), key=lambda i: dates_ts[i])
+    mask = [False] * len(dates_ts)
+    last_kept_ts: pd.Timestamp | None = None
+    horizon_delta = pd.Timedelta(days=horizon_trading_days)
+    for i in sort_order:
+        ts = dates_ts[i]
+        if last_kept_ts is None or (ts - last_kept_ts) >= horizon_delta:
+            mask[i] = True
+            last_kept_ts = ts
+    return mask
+
+
 def _load_momentum_params_from_s3(bucket: str) -> dict | None:
     """Read momentum GBM params from S3 if present.
 
@@ -813,6 +857,11 @@ def run_meta_training(
                     "expected_move": float(vol_preds[local_idx]),
                     **research_features,
                     "actual_fwd": float(y_fwd[idx]),
+                    # Track 1-of-2 of the audit Phase 1 horizon battery (2026-05-07):
+                    # carry the row's date so subsequent IC computations can
+                    # subsample to non-overlapping windows. Cheap (one column),
+                    # additive (no behavior change to training itself).
+                    "date": all_dates[idx],
                     **macro_row,  # raw macro features
                 }
                 # Multi-horizon labels (diagnostic only)
@@ -877,6 +926,14 @@ def run_meta_training(
     from scipy.stats import spearmanr
     meta_preds_oos_insample = meta_model.predict(meta_X).ravel()
     horizon_ics: dict[str, dict] = {}
+    # Track 1-of-2 of the audit Phase 1 horizon battery (2026-05-07): in
+    # addition to the legacy overlapping IC (each row's forward window
+    # shares 20 of 21 days with its neighbor at h=21d), compute the IC on
+    # a non-overlapping subsample so we can see how much of the
+    # cross-horizon ratio is real signal vs autocorrelation inflation.
+    # Both numbers persist in the manifest; downstream analysis decides
+    # which to trust for the canonical horizon decision.
+    row_dates = [r.get("date") for r in oos_meta_rows]
     for h in _DIAGNOSTIC_HORIZONS:
         y_h = np.array([r[f"actual_fwd_{h}d"] for r in oos_meta_rows])
         mask = np.isfinite(y_h)
@@ -885,7 +942,35 @@ def run_meta_training(
             ic = float(sp.correlation) if np.isfinite(sp.correlation) else 0.0
         else:
             ic = float("nan")
-        horizon_ics[f"{h}d"] = {"spearman": ic, "n": int(mask.sum())}
+
+        # Non-overlapping subsample IC: keep one row per non-overlapping
+        # h-day window, then re-mask for finite labels. Min sample size is
+        # lower (10) because non-overlapping naturally shrinks N at long
+        # horizons — a 90d horizon over 24 months yields only ~8 windows.
+        # NaN means "not enough independent samples to estimate IC" — the
+        # downstream consumer reads this as "consult the overlapping number
+        # at this horizon, or extend the training window."
+        nonoverlap_ic: float = float("nan")
+        nonoverlap_n: int = 0
+        if all(d is not None for d in row_dates):
+            nonoverlap_mask = _nonoverlapping_date_mask(row_dates, h)
+            combined_mask = np.array(nonoverlap_mask) & mask
+            if combined_mask.sum() >= 10:
+                sp_no = spearmanr(
+                    meta_preds_oos_insample[combined_mask], y_h[combined_mask]
+                )
+                nonoverlap_ic = (
+                    float(sp_no.correlation)
+                    if np.isfinite(sp_no.correlation) else float("nan")
+                )
+                nonoverlap_n = int(combined_mask.sum())
+
+        horizon_ics[f"{h}d"] = {
+            "spearman": ic,
+            "n": int(mask.sum()),
+            "spearman_nonoverlap": nonoverlap_ic,
+            "n_nonoverlap": nonoverlap_n,
+        }
 
     # Backwards-compat: keep spearman_5d / spearman_21d scalars for the
     # existing result-dict field consumers (email, dashboard, etc.).
@@ -897,7 +982,12 @@ def run_meta_training(
     _ic_line = "  ".join(
         f"{k}={v['spearman']:+.4f} (n={v['n']})" for k, v in horizon_ics.items()
     )
-    log.info("Horizon IC curve: %s", _ic_line)
+    log.info("Horizon IC curve (overlapping): %s", _ic_line)
+    _no_line = "  ".join(
+        f"{k}={v['spearman_nonoverlap']:+.4f} (n={v['n_nonoverlap']})"
+        for k, v in horizon_ics.items()
+    )
+    log.info("Horizon IC curve (non-overlapping): %s", _no_line)
     # Flag peak horizon for quick visual in logs/email.
     _peak = max(horizon_ics.items(),
                 key=lambda kv: abs(kv[1]["spearman"]) if np.isfinite(kv[1]["spearman"]) else -1)
@@ -1205,10 +1295,22 @@ def run_meta_training(
             "n_5d": mask_5d_count,
             "n_21d": mask_21d_count,
             # v3.2: full curve across _DIAGNOSTIC_HORIZONS.
+            # v3.3 (audit Phase 1 Track B, 2026-05-07): added non-overlapping
+            # subsample fields. The legacy `spearman`/`n` are computed on
+            # all rows (overlapping forward windows). `spearman_nonoverlap`
+            # / `n_nonoverlap` greedily subsample one row per h-day window
+            # so the IC reflects independent observations. Cross-horizon
+            # ratios computed on the non-overlapping fields are honest;
+            # ratios on the legacy fields are autocorrelation-inflated.
             "curve": {
                 k: {
                     "spearman": round(v["spearman"], 6) if np.isfinite(v["spearman"]) else None,
                     "n": v["n"],
+                    "spearman_nonoverlap": (
+                        round(v["spearman_nonoverlap"], 6)
+                        if np.isfinite(v["spearman_nonoverlap"]) else None
+                    ),
+                    "n_nonoverlap": v["n_nonoverlap"],
                 }
                 for k, v in horizon_ics.items()
             },
