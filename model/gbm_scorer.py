@@ -321,8 +321,11 @@ class GBMScorer:
         Save the booster to disk.
 
         Saves two files:
-          <path>          — LightGBM booster text format (portable, version-stable)
-          <path>.meta.json — metadata: feature names, best_iteration, val_IC, version
+          <path>          — LightGBM booster text format (portable, version-stable).
+                            Canonically encodes feature_names + tree count.
+          <path>.meta.json — diagnostic-only training metadata (val_IC, params,
+                            gbm_version, n_estimators). Not load-bearing for
+                            inference correctness — see load() for the contract.
         """
         if self._booster is None:
             raise RuntimeError("Nothing to save — model has not been fitted.")
@@ -331,10 +334,15 @@ class GBMScorer:
 
         self._booster.save_model(str(path))
 
+        # feature_names and best_iteration are intentionally NOT persisted in
+        # the sidecar — they live in the booster file (LightGBM's text format
+        # encodes feature_names directly, and num_trees() recovers the
+        # effective best_iteration). Duplicating them here would create two
+        # sources of truth that can drift; the 2026-05-06 force-promote
+        # incident hit exactly this when the dated-archive sidecar wasn't
+        # recoverable and a stub was hand-written with empty feature_names.
         meta = {
             "gbm_version": GBM_VERSION,
-            "feature_names": self._feature_names,
-            "best_iteration": self._best_iteration,
             "val_ic": round(self._val_ic, 6),
             "params": self.params,
             "n_estimators": self.n_estimators,
@@ -362,6 +370,22 @@ class GBMScorer:
 
         booster = lgb.Booster(model_file=str(path))
 
+        # Booster is the source of truth for schema (feature_names) + structure
+        # (num_trees → best_iteration). LightGBM's text format canonically
+        # encodes feature_names; reading them from anywhere else is what made
+        # a stub sidecar look like a valid load on 2026-05-07. booster.best_iteration
+        # is set when training used early stopping; LightGBM returns -1 (not 0)
+        # as the "no early stopping fired" sentinel, so check for non-positive
+        # explicitly and fall back to num_trees() — which means "use all trees"
+        # in predict() and matches the booster's actual extent.
+        feature_names = list(booster.feature_name())
+        bi = getattr(booster, "best_iteration", None)
+        best_iteration = bi if (isinstance(bi, int) and bi > 0) else booster.num_trees()
+
+        # Sidecar is diagnostic-only: training metadata (val_ic, params,
+        # gbm_version, n_estimators) that the booster doesn't carry. Missing
+        # or partial sidecar must NOT degrade inference — load() with no
+        # sidecar at all should still produce a fully usable scorer.
         meta_path = Path(str(path) + ".meta.json")
         meta: dict = {}
         if meta_path.exists():
@@ -372,13 +396,13 @@ class GBMScorer:
             n_estimators=meta.get("n_estimators", 2000),
         )
         scorer._booster = booster
-        scorer._feature_names = meta.get("feature_names", [])
-        scorer._best_iteration = meta.get("best_iteration", 0)
-        scorer._val_ic = meta.get("val_ic", 0.0)
+        scorer._feature_names = feature_names
+        scorer._best_iteration = best_iteration
+        scorer._val_ic = meta.get("val_ic") or 0.0
 
         log.info(
-            "GBMScorer loaded from %s  (val_IC=%.4f  best_iter=%d)",
-            path, scorer._val_ic, scorer._best_iteration,
+            "GBMScorer loaded from %s  (val_IC=%.4f  best_iter=%d  n_features=%d)",
+            path, scorer._val_ic, scorer._best_iteration, len(feature_names),
         )
         return scorer
 
