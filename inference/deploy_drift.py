@@ -15,10 +15,14 @@ from __future__ import annotations
 import json
 import logging
 import re
-import urllib.error
-import urllib.request
 from dataclasses import dataclass
 from typing import Optional, Union
+
+# Canonical helper lives in the lib so the catch-tuple bug-fix lands in
+# one place (see lib v0.5.5). Re-imported as a module-level attribute so
+# `patch.object(deploy_drift, "_fetch_origin_main_sha", ...)` keeps
+# working in tests.
+from alpha_engine_lib.preflight import _fetch_origin_main_sha  # noqa: F401
 
 log = logging.getLogger(__name__)
 
@@ -78,21 +82,6 @@ class StackStateError:
             "detail": self.detail,
             "stack_status": self.stack_status,
         }
-
-
-def _fetch_origin_main_sha(
-    repo: str, branch: str = "main", timeout: float = 5.0,
-) -> Optional[str]:
-    """Public-repo GitHub branch-HEAD lookup. Returns None on network error."""
-    url = f"https://api.github.com/repos/{repo}/branches/{branch}"
-    req = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json"})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            payload = json.loads(resp.read())
-        return payload.get("commit", {}).get("sha")
-    except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError) as exc:
-        log.warning("GitHub API unreachable (%s) for %s@%s", exc, repo, branch)
-        return None
 
 
 def _extract_sf_sha(comment: str) -> Optional[str]:

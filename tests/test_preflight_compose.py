@@ -1,10 +1,12 @@
 """
 Tests for PredictorPreflight.run() mode composition.
 
-BasePreflight primitives are tested in alpha-engine-lib. The deploy-drift
-check has its own test file (test_preflight_drift.py). These tests verify
-that ``run()`` composes the expected primitive calls in the expected order
-— and that ``run_for_drift_gate()`` is a strict subset for the SF gate.
+BasePreflight primitives — including ``check_deploy_drift`` and its
+``_fetch_origin_main_sha`` helper — are tested in alpha-engine-lib.
+These tests verify that ``run()`` composes the expected primitive
+calls in the expected order, that ``run_for_drift_gate()`` is a strict
+subset for the SF gate, and that the predictor passes its own repo
+slug to the inherited drift check.
 
 Data-freshness assertions (universe + macro/SPY + inference-macro symbols)
 moved upstream to ``alpha-engine-data``'s preflight 2026-05-05; the data
@@ -38,7 +40,7 @@ def test_run_composes_full_check_sequence():
 
     env.assert_called_once_with("AWS_REGION")
     s3.assert_called_once()
-    drift.assert_called_once()
+    drift.assert_called_once_with("cipher813/alpha-engine-predictor")
     s3_key.assert_called_once()
     assert s3_key.call_args.args[0] == "predictor/weights/meta/meta_model.pkl"
 
@@ -72,7 +74,7 @@ def test_run_for_drift_gate_is_strict_subset():
 
     env.assert_called_once_with("AWS_REGION")
     s3.assert_called_once()
-    drift.assert_called_once()
+    drift.assert_called_once_with("cipher813/alpha-engine-predictor")
     s3_key.assert_not_called()
     fresh.assert_not_called()
 
