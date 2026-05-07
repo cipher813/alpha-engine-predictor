@@ -776,12 +776,27 @@ def run(ctx: PipelineContext) -> None:
     }
     # Meta-only fields — surface manifest values directly so dashboard / ops
     # can see promotion state and per-component ICs without parsing manifest.
+    # The l1_ic / l2_ic / confidence_calibration keys satisfy the
+    # `predictor_decisions` row of the transparency inventory
+    # (alpha_engine_lib/transparency_inventory.yaml).
     if ctx.inference_mode == "meta":
         metrics["promoted"] = gbm_meta.get("promoted")
         metrics["meta_val_ic"] = gbm_meta.get("meta_val_ic")
         metrics["momentum_test_ic"] = gbm_meta.get("momentum_test_ic")
         metrics["volatility_test_ic"] = gbm_meta.get("volatility_test_ic")
         metrics["research_calibrator_n_samples"] = gbm_meta.get("research_calibrator_n_samples")
+        metrics["l1_ic"] = {
+            "momentum": gbm_meta.get("momentum_test_ic"),
+            "volatility": gbm_meta.get("volatility_test_ic"),
+            "research_calibrator": None,
+        }
+        metrics["l2_ic"] = gbm_meta.get("meta_val_ic")
+        metrics["confidence_calibration"] = {
+            "method": "isotonic",
+            "ece_before": gbm_meta.get("isotonic_ece_before"),
+            "ece_after": gbm_meta.get("isotonic_ece_after"),
+            "n_samples": gbm_meta.get("isotonic_n_samples"),
+        }
 
     # ── Supplemental merge (re-invocation coverage-gap path) ────────────────
     # When invoked with explicit_tickers, merge these new predictions into the
@@ -947,6 +962,7 @@ def _load_gbm_meta(ctx: PipelineContext) -> dict:
                      manifest.get("date"), manifest.get("promoted"),
                      manifest.get("models", {}).get("meta_model", {}).get("ic"))
             mm = manifest.get("models", {})
+            iso = mm.get("isotonic_calibrator", {})
             return {
                 "trained_date": manifest.get("date"),
                 "promoted": manifest.get("promoted"),
@@ -955,6 +971,9 @@ def _load_gbm_meta(ctx: PipelineContext) -> dict:
                 "momentum_test_ic": mm.get("momentum", {}).get("test_ic"),
                 "volatility_test_ic": mm.get("volatility", {}).get("test_ic"),
                 "research_calibrator_n_samples": mm.get("research_calibrator", {}).get("n_samples"),
+                "isotonic_ece_before": iso.get("ece_before"),
+                "isotonic_ece_after": iso.get("ece_after"),
+                "isotonic_n_samples": iso.get("n_samples"),
             }
 
         if ctx.model_type != "gbm":

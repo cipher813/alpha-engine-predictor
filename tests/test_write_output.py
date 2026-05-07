@@ -277,6 +277,107 @@ class TestReadExistingPredictions:
         assert [p["ticker"] for p in result] == ["AAPL", "MSFT"]
 
 
+class TestSubstrateInventoryKeys:
+    """`predictor_decisions` row in alpha_engine_lib.transparency_inventory
+    asserts l1_ic, l2_ic, confidence_calibration keys are present in
+    predictor/metrics/latest.json. These tests pin the contract."""
+
+    def _ctx(self):
+        from inference.pipeline import PipelineContext
+        return PipelineContext(
+            date_str="2026-05-09",
+            bucket="bucket",
+            dry_run=True,
+            predictions=[
+                {"ticker": "A", "predicted_alpha": 0.01, "combined_rank": 1,
+                 "predicted_direction": "UP", "prediction_confidence": 0.55},
+            ],
+            signals_data={},
+            explicit_tickers=[],
+            inference_mode="meta",
+        )
+
+    @patch.object(wo, "get_veto_threshold", return_value=0.65)
+    @patch.object(wo, "write_predictions")
+    @patch.object(wo, "_load_gbm_meta")
+    def test_meta_mode_emits_inventory_keys(self, mock_meta, mock_write, _v):
+        mock_meta.return_value = {
+            "trained_date": "2026-05-09",
+            "promoted": True,
+            "meta_val_ic": 0.132,
+            "momentum_test_ic": 0.071,
+            "volatility_test_ic": 0.043,
+            "research_calibrator_n_samples": 4200,
+            "isotonic_ece_before": 0.087,
+            "isotonic_ece_after": 0.021,
+            "isotonic_n_samples": 1500,
+        }
+        wo.run(self._ctx())
+
+        assert mock_write.called
+        metrics = mock_write.call_args.args[3]
+        assert "l1_ic" in metrics
+        assert "l2_ic" in metrics
+        assert "confidence_calibration" in metrics
+        assert metrics["l1_ic"] == {
+            "momentum": 0.071,
+            "volatility": 0.043,
+            "research_calibrator": None,
+        }
+        assert metrics["l2_ic"] == 0.132
+        assert metrics["confidence_calibration"] == {
+            "method": "isotonic",
+            "ece_before": 0.087,
+            "ece_after": 0.021,
+            "n_samples": 1500,
+        }
+
+    @patch.object(wo, "get_veto_threshold", return_value=0.65)
+    @patch.object(wo, "write_predictions")
+    @patch.object(wo, "_load_gbm_meta")
+    def test_meta_mode_keys_present_when_manifest_partial(self, mock_meta, mock_write, _v):
+        # Older manifests written before isotonic_calibrator landed lack the
+        # ECE fields. Substrate check asserts presence (not non-null), so the
+        # keys must still appear with None values rather than be omitted.
+        mock_meta.return_value = {
+            "trained_date": "2026-04-15",
+            "promoted": True,
+            "meta_val_ic": 0.10,
+            "momentum_test_ic": 0.05,
+            "volatility_test_ic": 0.03,
+        }
+        wo.run(self._ctx())
+
+        metrics = mock_write.call_args.args[3]
+        assert "l1_ic" in metrics
+        assert "l2_ic" in metrics
+        assert "confidence_calibration" in metrics
+        assert metrics["confidence_calibration"]["ece_before"] is None
+        assert metrics["confidence_calibration"]["ece_after"] is None
+
+    @patch.object(wo, "get_veto_threshold", return_value=0.65)
+    @patch.object(wo, "write_predictions")
+    @patch.object(wo, "_load_gbm_meta", return_value={})
+    def test_non_meta_mode_does_not_emit_keys(self, _m, mock_write, _v):
+        from inference.pipeline import PipelineContext
+        ctx = PipelineContext(
+            date_str="2026-05-09",
+            bucket="bucket",
+            dry_run=True,
+            predictions=[],
+            signals_data={},
+            explicit_tickers=[],
+            inference_mode="mse",
+        )
+        wo.run(ctx)
+        metrics = mock_write.call_args.args[3]
+        # Keys are scoped to meta mode — legacy modes don't have a Layer-2 IC
+        # to report, so they should be absent rather than null.
+        assert "l1_ic" not in metrics
+        assert "l2_ic" not in metrics
+        assert "confidence_calibration" not in metrics
+
+
 class TestEmailGating:
     """Email is sent on exactly the terminal invocation — first run when
     no coverage-gap re-invoke is expected, or the supplemental re-invoke
