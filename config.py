@@ -247,6 +247,17 @@ WF_MIN_TRAIN_DAYS = _wf_cfg.get("min_train_days", 504)
 WF_PURGE_DAYS = _wf_cfg.get("purge_days", 5)
 WF_MIN_FOLDS_POSITIVE = _wf_cfg.get("min_folds_positive", 0.60)
 WF_MEDIAN_IC_GATE = _wf_cfg.get("median_ic_gate", 0.02)
+
+# Audit Phase 2a output-distribution gate (2026-05-07). When True, a
+# calibrator-output-shape check is added to the promotion gate alongside
+# the existing meta-IC and per-component subsample gates. Default False
+# for one Saturday-SF observation cycle so we measure baseline pass rate
+# before promoting the gate to blocking. Flip to True via predictor.yaml's
+# walk_forward.output_distribution_gate_blocking once a baseline run
+# confirms the gate doesn't false-block on healthy models.
+OUTPUT_DISTRIBUTION_GATE_BLOCKING = _wf_cfg.get(
+    "output_distribution_gate_blocking", False
+)
 WF_N_ESTIMATORS = _wf_cfg.get("wf_n_estimators", None)  # None → use GBM_N_ESTIMATORS
 WF_EARLY_STOPPING = _wf_cfg.get("wf_early_stopping", None)  # None → use GBM_EARLY_STOPPING_ROUNDS
 

@@ -1363,16 +1363,41 @@ def run_meta_training(
     # missing pre-2026-04-29 — meta_ic≥0.02 alone proved 2026-04-28 that
     # the ensemble could "work" while the components had silent NaN
     # poisoning the data layer was actively shipping.
-    promoted = meta_ic_passed and subsample_gate_passed
+
+    # Audit Phase 2a-PROMOTE (2026-05-07): output-distribution gate runs
+    # the candidate calibrator on a synthetic alpha sweep and checks
+    # four distribution-shape invariants (uniqueness / saturation /
+    # stdev / direction skew). Catches the calibrator-plateau /
+    # saturation / direction-skew failure class that bit production
+    # 2026-04-28, 2026-05-04, 2026-05-07 — promotion-gate variants of
+    # those incidents shipped to live S3 paths because no gate looked at
+    # the calibrator's output the way the executor consumes it. Off
+    # behind a feature flag for one Saturday-SF observation cycle, then
+    # flips to blocking via predictor_params.json.
+    from model.output_distribution_gate import validate_calibrator_distribution
+    output_dist_result = validate_calibrator_distribution(calibrator)
+    output_dist_blocking = bool(
+        cfg.OUTPUT_DISTRIBUTION_GATE_BLOCKING
+        if hasattr(cfg, "OUTPUT_DISTRIBUTION_GATE_BLOCKING") else False
+    )
+    output_dist_gate_passed = output_dist_result.passed if output_dist_blocking else True
+
+    promoted = (
+        meta_ic_passed
+        and subsample_gate_passed
+        and output_dist_gate_passed
+    )
     log.info(
         "Promotion gate: meta_IC=%.4f %s %.4f (meta=%s) AND component "
-        "subsample (mom=%s, vol=%s, research=%s) → %s "
+        "subsample (mom=%s, vol=%s, research=%s) AND output_dist=%s%s → %s "
         "(walk-forward for reference: mom_median=%.4f, vol_median=%.4f)",
         meta_model._val_ic, ">=" if meta_ic_passed else "<", _meta_ic_gate,
         "PASS" if meta_ic_passed else "BLOCK",
         "PASS" if mom_subsample_result.passed else "BLOCK",
         "PASS" if vol_subsample_result.passed else "BLOCK",
         "PASS" if research_subsample_result.passed else "BLOCK",
+        "PASS" if output_dist_result.passed else "FAIL",
+        "" if output_dist_blocking else " (OBSERVE-ONLY: not blocking)",
         "PROMOTE" if promoted else "BLOCK",
         mom_median_ic, vol_median_ic,
     )
@@ -1466,6 +1491,22 @@ def run_meta_training(
                     "n_folds": len(folds),
                 },
                 "meta_coefficients": meta_model._coefficients,
+                # Audit Phase 2a (2026-05-07): output-distribution gate
+                # result. Persisted regardless of pass/fail so a borderline
+                # pass over multiple training cycles is itself a useful
+                # trend signal. ``blocking`` reflects whether the gate
+                # blocked promotion this run (only True when the gate
+                # failed AND the feature flag was set to blocking mode).
+                "output_distribution_gate": {
+                    "passed": output_dist_result.passed,
+                    "failed_check": output_dist_result.failed_check,
+                    "reason": output_dist_result.reason,
+                    "metrics": output_dist_result.metrics,
+                    "blocking": output_dist_blocking,
+                    "would_have_blocked_if_blocking": (
+                        not output_dist_result.passed
+                    ),
+                },
             }
             s3_up.put_object(
                 Bucket=bucket, Key=cfg.META_MANIFEST_KEY,
