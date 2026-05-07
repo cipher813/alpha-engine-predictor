@@ -91,6 +91,91 @@ def _nonoverlapping_date_mask(dates: list, horizon_trading_days: int) -> list[bo
     return mask
 
 
+def _bootstrap_ic_ci_by_date(
+    predictions,
+    actuals,
+    dates: list,
+    n_iter: int = 1000,
+    ci: float = 0.95,
+    seed: int = 42,
+) -> tuple[float, float]:
+    """1000-iter bootstrap of Spearman IC by resampling unique dates with replacement.
+
+    Why bootstrap-by-date rather than bootstrap-by-row: at h=21d, two rows
+    on consecutive dates share 20 of 21 days of forward return. Resampling
+    rows treats them as independent observations — that's the same
+    autocorrelation problem the non-overlapping subsample addresses for the
+    point estimate. The right unit of independence is the date. Resampling
+    dates with replacement, then including ALL rows whose date is in the
+    resample, gives a CI that respects the within-date cross-section but
+    properly accounts for between-date uncertainty.
+
+    Returns ``(ic_lo, ic_hi)`` at the specified confidence level (default
+    95% = 2.5th / 97.5th percentiles). Returns ``(NaN, NaN)`` when:
+      - ``dates`` is empty or fewer than 3 unique dates available (CI is
+        meaningless on <3 independent observations);
+      - ``predictions`` and ``actuals`` lengths disagree;
+      - every bootstrap iteration produces a non-finite IC (degenerate input).
+
+    NaN-tolerant on actuals: rows with NaN actual are excluded from each
+    bootstrap iteration's IC computation, just like the point estimate.
+
+    Seeded RNG (default seed=42) so the CI is deterministic across training
+    runs holding training input constant. Lets operators eyeball "did the
+    CI shrink because of more data, or move because of new data."
+    """
+    import numpy as np
+    import pandas as pd
+    from scipy.stats import spearmanr
+
+    if not dates or len(predictions) != len(actuals) or len(predictions) != len(dates):
+        return float("nan"), float("nan")
+
+    dates_ts = [pd.Timestamp(d) for d in dates]
+    unique_dates = sorted(set(dates_ts))
+    if len(unique_dates) < 3:
+        return float("nan"), float("nan")
+
+    # Pre-build date → row-index list once. Each bootstrap iteration walks
+    # this dict; avoids repeated O(N) date scans inside the inner loop.
+    by_date: dict = {}
+    for i, d in enumerate(dates_ts):
+        by_date.setdefault(d, []).append(i)
+
+    preds_arr = np.asarray(predictions)
+    actuals_arr = np.asarray(actuals)
+    rng = np.random.default_rng(seed)
+    n_dates = len(unique_dates)
+    ics: list[float] = []
+
+    for _ in range(n_iter):
+        sampled_date_idx = rng.integers(0, n_dates, size=n_dates)
+        sampled_indices: list[int] = []
+        for di in sampled_date_idx:
+            sampled_indices.extend(by_date[unique_dates[di]])
+        if not sampled_indices:
+            continue
+        idx_arr = np.array(sampled_indices)
+        p = preds_arr[idx_arr]
+        a = actuals_arr[idx_arr]
+        finite = np.isfinite(a) & np.isfinite(p)
+        if finite.sum() < 5:
+            continue
+        sp = spearmanr(p[finite], a[finite])
+        if np.isfinite(sp.correlation):
+            ics.append(float(sp.correlation))
+
+    if len(ics) < 10:
+        # Too many degenerate iterations to trust the CI shape.
+        return float("nan"), float("nan")
+
+    ics_arr = np.array(ics)
+    alpha = 1.0 - ci
+    lo = float(np.percentile(ics_arr, 100 * alpha / 2))
+    hi = float(np.percentile(ics_arr, 100 * (1 - alpha / 2)))
+    return lo, hi
+
+
 def _load_momentum_params_from_s3(bucket: str) -> dict | None:
     """Read momentum GBM params from S3 if present.
 
@@ -943,6 +1028,22 @@ def run_meta_training(
         else:
             ic = float("nan")
 
+        # Bootstrap 95% CI on overlapping IC. Track 2-of-N of the audit
+        # Phase 1 horizon battery (2026-05-07): 1000-iter bootstrap
+        # resampling unique dates with replacement (not rows — see helper
+        # docstring for why). Tells the operator how much of the cross-
+        # horizon IC ratio is explained by sampling noise vs real signal.
+        ic_ci_lo, ic_ci_hi = float("nan"), float("nan")
+        if mask.sum() >= 100 and all(d is not None for d in row_dates):
+            ic_ci_lo, ic_ci_hi = _bootstrap_ic_ci_by_date(
+                meta_preds_oos_insample[mask],
+                y_h[mask],
+                [d for d, m in zip(row_dates, mask) if m],
+                n_iter=1000,
+                ci=0.95,
+                seed=42 + h,  # unique seed per horizon for IID bootstrap streams
+            )
+
         # Non-overlapping subsample IC: keep one row per non-overlapping
         # h-day window, then re-mask for finite labels. Min sample size is
         # lower (10) because non-overlapping naturally shrinks N at long
@@ -952,6 +1053,7 @@ def run_meta_training(
         # at this horizon, or extend the training window."
         nonoverlap_ic: float = float("nan")
         nonoverlap_n: int = 0
+        nonoverlap_ci_lo, nonoverlap_ci_hi = float("nan"), float("nan")
         if all(d is not None for d in row_dates):
             nonoverlap_mask = _nonoverlapping_date_mask(row_dates, h)
             combined_mask = np.array(nonoverlap_mask) & mask
@@ -964,12 +1066,27 @@ def run_meta_training(
                     if np.isfinite(sp_no.correlation) else float("nan")
                 )
                 nonoverlap_n = int(combined_mask.sum())
+                # Bootstrap CI on the non-overlap subsample. CI naturally
+                # widens at long horizons (8 dates at h=90d → much wider
+                # than at h=5d's ~144 dates). The width is the diagnostic.
+                nonoverlap_ci_lo, nonoverlap_ci_hi = _bootstrap_ic_ci_by_date(
+                    meta_preds_oos_insample[combined_mask],
+                    y_h[combined_mask],
+                    [d for d, m in zip(row_dates, combined_mask) if m],
+                    n_iter=1000,
+                    ci=0.95,
+                    seed=42 + h + 1000,  # offset from overlap seed
+                )
 
         horizon_ics[f"{h}d"] = {
             "spearman": ic,
             "n": int(mask.sum()),
+            "spearman_ci_lo": ic_ci_lo,
+            "spearman_ci_hi": ic_ci_hi,
             "spearman_nonoverlap": nonoverlap_ic,
             "n_nonoverlap": nonoverlap_n,
+            "spearman_nonoverlap_ci_lo": nonoverlap_ci_lo,
+            "spearman_nonoverlap_ci_hi": nonoverlap_ci_hi,
         }
 
     # Backwards-compat: keep spearman_5d / spearman_21d scalars for the
@@ -979,15 +1096,21 @@ def run_meta_training(
     mask_5d_count = horizon_ics["5d"]["n"]
     mask_21d_count = horizon_ics["21d"]["n"]
 
+    def _fmt_ci(lo: float, hi: float) -> str:
+        if not (np.isfinite(lo) and np.isfinite(hi)):
+            return "[—,—]"
+        return f"[{lo:+.4f},{hi:+.4f}]"
+
     _ic_line = "  ".join(
-        f"{k}={v['spearman']:+.4f} (n={v['n']})" for k, v in horizon_ics.items()
-    )
-    log.info("Horizon IC curve (overlapping): %s", _ic_line)
-    _no_line = "  ".join(
-        f"{k}={v['spearman_nonoverlap']:+.4f} (n={v['n_nonoverlap']})"
+        f"{k}={v['spearman']:+.4f}{_fmt_ci(v['spearman_ci_lo'], v['spearman_ci_hi'])} (n={v['n']})"
         for k, v in horizon_ics.items()
     )
-    log.info("Horizon IC curve (non-overlapping): %s", _no_line)
+    log.info("Horizon IC curve (overlapping, 95%% CI): %s", _ic_line)
+    _no_line = "  ".join(
+        f"{k}={v['spearman_nonoverlap']:+.4f}{_fmt_ci(v['spearman_nonoverlap_ci_lo'], v['spearman_nonoverlap_ci_hi'])} (n={v['n_nonoverlap']})"
+        for k, v in horizon_ics.items()
+    )
+    log.info("Horizon IC curve (non-overlapping, 95%% CI): %s", _no_line)
     # Flag peak horizon for quick visual in logs/email.
     _peak = max(horizon_ics.items(),
                 key=lambda kv: abs(kv[1]["spearman"]) if np.isfinite(kv[1]["spearman"]) else -1)
@@ -1295,22 +1418,44 @@ def run_meta_training(
             "n_5d": mask_5d_count,
             "n_21d": mask_21d_count,
             # v3.2: full curve across _DIAGNOSTIC_HORIZONS.
-            # v3.3 (audit Phase 1 Track B, 2026-05-07): added non-overlapping
-            # subsample fields. The legacy `spearman`/`n` are computed on
-            # all rows (overlapping forward windows). `spearman_nonoverlap`
-            # / `n_nonoverlap` greedily subsample one row per h-day window
-            # so the IC reflects independent observations. Cross-horizon
-            # ratios computed on the non-overlapping fields are honest;
-            # ratios on the legacy fields are autocorrelation-inflated.
+            # v3.3 (audit Phase 1 Track B 1/N, 2026-05-07): added
+            # non-overlapping subsample fields. The legacy `spearman`/`n`
+            # are computed on all rows (overlapping forward windows).
+            # `spearman_nonoverlap` / `n_nonoverlap` greedily subsample
+            # one row per h-day window so the IC reflects independent
+            # observations. Cross-horizon ratios computed on the
+            # non-overlapping fields are honest; ratios on the legacy
+            # fields are autocorrelation-inflated.
+            # v3.4 (Track B 2/N, 2026-05-07): added 95% bootstrap CI
+            # fields on both overlap and non-overlap. CI is computed by
+            # 1000-iter resampling of unique dates with replacement (not
+            # rows) so the CI respects within-date cross-section but
+            # properly accounts for between-date uncertainty.
             "curve": {
                 k: {
                     "spearman": round(v["spearman"], 6) if np.isfinite(v["spearman"]) else None,
                     "n": v["n"],
+                    "spearman_ci_lo": (
+                        round(v["spearman_ci_lo"], 6)
+                        if np.isfinite(v["spearman_ci_lo"]) else None
+                    ),
+                    "spearman_ci_hi": (
+                        round(v["spearman_ci_hi"], 6)
+                        if np.isfinite(v["spearman_ci_hi"]) else None
+                    ),
                     "spearman_nonoverlap": (
                         round(v["spearman_nonoverlap"], 6)
                         if np.isfinite(v["spearman_nonoverlap"]) else None
                     ),
                     "n_nonoverlap": v["n_nonoverlap"],
+                    "spearman_nonoverlap_ci_lo": (
+                        round(v["spearman_nonoverlap_ci_lo"], 6)
+                        if np.isfinite(v["spearman_nonoverlap_ci_lo"]) else None
+                    ),
+                    "spearman_nonoverlap_ci_hi": (
+                        round(v["spearman_nonoverlap_ci_hi"], 6)
+                        if np.isfinite(v["spearman_nonoverlap_ci_hi"]) else None
+                    ),
                 }
                 for k, v in horizon_ics.items()
             },
