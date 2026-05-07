@@ -681,6 +681,45 @@ def run_meta_training(
     log.info("Arrays built: %d samples, mom=%d features, vol=%d features",
              N, X_mom.shape[1], X_vol.shape[1])
 
+    # ── Step 3b: Canonical alpha labels (audit Track A PR 2/6, observe-only) ─
+    # Computes log-domain risk-matched alpha vs vol-cohort EW basket per
+    # (date, ticker) from all_close_prices. Per audit §7.3-§7.4 this is
+    # the canonical replacement for the legacy
+    # ``stock_5d_return - sector_etf_5d_return`` arithmetic label that
+    # gets attached to oos_meta_rows below in Step 6.
+    #
+    # Observe-only in this PR — labels are attached to each row but the
+    # meta-Ridge still trains on the legacy ``actual_fwd`` label.
+    # Track A PR 3 adds a parallel canonical-label Ridge fit; PR 5 cuts
+    # over to canonical labels as production training target.
+    #
+    # Computes once on the full universe (not per-fold) since the
+    # cohort partitioning is cross-sectional per-date and doesn't depend
+    # on walk-forward fold boundaries — the cohort assignment only uses
+    # *trailing* vol, no forward leakage.
+    from model.canonical_alpha_labels import compute_canonical_alpha
+
+    canonical_alpha_by_ticker: dict[str, "pd.Series"] = {}
+    try:
+        canonical_alpha_by_ticker = compute_canonical_alpha(
+            all_close_prices,
+            horizon=cfg.FORWARD_DAYS,
+            vol_lookback_days=20,
+            n_cohorts=10,
+        )
+        n_finite = sum(int(s.notna().sum()) for s in canonical_alpha_by_ticker.values())
+        log.info(
+            "Canonical alpha labels: %d tickers, %d finite (date, ticker) cells "
+            "— observe-only Track A PR 2",
+            len(canonical_alpha_by_ticker), n_finite,
+        )
+    except Exception as e:
+        log.warning(
+            "compute_canonical_alpha failed (non-blocking, observe-only): %s — "
+            "rows will get None for actual_fwd_canonical",
+            e,
+        )
+
     # ── Step 4: Build regime features + labels ───────────────────────────────
     regime_predictor = RegimePredictor()
     regime_features_df = regime_predictor.build_features(
@@ -1111,6 +1150,22 @@ def run_meta_training(
                 # Multi-horizon labels (diagnostic only)
                 for hi, h in enumerate(_DIAGNOSTIC_HORIZONS):
                     row[f"actual_fwd_{h}d"] = float(y_fwd_horizons[idx, hi])
+                # Audit Track A PR 2/6 (2026-05-07): canonical alpha label
+                # (log-domain risk-matched vs vol-cohort EW basket).
+                # Observe-only — meta-Ridge still trains on actual_fwd.
+                # NaN for rows where the ticker was unclassifiable into a
+                # cohort or the cohort had <2 members; the manifest gets
+                # the finite-row count as a coverage metric.
+                row_ts = all_dates[idx]
+                _canonical_series = canonical_alpha_by_ticker.get(ticker)
+                if _canonical_series is not None:
+                    _canonical_value = _canonical_series.get(row_ts)
+                    if _canonical_value is not None and np.isfinite(_canonical_value):
+                        row["actual_fwd_canonical"] = float(_canonical_value)
+                    else:
+                        row["actual_fwd_canonical"] = float("nan")
+                else:
+                    row["actual_fwd_canonical"] = float("nan")
                 oos_meta_rows.append(row)
                 n_rows_with_real_signals += 1
 
@@ -1284,6 +1339,55 @@ def run_meta_training(
             "spearman_nonoverlap_ci_hi": nonoverlap_ci_hi,
             "by_regime": regime_ics,
         }
+
+    # Audit Track A PR 2/6 (2026-05-07): canonical-label IC diagnostic.
+    # Computes Pearson correlation of meta_preds_oos_insample (single-Ridge
+    # output trained on legacy ``actual_fwd`` labels) against the canonical
+    # alpha labels (log-domain risk-matched vs vol-cohort EW basket).
+    # If the IC against canonical is meaningfully different from IC against
+    # legacy, that's the audit's expected direction-of-shift signal —
+    # evidence that the meta-Ridge would benefit from training on canonical
+    # labels (Track A PR 3 ships that parallel Ridge fit; PR 5 cuts over).
+    canonical_ic_metrics: dict = {"computed": False}
+    try:
+        y_canonical = np.array([
+            r.get("actual_fwd_canonical", float("nan")) for r in oos_meta_rows
+        ])
+        canonical_mask = np.isfinite(y_canonical)
+        if canonical_mask.sum() >= 100:
+            canonical_ic = float(
+                np.corrcoef(
+                    meta_preds_oos_insample[canonical_mask],
+                    y_canonical[canonical_mask],
+                )[0, 1]
+            )
+            legacy_ic_against_legacy = float(meta_model._val_ic)
+            canonical_ic_metrics = {
+                "computed": True,
+                "n_finite_canonical_labels": int(canonical_mask.sum()),
+                "n_total_rows": len(oos_meta_rows),
+                "single_ridge_ic_vs_canonical": (
+                    round(canonical_ic, 6) if np.isfinite(canonical_ic) else None
+                ),
+                "single_ridge_ic_vs_legacy": round(legacy_ic_against_legacy, 6),
+            }
+            log.info(
+                "Canonical-label IC diagnostic: single-Ridge vs canonical=%s, "
+                "vs legacy=%.4f (n_canonical=%d / n_total=%d) — observe-only Track A PR 2",
+                f"{canonical_ic:.4f}" if np.isfinite(canonical_ic) else "n/a",
+                legacy_ic_against_legacy,
+                int(canonical_mask.sum()), len(oos_meta_rows),
+            )
+        else:
+            log.info(
+                "Canonical-label IC diagnostic: only %d finite canonical labels "
+                "(need >=100) — skipped",
+                int(canonical_mask.sum()),
+            )
+    except Exception as e:
+        log.warning(
+            "Canonical-label IC diagnostic failed (non-blocking, observe-only): %s", e,
+        )
 
     # Backwards-compat: keep spearman_5d / spearman_21d scalars for the
     # existing result-dict field consumers (email, dashboard, etc.).
@@ -1996,6 +2100,14 @@ def run_meta_training(
             "regime_distribution": regime_counts,
             "peak_horizon": _peak[0],
             "peak_spearman": round(_peak[1]["spearman"], 6) if np.isfinite(_peak[1]["spearman"]) else None,
+            # Audit Track A PR 2/6 (2026-05-07): canonical-label IC
+            # diagnostic. Persisted regardless of pass/fail for cross-cycle
+            # trend monitoring. The audit's PR 5 cutover decision will
+            # compare ``single_ridge_ic_vs_canonical`` against the future
+            # ``canonical_ridge_ic_vs_canonical`` (Track A PR 3) — the
+            # canonical-label Ridge should dominate the legacy-label
+            # Ridge against the canonical target.
+            "canonical_label_ic": canonical_ic_metrics,
         },
         "walk_forward": {
             "momentum_median_ic": round(mom_median_ic, 6),
