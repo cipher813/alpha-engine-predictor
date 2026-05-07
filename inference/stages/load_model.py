@@ -105,10 +105,36 @@ def _load_meta_models(ctx: PipelineContext) -> None:
         ctx.meta_models["research_gbm"] = ResearchGBMScorer.load(path)
         log.info("Loaded ResearchGBMScorer (Phase 3 observe-only)")
     except Exception as e:
-        # Fully expected to fail in the early observation period or
-        # whenever the training-side persistence was skipped. Down-grade
-        # to debug-level so it doesn't pollute Lambda logs.
         log.debug("ResearchGBMScorer not available (observe-only OK): %s", e)
+
+    # Audit Phase 4 PR 4/6 (2026-05-07): RegimePredictorV2 +
+    # RegimeConditionedMeta ship alongside the single-Ridge meta-model
+    # in observe-only mode. The regime detector predicts the current
+    # regime; the regime-conditioned Ridge stack produces alpha for the
+    # predicted regime; both ride alongside the single-Ridge alpha as
+    # parallel diagnostics. The single Ridge remains canonical until
+    # the cutover (PR 5) gate clears (regime-conditioned IC > single-
+    # Ridge IC by ≥ 15% relative across validation period).
+    #
+    # Loaders are tolerant of either file being absent (early observation
+    # period before Sat training fires, or any cycle where the upstream
+    # training persistence was skipped). Inference doesn't fail — the
+    # parallel field rides as null in the output JSON.
+    try:
+        from model.regime_predictor_v2 import RegimePredictorV2
+        path = _dl(f"{prefix}regime_predictor_v2.pkl", "regime_predictor_v2.pkl")
+        ctx.meta_models["regime_predictor_v2"] = RegimePredictorV2.load(path)
+        log.info("Loaded RegimePredictorV2 (Phase 4 observe-only)")
+    except Exception as e:
+        log.debug("RegimePredictorV2 not available (observe-only OK): %s", e)
+
+    try:
+        from model.regime_conditioned_meta import RegimeConditionedMeta
+        path = _dl(f"{prefix}regime_conditioned_meta.pkl", "regime_conditioned_meta.pkl")
+        ctx.meta_models["regime_conditioned_meta"] = RegimeConditionedMeta.load(path)
+        log.info("Loaded RegimeConditionedMeta (Phase 4 observe-only)")
+    except Exception as e:
+        log.debug("RegimeConditionedMeta not available (observe-only OK): %s", e)
 
     # Meta-model (ridge stacker)
     try:

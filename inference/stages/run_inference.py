@@ -214,6 +214,14 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
     # research_calibrator_prob META_FEATURE; the LGB output is captured
     # per-prediction for parity comparison.
     research_gbm = ctx.meta_models.get("research_gbm")
+    # Audit Phase 4 PR 4/6 (2026-05-07): RegimePredictorV2 +
+    # RegimeConditionedMeta ride alongside the single-Ridge meta-model
+    # in observe-only mode. Predicted regime + regime-conditioned alpha
+    # are captured per-ticker for parity comparison with the single-Ridge
+    # canonical alpha. Cutover is PR 5 after the gate (regime-conditioned
+    # IC > single-Ridge IC by ≥ 15% relative) clears on validation.
+    regime_predictor_v2 = ctx.meta_models.get("regime_predictor_v2")
+    regime_conditioned_meta = ctx.meta_models.get("regime_conditioned_meta")
     meta_model = ctx.meta_models.get("meta")
 
     if mom_scorer is None and vol_scorer is None and meta_model is None:
@@ -423,6 +431,48 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
                 # predict_from_dict is defensive on missing keys.
                 log.debug("ResearchGBMScorer.predict_from_dict failed for %s: %s", ticker, e)
 
+        # Audit Phase 4 PR 4/6 (2026-05-07): regime-conditioned alpha
+        # parallel path. RegimePredictorV2 predicts the current regime
+        # (using macro features + SPY-momentum already in meta_features
+        # plus the row-level macro_* fields); RegimeConditionedMeta
+        # routes to the per-regime Ridge (or fallback) and produces an
+        # alternative alpha. Both predicted_regime and
+        # regime_conditioned_alpha ride alongside the single-Ridge alpha
+        # in the prediction dict. None values when the regime detector
+        # or the per-regime stack isn't loaded (early observation period,
+        # or training-side persistence was skipped this Saturday).
+        predicted_regime: str | None = None
+        regime_conditioned_alpha: float | None = None
+        if (
+            regime_predictor_v2 is not None
+            and getattr(regime_predictor_v2, "fitted", False)
+        ):
+            try:
+                predicted_regime = regime_predictor_v2.predict_class_from_dict(
+                    meta_features
+                )
+            except Exception as e:
+                log.debug(
+                    "RegimePredictorV2.predict_class_from_dict failed for %s: %s",
+                    ticker, e,
+                )
+        if (
+            predicted_regime is not None
+            and regime_conditioned_meta is not None
+            and getattr(regime_conditioned_meta, "fitted", False)
+        ):
+            try:
+                regime_conditioned_alpha = float(
+                    regime_conditioned_meta.predict_single_for_regime(
+                        meta_features, predicted_regime,
+                    )
+                )
+            except Exception as e:
+                log.debug(
+                    "RegimeConditionedMeta.predict_single_for_regime failed for %s: %s",
+                    ticker, e,
+                )
+
         # NaN-aware sanitization at the ridge boundary. Ridge is NaN-poison;
         # data layer ships partial-NaN features for short-history tickers
         # (2026-04-21 evening graceful-degrade policy). Impute neutral and
@@ -497,6 +547,19 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
             # Dashboards + email may surface for parity comparison.
             "research_gbm_prob": (
                 round(research_gbm_prob, 4) if research_gbm_prob is not None else None
+            ),
+            # Audit Phase 4 PR 4/6: regime-conditioned parallel path.
+            # predicted_regime is the V2 detector's class label (or None
+            # when V2 isn't loaded). regime_conditioned_alpha is the
+            # per-regime Ridge stack's alpha for that regime (or None
+            # when the stack isn't loaded). Both ride alongside the
+            # single-Ridge canonical predicted_alpha in observe-only
+            # mode. Cutover is PR 5 after the gate (regime-conditioned
+            # IC > single-Ridge IC by ≥ 15% relative) clears.
+            "predicted_regime": predicted_regime,
+            "regime_conditioned_alpha": (
+                round(regime_conditioned_alpha, 6)
+                if regime_conditioned_alpha is not None else None
             ),
             "momentum_confirmation": round(momentum_score, 6),
             "expected_move": round(expected_move, 6),
