@@ -145,6 +145,27 @@ def _load_meta_models(ctx: PipelineContext) -> None:
     except Exception as e:
         log.warning("Meta-model not available: %s", e)
 
+    # Audit Track A PR 4/6 (2026-05-07): canonical-label Ridge ships
+    # alongside the legacy single-Ridge in observe-only mode. Per-ticker
+    # canonical_predicted_alpha rides alongside the legacy predicted_alpha
+    # in the predictions JSON for parity comparison. The legacy Ridge
+    # remains canonical (executor's veto gate + sizing reads
+    # predicted_alpha unchanged) until PR 5 cutover.
+    #
+    # Loader is tolerant of canonical_meta_model.pkl being absent —
+    # early observation period before Sat training has produced one,
+    # or any cycle where canonical fit was skipped due to insufficient
+    # finite canonical labels.
+    try:
+        from model.meta_model import MetaModel
+        path = _dl(f"{prefix}canonical_meta_model.pkl", "canonical_meta_model.pkl")
+        ctx.meta_models["canonical_meta"] = MetaModel.load(path)
+        log.info("Loaded canonical-label meta-model (Track A observe-only)")
+    except Exception as e:
+        log.debug(
+            "Canonical-label meta-model not available (observe-only OK): %s", e,
+        )
+
     # Calibrator (Platt scaling on meta-model output)
     ctx.calibrator = None
     if getattr(cfg, "CALIBRATION_ENABLED", True):

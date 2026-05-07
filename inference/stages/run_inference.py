@@ -223,6 +223,12 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
     regime_predictor_v2 = ctx.meta_models.get("regime_predictor_v2")
     regime_conditioned_meta = ctx.meta_models.get("regime_conditioned_meta")
     meta_model = ctx.meta_models.get("meta")
+    # Audit Track A PR 4/6 (2026-05-07): canonical-label Ridge rides
+    # alongside the legacy meta-Ridge in observe-only mode. Per-ticker
+    # canonical_predicted_alpha is captured for parity comparison with
+    # the legacy predicted_alpha. None when the canonical Ridge isn't
+    # loaded (early observation cycle, or training-side fit was skipped).
+    canonical_meta_model = ctx.meta_models.get("canonical_meta")
 
     if mom_scorer is None and vol_scorer is None and meta_model is None:
         # Per feedback_hard_fail_until_stable: this is a cold-start load
@@ -473,6 +479,30 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
                     ticker, e,
                 )
 
+        # Audit Track A PR 4/6 (2026-05-07): canonical-label Ridge
+        # parallel path. The canonical Ridge consumes the same
+        # meta_features the legacy Ridge consumes; produces an alpha
+        # trained on canonical labels (log-domain risk-matched vs
+        # vol-cohort EW basket). The output rides alongside the legacy
+        # predicted_alpha as canonical_predicted_alpha for parity
+        # comparison. The legacy Ridge remains canonical until PR 5
+        # cutover. None when the canonical Ridge isn't loaded (early
+        # observation cycle) or per-ticker prediction failed.
+        canonical_predicted_alpha: float | None = None
+        if (
+            canonical_meta_model is not None
+            and getattr(canonical_meta_model, "is_fitted", True)
+        ):
+            try:
+                canonical_predicted_alpha = float(
+                    canonical_meta_model.predict_single(meta_features)
+                )
+            except Exception as e:
+                log.debug(
+                    "canonical_meta_model.predict_single failed for %s: %s",
+                    ticker, e,
+                )
+
         # NaN-aware sanitization at the ridge boundary. Ridge is NaN-poison;
         # data layer ships partial-NaN features for short-history tickers
         # (2026-04-21 evening graceful-degrade policy). Impute neutral and
@@ -560,6 +590,17 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
             "regime_conditioned_alpha": (
                 round(regime_conditioned_alpha, 6)
                 if regime_conditioned_alpha is not None else None
+            ),
+            # Audit Track A PR 4/6: canonical-label Ridge parallel output.
+            # Rides alongside predicted_alpha (legacy single-Ridge canonical)
+            # in observe-only mode. None when the canonical Ridge isn't
+            # loaded or per-ticker prediction failed. Cutover is PR 5
+            # after the gate (canonical_ridge_ic > legacy_ridge_ic against
+            # canonical labels) clears in the manifest's
+            # horizon_diagnostic.canonical_label_ic sub-dict.
+            "canonical_predicted_alpha": (
+                round(canonical_predicted_alpha, 6)
+                if canonical_predicted_alpha is not None else None
             ),
             "momentum_confirmation": round(momentum_score, 6),
             "expected_move": round(expected_move, 6),
