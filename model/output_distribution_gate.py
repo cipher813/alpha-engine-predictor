@@ -260,6 +260,180 @@ def validate_live_batch_distribution(
     )
 
 
+def validate_stratified_per_regime(
+    predictions: list[dict],
+    regimes: list[str],
+    *,
+    min_per_regime_size: int = 25,
+    min_unique_p_up: int = 8,
+    max_saturation_rate: float = 0.25,
+    min_stdev: float = 0.005,
+    max_direction_skew: float = 0.85,
+    floor: float = 0.011,
+    ceiling: float = 0.989,
+) -> OutputDistributionGateResult:
+    """Run the four invariants check INDEPENDENTLY on each regime's slice
+    of the prediction batch.
+
+    Audit Phase 2a-PROMOTE Option C (2026-05-07): the synthetic-sweep
+    variant catches calibrator-internal failures (isotonic plateaus,
+    floor clipping); the live-batch variant catches degenerate live
+    output. Both can pass while the model collapses in only one regime
+    (e.g. healthy IC + non-degenerate output in bull/neutral, but in
+    bear regime the Ridge output lands entirely in a calibrator flat
+    region). Aggregate-pool gates miss this; a per-regime stratified
+    gate catches it.
+
+    Per audit §9.2: "C catches the cross-regime failure class that B
+    (synthetic) can't see. **B + C together catch all four recent
+    incidents at the gate.** A or D alone catches at most three."
+
+    Designed to be called from training/meta_trainer.py after the
+    composite IC + synthetic-sweep gates pass. Inputs are the same OOS
+    rows the existing horizon-IC diagnostic uses, with predictions
+    already calibrated and a regime label attached per row.
+
+    Pass semantics:
+      - All regimes with >= ``min_per_regime_size`` rows must individually
+        pass all four invariants.
+      - Regimes with < ``min_per_regime_size`` rows are SKIPPED with a
+        note in the metrics — too few rows to make a meaningful
+        per-regime call. This matches the audit's "don't confuse
+        low-sample noise with signal" framing.
+      - If every regime is below ``min_per_regime_size``, the gate
+        returns ``passed=True`` with a metrics dict indicating
+        "insufficient stratified sample" — operator decides whether
+        the training corpus is too narrow.
+
+    Fail semantics:
+      - Returns ``passed=False`` with ``failed_check`` formatted as
+        ``"{regime}/{check}"`` (e.g. ``"bear/unique_p_up"``).
+      - ``reason`` includes the regime name explicitly so operators
+        immediately know which regime collapsed.
+      - ``metrics`` carries per-regime invariant results regardless
+        of pass/fail, so a borderline-pass regime over multiple
+        training cycles is itself a useful trend signal.
+
+    Args:
+        predictions: list of prediction dicts (same shape as
+            ``validate_live_batch_distribution`` input — must have
+            ``p_up`` and ``predicted_direction``).
+        regimes: parallel list of regime labels (one per prediction).
+            Each label must be one of ``"bull"`` / ``"neutral"`` /
+            ``"bear"``; other labels are tolerated but bucketed into
+            ``"other"`` and excluded from the per-regime check.
+        min_per_regime_size: minimum rows required for a regime to
+            participate. Default 25 — fewer rows than that and the
+            within-regime stdev / uniqueness checks are too noisy.
+        Other args: same thresholds as the other gate variants.
+    """
+    import numpy as np
+
+    if len(predictions) != len(regimes):
+        return OutputDistributionGateResult(
+            passed=False,
+            failed_check="input_mismatch",
+            reason=(
+                f"predictions ({len(predictions)}) and regimes "
+                f"({len(regimes)}) length disagree"
+            ),
+            metrics={},
+        )
+
+    # Bucket predictions by regime.
+    by_regime: dict[str, list[dict]] = {"bull": [], "neutral": [], "bear": []}
+    for p, r in zip(predictions, regimes):
+        if r in by_regime:
+            by_regime[r].append(p)
+
+    per_regime_results: dict[str, dict] = {}
+    failed_regime: str | None = None
+    failed_result: OutputDistributionGateResult | None = None
+    n_regimes_evaluated = 0
+
+    for regime in ("bull", "neutral", "bear"):
+        regime_preds = by_regime[regime]
+        if len(regime_preds) < min_per_regime_size:
+            per_regime_results[regime] = {
+                "evaluated": False,
+                "n": len(regime_preds),
+                "reason": f"below min_per_regime_size={min_per_regime_size}",
+            }
+            continue
+
+        n_regimes_evaluated += 1
+        # Reuse the live-batch helper — same four invariants, applied
+        # to this regime's slice. We pass min_batch_size=1 because the
+        # outer loop already enforces min_per_regime_size; we don't want
+        # the inner helper to second-guess it.
+        regime_result = validate_live_batch_distribution(
+            regime_preds,
+            min_unique_p_up=min_unique_p_up,
+            max_saturation_rate=max_saturation_rate,
+            min_stdev=min_stdev,
+            max_direction_skew=max_direction_skew,
+            floor=floor,
+            ceiling=ceiling,
+            min_batch_size=1,
+        )
+        per_regime_results[regime] = {
+            "evaluated": True,
+            "n": len(regime_preds),
+            "passed": regime_result.passed,
+            "failed_check": regime_result.failed_check,
+            "reason": regime_result.reason,
+            "metrics": regime_result.metrics,
+        }
+        if not regime_result.passed and failed_regime is None:
+            failed_regime = regime
+            failed_result = regime_result
+
+    aggregate_metrics = {
+        "n_regimes_evaluated": n_regimes_evaluated,
+        "min_per_regime_size": min_per_regime_size,
+        "per_regime": per_regime_results,
+    }
+
+    if n_regimes_evaluated == 0:
+        return OutputDistributionGateResult(
+            passed=True,
+            failed_check=None,
+            reason=(
+                f"no regime met min_per_regime_size={min_per_regime_size} "
+                f"— stratified gate does not fire"
+            ),
+            metrics=aggregate_metrics,
+        )
+
+    if failed_regime is not None and failed_result is not None:
+        regime_count = per_regime_results[failed_regime]["n"]
+        failure_label = f"{failed_regime}/{failed_result.failed_check}"
+        compose_reason = (
+            f"regime '{failed_regime}' (n={regime_count}) failed "
+            f"{failed_result.failed_check}: {failed_result.reason}"
+        )
+        log.warning(
+            "Stratified per-regime gate FAILED — %s", compose_reason,
+        )
+        return OutputDistributionGateResult(
+            passed=False,
+            failed_check=failure_label,
+            reason=compose_reason,
+            metrics=aggregate_metrics,
+        )
+
+    log.info(
+        "Stratified per-regime gate PASSED — all %d evaluated regimes clean",
+        n_regimes_evaluated,
+    )
+    return OutputDistributionGateResult(
+        passed=True,
+        failed_check=None,
+        reason=f"all {n_regimes_evaluated} evaluated regimes passed",
+        metrics=aggregate_metrics,
+    )
+
+
 def _evaluate_distribution_invariants(
     *,
     p_ups,
