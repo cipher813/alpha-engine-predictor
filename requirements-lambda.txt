@@ -1,4 +1,11 @@
-# Lambda deployment requirements (GBM + CatBoost inference — no PyTorch)
+# Lambda deployment requirements (GBM + CatBoost inference — no PyTorch).
+#
+# Keep the alpha-engine-lib pin in lockstep with the project-root
+# requirements.txt — they're two views of the same dependency graph
+# (root file used by training EC2 + local dev; this file used by the
+# Dockerfile in the Lambda image). Drift between them shipped a stale
+# lib to prod on 2026-05-07.
+alpha-engine-lib[arcticdb,flow_doctor] @ git+https://github.com/cipher813/alpha-engine-lib@v0.5.5
 numpy>=1.24.0,<2
 pandas>=2.0.0
 pyarrow>=14.0.0
