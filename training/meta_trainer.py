@@ -1214,6 +1214,89 @@ def run_meta_training(
     meta_model = MetaModel(alpha=1.0)
     meta_model.fit(meta_X, meta_y, feature_names=META_FEATURES)
 
+    # ── Step 7e: Parallel canonical-label Ridge (audit Track A PR 3/6) ──────
+    # Fits a second Ridge on the same META_FEATURES but with canonical
+    # alpha labels (log-domain risk-matched vs vol-cohort EW basket) as
+    # the regression target instead of legacy ``actual_fwd``. Persisted
+    # alongside the legacy Ridge in observe-only mode — inference doesn't
+    # consume it yet (Track A PR 4 wires that). Cutover is PR 5 after the
+    # parity comparison validates direction-of-shift.
+    #
+    # Same parallel-observation pattern as Phase 3 PR 2 (research-LGB) and
+    # Phase 4 PR 3 (per-regime Ridge stack). Manifest carries val_ic for
+    # both Ridges so the cutover decision is data-driven.
+    canonical_meta_model: MetaModel | None = None
+    canonical_meta_model_metrics: dict | None = None
+    try:
+        canonical_y_full = np.array([
+            r.get("actual_fwd_canonical", float("nan")) for r in oos_meta_rows
+        ])
+        canonical_finite_mask = np.isfinite(canonical_y_full)
+        if canonical_finite_mask.sum() >= 100:
+            canonical_meta_model = MetaModel(alpha=1.0).fit(
+                meta_X[canonical_finite_mask],
+                canonical_y_full[canonical_finite_mask],
+                feature_names=META_FEATURES,
+            )
+            # Compute IC of canonical Ridge against canonical labels (its own
+            # training target) AND against legacy labels (parity comparison
+            # — does training on canonical labels degrade legacy-label IC?).
+            canonical_preds = canonical_meta_model.predict(
+                meta_X[canonical_finite_mask]
+            )
+            canonical_y_subset = canonical_y_full[canonical_finite_mask]
+            legacy_y_subset = meta_y[canonical_finite_mask]
+            ic_canonical_ridge_vs_canonical = (
+                float(np.corrcoef(canonical_preds, canonical_y_subset)[0, 1])
+                if np.std(canonical_preds) > 0 else 0.0
+            )
+            # IC of canonical Ridge on legacy labels (cross-target).
+            mask_finite_legacy = np.isfinite(legacy_y_subset)
+            if mask_finite_legacy.sum() >= 50:
+                ic_canonical_ridge_vs_legacy = float(np.corrcoef(
+                    canonical_preds[mask_finite_legacy],
+                    legacy_y_subset[mask_finite_legacy],
+                )[0, 1])
+            else:
+                ic_canonical_ridge_vs_legacy = float("nan")
+            canonical_meta_model_metrics = {
+                "type": "canonical_meta_model_v1",
+                "fitted": True,
+                "n_samples": int(canonical_finite_mask.sum()),
+                "ic_canonical_ridge_vs_canonical": (
+                    round(ic_canonical_ridge_vs_canonical, 6)
+                    if np.isfinite(ic_canonical_ridge_vs_canonical) else None
+                ),
+                "ic_canonical_ridge_vs_legacy": (
+                    round(ic_canonical_ridge_vs_legacy, 6)
+                    if np.isfinite(ic_canonical_ridge_vs_legacy) else None
+                ),
+                "ic_legacy_ridge_vs_legacy": round(meta_model._val_ic, 6),
+                "feature_names": list(META_FEATURES),
+                "coefficients": canonical_meta_model._coefficients,
+            }
+            log.info(
+                "Canonical Ridge fit: n=%d, ic_canonical_ridge_vs_canonical=%s, "
+                "ic_canonical_ridge_vs_legacy=%s, ic_legacy_ridge_vs_legacy=%.4f "
+                "— observe-only Track A PR 3/6",
+                int(canonical_finite_mask.sum()),
+                f"{ic_canonical_ridge_vs_canonical:.4f}"
+                if np.isfinite(ic_canonical_ridge_vs_canonical) else "n/a",
+                f"{ic_canonical_ridge_vs_legacy:.4f}"
+                if np.isfinite(ic_canonical_ridge_vs_legacy) else "n/a",
+                meta_model._val_ic,
+            )
+        else:
+            log.info(
+                "Canonical Ridge: only %d finite canonical labels (need >=100) — "
+                "skipped this cycle. Legacy meta-Ridge unchanged.",
+                int(canonical_finite_mask.sum()),
+            )
+    except Exception as e:
+        log.warning(
+            "Canonical Ridge fit failed (non-blocking, observe-only): %s", e,
+        )
+
     # ── Step 7.1: Multi-horizon forward IC diagnostic (ROADMAP Predictor P2) ─
     # Evaluate how well the 5d-trained meta-model ranks tickers at multiple
     # forward horizons. 2026-04-15 first measurement (5d vs 21d only) showed
@@ -1823,6 +1906,14 @@ def run_meta_training(
                 models["regime_conditioned_meta"] = (
                     prod_regime_conditioned_meta, "regime_conditioned_meta.pkl",
                 )
+            # Audit Track A PR 3/6: canonical-label Ridge ships in
+            # observe-only mode. Inference doesn't load it yet (PR 4
+            # wires that). The legacy meta_model.pkl above remains the
+            # canonical alpha source.
+            if canonical_meta_model is not None:
+                models["canonical_meta_model"] = (
+                    canonical_meta_model, "canonical_meta_model.pkl",
+                )
             # Dated archive is always written (records what training produced
             # regardless of gate decision). Live path is only overwritten when
             # the promotion gate passes — otherwise live weights stay at the
@@ -1915,6 +2006,20 @@ def run_meta_training(
                             **(regime_conditioned_meta_metrics or {}),
                         }}
                         if prod_regime_conditioned_meta is not None else {}
+                    ),
+                    # Audit Track A PR 3/6 (2026-05-07): canonical-label
+                    # Ridge observe-only metrics. Carries val_ic for the
+                    # canonical Ridge against both canonical and legacy
+                    # labels — PR 5's cutover decision compares
+                    # ic_canonical_ridge_vs_canonical against
+                    # ic_legacy_ridge_vs_legacy to confirm the canonical
+                    # Ridge dominates against its own (canonical) target.
+                    **(
+                        {"canonical_meta_model": {
+                            "key": f"{prefix}canonical_meta_model.pkl",
+                            **(canonical_meta_model_metrics or {}),
+                        }}
+                        if canonical_meta_model is not None else {}
                     ),
                 },
                 "walk_forward": {
