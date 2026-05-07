@@ -1,13 +1,15 @@
 """Unit tests for inference.deploy_drift — SF + CF drift probe.
 
 Exercises the pure-Python compare logic + the boto3-call surface with
-stubs. GitHub API is mocked via urllib patch.
+stubs. The GitHub-fetch helper (``_fetch_origin_main_sha``) is owned
+by alpha-engine-lib and tested there; this module re-imports it so
+``patch.object(dd, "_fetch_origin_main_sha", ...)`` keeps mocking the
+same symbol the production code calls.
 """
 
 from __future__ import annotations
 
 import json
-import urllib.error
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -126,25 +128,6 @@ def test_github_outage_is_no_drift(mock_fetch, mock_tag, mock_comment):
     result = dd.check_deploy_drift(region="us-east-1", account_id="123")
     assert result["has_drift"] is False
     assert result["upstream_sha"] is None
-
-
-# ── GitHub fetch ─────────────────────────────────────────────────────────────
-
-def test_fetch_origin_main_sha_happy():
-    mock_resp = MagicMock()
-    mock_resp.read.return_value = b'{"commit": {"sha": "beef1234"}}'
-    mock_resp.__enter__ = MagicMock(return_value=mock_resp)
-    mock_resp.__exit__ = MagicMock(return_value=False)
-    with patch("urllib.request.urlopen", return_value=mock_resp):
-        sha = dd._fetch_origin_main_sha("cipher813/alpha-engine-data")
-    assert sha == "beef1234"
-
-
-def test_fetch_origin_main_sha_returns_none_on_network_error():
-    with patch("urllib.request.urlopen",
-               side_effect=urllib.error.URLError("dns")):
-        sha = dd._fetch_origin_main_sha("cipher813/alpha-engine-data")
-    assert sha is None
 
 
 # ── AWS read surface ─────────────────────────────────────────────────────────
