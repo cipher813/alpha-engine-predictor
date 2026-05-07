@@ -1392,6 +1392,42 @@ def run_meta_training(
             "ResearchGBMScorer fit failed (non-blocking, observe-only): %s", e,
         )
 
+    # ── Step 7d: RegimeConditionedMeta fit (audit Phase 4 PR 3/6, observe-only) ─
+    # Three Ridges (one per regime) + an unconditioned fallback. Fits on
+    # the same OOS rows + their regime labels (already attached by Track B
+    # 3/N's _classify_regime). Persisted alongside the single Ridge in
+    # observe-only mode; inference doesn't read it yet (PR 4 wires that).
+    # Cutover is PR 5 after the gate (regime-conditioned ensemble IC must
+    # exceed single-Ridge IC by ≥ 15% relative across validation period)
+    # has cleared.
+    from model.regime_conditioned_meta import RegimeConditionedMeta
+
+    prod_regime_conditioned_meta: RegimeConditionedMeta | None = None
+    regime_conditioned_meta_metrics: dict | None = None
+    try:
+        if len(oos_meta_rows) >= 600:  # need ~200 per regime worst case
+            prod_regime_conditioned_meta = RegimeConditionedMeta(
+                alpha=1.0, min_per_regime_rows=200,
+            ).fit(meta_X, meta_y, row_regimes, feature_names=META_FEATURES)
+            regime_conditioned_meta_metrics = prod_regime_conditioned_meta.metrics()
+            log.info(
+                "RegimeConditionedMeta fit: dedicated_ridges=%s, fallback_val_ic=%s — "
+                "observe-only Phase 4 PR 3/6",
+                regime_conditioned_meta_metrics["regimes_with_dedicated_ridge"],
+                f"{prod_regime_conditioned_meta._fallback_ridge._val_ic:.4f}"
+                if prod_regime_conditioned_meta._fallback_ridge is not None else "n/a",
+            )
+        else:
+            log.info(
+                "RegimeConditionedMeta: only %d OOS rows (need >=600 for 3-regime fit) — "
+                "skipped this cycle.",
+                len(oos_meta_rows),
+            )
+    except Exception as e:
+        log.warning(
+            "RegimeConditionedMeta fit failed (non-blocking, observe-only): %s", e,
+        )
+
     # ── Step 7b: Fit isotonic calibrator on meta OOS predictions ─────────────
     # ROADMAP P1: collapse FLAT, use calibrated P(UP) as confidence.
     #
@@ -1675,6 +1711,14 @@ def run_meta_training(
             # loading it 2026-04-16).
             if prod_regime_v2 is not None:
                 models["regime_predictor_v2"] = (prod_regime_v2, "regime_predictor_v2.pkl")
+            # Audit Phase 4 PR 3/6: RegimeConditionedMeta (3 Ridges + fallback)
+            # ships in observe-only mode. Inference doesn't load it yet
+            # (PR 4 wires that). The single-Ridge meta_model.pkl above
+            # remains the canonical alpha source.
+            if prod_regime_conditioned_meta is not None:
+                models["regime_conditioned_meta"] = (
+                    prod_regime_conditioned_meta, "regime_conditioned_meta.pkl",
+                )
             # Dated archive is always written (records what training produced
             # regardless of gate decision). Live path is only overwritten when
             # the promotion gate passes — otherwise live weights stay at the
@@ -1757,6 +1801,16 @@ def run_meta_training(
                             **(regime_v2_metrics or {}),
                         }}
                         if prod_regime_v2 is not None else {}
+                    ),
+                    # Audit Phase 4 PR 3/6 (2026-05-07): RegimeConditionedMeta
+                    # observe-only metrics. Carries per-regime val_ic +
+                    # sample counts so PR 5's cutover decision is data-driven.
+                    **(
+                        {"regime_conditioned_meta": {
+                            "key": f"{prefix}regime_conditioned_meta.pkl",
+                            **(regime_conditioned_meta_metrics or {}),
+                        }}
+                        if prod_regime_conditioned_meta is not None else {}
                     ),
                 },
                 "walk_forward": {
