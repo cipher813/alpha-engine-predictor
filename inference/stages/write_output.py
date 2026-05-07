@@ -200,6 +200,40 @@ def write_predictions(
     dry_run :     If True, print to stdout instead of writing to S3.
     veto_threshold : Confidence threshold for veto gate. Defaults to cfg.MIN_CONFIDENCE.
     """
+    # Audit Phase 2a-INFER (2026-05-07): output-distribution gate at the
+    # inference-time write site. Validates the live batch's p_up
+    # distribution against the same four invariants the promotion gate
+    # uses (uniqueness / saturation / stdev / direction skew). Behind a
+    # feature flag for one observation cycle so we measure baseline pass
+    # rate before promoting the gate to fail-closed.
+    #
+    # When the flag is True and the gate fails:
+    #   - log ERROR with structured reason
+    #   - record the failure in the metrics output for forensic trail
+    #   - raise RuntimeError so the Lambda handler returns an error,
+    #     SF Catch [States.ALL] fires, flow-doctor alerts, predictions.json
+    #     is NOT written (executor reads prior-day fallback)
+    #
+    # The gate's metrics ride along with the standard metrics.json write
+    # in observe-only mode, so we get a forensic record of "would this
+    # have blocked today's invocation" without risk to live trading.
+    from model.output_distribution_gate import validate_live_batch_distribution
+    inference_gate_blocking = bool(
+        getattr(cfg, "OUTPUT_DISTRIBUTION_GATE_INFERENCE_BLOCKING", False)
+    )
+    inference_gate_result = validate_live_batch_distribution(predictions)
+    if not inference_gate_result.passed:
+        log.error(
+            "Output-distribution gate FAILED at inference-time on %d-row batch: %s "
+            "(blocking=%s)",
+            len(predictions), inference_gate_result.reason, inference_gate_blocking,
+        )
+    else:
+        log.info(
+            "Output-distribution gate (inference-time) PASSED — %s",
+            inference_gate_result.reason,
+        )
+
     threshold = veto_threshold if veto_threshold is not None else cfg.MIN_CONFIDENCE
     # Build the predictions envelope
     n_high_confidence = sum(
@@ -222,10 +256,41 @@ def write_predictions(
         "n_high_confidence": n_high_confidence,
         "last_run_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "status": "ok",
+        # Audit Phase 2a-INFER: persist the gate result alongside the
+        # standard metrics for forensic trail. Carries pass/fail +
+        # failed_check + the four measured invariants (n_unique_p_up,
+        # saturation_rate, stdev_p_up, direction_skew) regardless of
+        # whether the gate was in blocking mode this run.
+        "output_distribution_gate": {
+            "passed": inference_gate_result.passed,
+            "failed_check": inference_gate_result.failed_check,
+            "reason": inference_gate_result.reason,
+            "metrics": inference_gate_result.metrics,
+            "blocking": inference_gate_blocking,
+            "would_have_blocked_if_blocking": not inference_gate_result.passed,
+        },
     }
 
     predictions_json = json.dumps(output, indent=2)
     metrics_json = json.dumps(metrics_out, indent=2)
+
+    # Audit Phase 2a-INFER: fail-closed at the boundary. If the gate
+    # failed AND the blocking flag is on, raise BEFORE the dry_run
+    # short-circuit and BEFORE any S3 write. The raise must fire in
+    # dry-run drills too — operators want to catch degenerate batches
+    # during a release simulation the same way as in production. Per
+    # audit §9.5: the alert IS the record; writing stale metrics with
+    # status=ok would mislead dashboards.
+    if inference_gate_blocking and not inference_gate_result.passed:
+        raise RuntimeError(
+            f"Output-distribution gate refused write at inference time: "
+            f"{inference_gate_result.reason}. predictions.json NOT written; "
+            f"executor falls back to prior-day predictions. "
+            f"Investigate the model output (manifest's output_distribution_gate "
+            f"sub-dict from the most recent training run) before next "
+            f"inference; if the model is genuinely unhealthy, roll back to "
+            f"a known-good archive at predictor/weights/meta/archive/."
+        )
 
     if dry_run:
         print("=== PREDICTIONS (dry-run) ===")
