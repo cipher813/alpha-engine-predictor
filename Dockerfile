@@ -31,12 +31,15 @@ ARG GIT_SHA=unknown
 RUN echo "${GIT_SHA}" > /var/task/GIT_SHA.txt
 
 # Copy and install Python requirements first for better layer caching.
-# alpha-engine-lib is installed from public git+https (lib was flipped
-# public 2026-05-03; previous versions vendored a local copy).
+# alpha-engine-lib is pinned in requirements-lambda.txt (single source of
+# truth for the Lambda image — keep in lockstep with the project-root
+# requirements.txt). The standalone install line previously here drifted
+# behind requirements.txt and shipped v0.2.4 to prod even after the
+# project pin moved to v0.5.5; consolidating prevents a repeat (see
+# `feedback_two_doc_sources_two_staleness_vectors`).
 COPY requirements-lambda.txt .
 
-RUN pip install --no-cache-dir "alpha-engine-lib[arcticdb,flow_doctor] @ git+https://github.com/cipher813/alpha-engine-lib@v0.2.4" && \
-    pip install --no-cache-dir -r requirements-lambda.txt && \
+RUN pip install --no-cache-dir -r requirements-lambda.txt && \
     rm -rf /root/.cache/pip
 
 # Copy application code
