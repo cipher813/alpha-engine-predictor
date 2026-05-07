@@ -17,7 +17,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -69,7 +68,11 @@ def _fetch_origin_main_sha(repo: str, branch: str = "main", timeout: float = 5.0
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             payload = json.loads(resp.read())
         return payload.get("commit", {}).get("sha")
-    except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError) as exc:
+    except (OSError, json.JSONDecodeError) as exc:
+        # OSError covers urllib.error.URLError/HTTPError plus the bare
+        # TimeoutError that urlopen raises on a read-phase timeout (the
+        # 2026-05-07 weekday SF failure: read timed out inside getresponse,
+        # which is past urllib's OSError→URLError wrap point).
         log.warning("Deploy-drift: GitHub API unreachable (%s) — cannot compare", exc)
         return None
 

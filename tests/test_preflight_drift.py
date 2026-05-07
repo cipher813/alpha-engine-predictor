@@ -114,3 +114,16 @@ def test_fetch_origin_main_returns_none_on_network_error():
                side_effect=urllib.error.URLError("dns failure")):
         sha = pf._fetch_origin_main_sha("cipher813/alpha-engine-predictor")
     assert sha is None
+
+
+def test_fetch_origin_main_returns_none_on_read_timeout():
+    # Regression: urllib.request.urlopen raises a bare TimeoutError on
+    # read-phase timeouts (inside getresponse), not URLError. The
+    # 2026-05-07 weekday SF failure was exactly this — the Lambda crashed
+    # because the except clause didn't cover TimeoutError. Drift check is
+    # designed to warn-and-continue on GitHub outages, so a read timeout
+    # must degrade gracefully too.
+    with patch("urllib.request.urlopen",
+               side_effect=TimeoutError("The read operation timed out")):
+        sha = pf._fetch_origin_main_sha("cipher813/alpha-engine-predictor")
+    assert sha is None
