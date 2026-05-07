@@ -1374,7 +1374,10 @@ def run_meta_training(
     # the calibrator's output the way the executor consumes it. Off
     # behind a feature flag for one Saturday-SF observation cycle, then
     # flips to blocking via predictor_params.json.
-    from model.output_distribution_gate import validate_calibrator_distribution
+    from model.output_distribution_gate import (
+        validate_calibrator_distribution,
+        validate_stratified_per_regime,
+    )
     output_dist_result = validate_calibrator_distribution(calibrator)
     output_dist_blocking = bool(
         cfg.OUTPUT_DISTRIBUTION_GATE_BLOCKING
@@ -1382,14 +1385,54 @@ def run_meta_training(
     )
     output_dist_gate_passed = output_dist_result.passed if output_dist_blocking else True
 
+    # Audit Phase 2a-PROMOTE Option C (2026-05-07): stratified per-regime
+    # variant. The synthetic-sweep gate above catches calibrator-internal
+    # failures; this catches regime-conditional degeneracy where the
+    # model's output collapses in only one regime (bull/neutral/bear).
+    # Both can pass while a regime-conditional failure ships. Reuses the
+    # same OOS rows + meta-model predictions the existing horizon-IC
+    # diagnostic computed earlier in Step 7.1, plus runs them through
+    # the calibrator and slices by regime label (already attached to
+    # each oos_meta_row via the Track B 3/N PR).
+    stratified_result = None
+    try:
+        # Calibrate the meta predictions to p_up + direction (one entry
+        # per OOS row) then bucket by regime for the per-regime check.
+        stratified_predictions: list[dict] = []
+        stratified_regimes: list[str] = []
+        for i, raw_alpha in enumerate(meta_preds_oos_insample):
+            cal_result = calibrator.calibrate_prediction(float(raw_alpha))
+            stratified_predictions.append({
+                "p_up": cal_result["p_up"],
+                "predicted_direction": cal_result["predicted_direction"],
+            })
+            stratified_regimes.append(row_regimes[i])
+        stratified_result = validate_stratified_per_regime(
+            stratified_predictions, stratified_regimes,
+        )
+    except Exception as e:
+        log.warning(
+            "Stratified per-regime gate computation failed (non-blocking): %s", e,
+        )
+    stratified_gate_passed = (
+        stratified_result.passed if (stratified_result is not None and output_dist_blocking)
+        else True
+    )
+
     promoted = (
         meta_ic_passed
         and subsample_gate_passed
         and output_dist_gate_passed
+        and stratified_gate_passed
+    )
+    _stratified_status = (
+        "n/a" if stratified_result is None
+        else ("PASS" if stratified_result.passed else "FAIL")
     )
     log.info(
         "Promotion gate: meta_IC=%.4f %s %.4f (meta=%s) AND component "
-        "subsample (mom=%s, vol=%s, research=%s) AND output_dist=%s%s → %s "
+        "subsample (mom=%s, vol=%s, research=%s) AND output_dist=%s "
+        "AND stratified_per_regime=%s%s → %s "
         "(walk-forward for reference: mom_median=%.4f, vol_median=%.4f)",
         meta_model._val_ic, ">=" if meta_ic_passed else "<", _meta_ic_gate,
         "PASS" if meta_ic_passed else "BLOCK",
@@ -1397,6 +1440,7 @@ def run_meta_training(
         "PASS" if vol_subsample_result.passed else "BLOCK",
         "PASS" if research_subsample_result.passed else "BLOCK",
         "PASS" if output_dist_result.passed else "FAIL",
+        _stratified_status,
         "" if output_dist_blocking else " (OBSERVE-ONLY: not blocking)",
         "PROMOTE" if promoted else "BLOCK",
         mom_median_ic, vol_median_ic,
@@ -1505,6 +1549,22 @@ def run_meta_training(
                     "blocking": output_dist_blocking,
                     "would_have_blocked_if_blocking": (
                         not output_dist_result.passed
+                    ),
+                    # Phase 2a-PROMOTE Option C (2026-05-07): stratified
+                    # per-regime sub-gate. Persisted regardless of
+                    # pass/fail — borderline-pass on one regime over
+                    # multiple training cycles is a useful trend signal.
+                    "stratified_per_regime": (
+                        {
+                            "passed": stratified_result.passed,
+                            "failed_check": stratified_result.failed_check,
+                            "reason": stratified_result.reason,
+                            "metrics": stratified_result.metrics,
+                            "would_have_blocked_if_blocking": (
+                                not stratified_result.passed
+                            ),
+                        } if stratified_result is not None
+                        else {"passed": None, "reason": "computation skipped"}
                     ),
                 },
             }
