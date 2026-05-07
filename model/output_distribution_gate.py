@@ -149,6 +149,141 @@ def validate_calibrator_distribution(
     p_ups = np.array([r["p_up"] for r in results])
     directions = [r.get("predicted_direction") for r in results]
 
+    extra_metrics = {
+        "calibrator_fitted": True,
+        "n_synthetic": n_synthetic,
+        "alpha_range": list(alpha_range),
+    }
+    return _evaluate_distribution_invariants(
+        p_ups=p_ups,
+        directions=directions,
+        source_label=f"synthetic alpha sweep ({n_synthetic} samples)",
+        min_unique_p_up=min_unique_p_up,
+        max_saturation_rate=max_saturation_rate,
+        min_stdev=min_stdev,
+        max_direction_skew=max_direction_skew,
+        floor=floor,
+        ceiling=ceiling,
+        extra_metrics=extra_metrics,
+    )
+
+
+def validate_live_batch_distribution(
+    predictions: list[dict],
+    *,
+    min_unique_p_up: int = 8,
+    max_saturation_rate: float = 0.25,
+    min_stdev: float = 0.005,
+    max_direction_skew: float = 0.85,
+    floor: float = 0.011,
+    ceiling: float = 0.989,
+    min_batch_size: int = 5,
+) -> OutputDistributionGateResult:
+    """Validate the LIVE inference batch's p_up distribution before write.
+
+    Audit Phase 2a-INFER (2026-05-07): same four invariants as the
+    promotion-time gate (``validate_calibrator_distribution``), but
+    applied to today's actual inference output rather than a synthetic
+    alpha sweep. Catches degenerate live-batch output even when the
+    calibrator itself is healthy on synthetic input — for example,
+    today's 2026-05-07 incident where 16 of 27 tickers all clamped to
+    p_up=0.458: the calibrator's flat region happened to be where the
+    Ridge's live output landed for most of the universe, so a synthetic
+    sweep might still show diversity (hitting other regions of the
+    calibrator) while the live batch collapses.
+
+    Designed to be called from inference/stages/write_output.py at the
+    top of ``write_predictions``, before any S3 write. On failure,
+    raises ``RuntimeError`` so the Lambda handler returns an error and
+    the SF's ``Catch [States.ALL]`` fires (per audit §9.5 fail-closed).
+
+    Pass-on-empty-batch: if ``predictions`` is empty or below
+    ``min_batch_size``, returns ``passed=True`` with metrics indicating
+    insufficient data — the gate doesn't fire on early-cutover days
+    where coverage is incomplete by design.
+
+    Args:
+        predictions: list of prediction dicts. Each must have ``p_up``;
+            ``predicted_direction`` is optional but used for skew check.
+        Other args: same thresholds as ``validate_calibrator_distribution``.
+            Defaults intentionally identical so promotion-time pass and
+            inference-time pass agree on what "degenerate" means.
+    """
+    import numpy as np
+
+    if not predictions or len(predictions) < min_batch_size:
+        return OutputDistributionGateResult(
+            passed=True,
+            failed_check=None,
+            reason=(
+                f"batch size {len(predictions) if predictions else 0} "
+                f"below min_batch_size={min_batch_size} — gate does not fire"
+            ),
+            metrics={"batch_size": len(predictions) if predictions else 0},
+        )
+
+    p_ups = np.array([
+        p.get("p_up") for p in predictions
+        if p.get("p_up") is not None and isinstance(p.get("p_up"), (int, float))
+    ])
+    directions = [
+        p.get("predicted_direction") for p in predictions
+        if p.get("p_up") is not None and isinstance(p.get("p_up"), (int, float))
+    ]
+
+    if len(p_ups) < min_batch_size:
+        return OutputDistributionGateResult(
+            passed=True,
+            failed_check=None,
+            reason=(
+                f"only {len(p_ups)} predictions had finite p_up (below "
+                f"min_batch_size={min_batch_size}) — gate does not fire"
+            ),
+            metrics={"batch_size": len(p_ups)},
+        )
+
+    extra_metrics = {
+        "batch_size": len(p_ups),
+        "n_predictions_total": len(predictions),
+    }
+    return _evaluate_distribution_invariants(
+        p_ups=p_ups,
+        directions=directions,
+        source_label=f"live inference batch ({len(p_ups)} tickers)",
+        min_unique_p_up=min_unique_p_up,
+        max_saturation_rate=max_saturation_rate,
+        min_stdev=min_stdev,
+        max_direction_skew=max_direction_skew,
+        floor=floor,
+        ceiling=ceiling,
+        extra_metrics=extra_metrics,
+    )
+
+
+def _evaluate_distribution_invariants(
+    *,
+    p_ups,
+    directions: list,
+    source_label: str,
+    min_unique_p_up: int,
+    max_saturation_rate: float,
+    min_stdev: float,
+    max_direction_skew: float,
+    floor: float,
+    ceiling: float,
+    extra_metrics: dict,
+) -> OutputDistributionGateResult:
+    """Shared invariants check for both synthetic-sweep and live-batch variants.
+
+    Both ``validate_calibrator_distribution`` (promotion gate) and
+    ``validate_live_batch_distribution`` (inference gate) call here
+    after constructing their respective ``p_ups`` array. Single source
+    of truth for the four checks (uniqueness / saturation / stdev /
+    direction skew); extracted so promotion-time pass and inference-time
+    pass never disagree on what "degenerate" means.
+    """
+    import numpy as np
+
     # Check 1: unique p_up count (round to 6 decimals to handle FP noise)
     n_unique = int(len(np.unique(np.round(p_ups, 6))))
 
@@ -170,9 +305,7 @@ def validate_calibrator_distribution(
     )
 
     metrics = {
-        "calibrator_fitted": True,
-        "n_synthetic": n_synthetic,
-        "alpha_range": list(alpha_range),
+        **extra_metrics,
         "n_unique_p_up": n_unique,
         "saturation_rate": round(saturation_rate, 4),
         "stdev_p_up": round(stdev, 6),
@@ -184,9 +317,9 @@ def validate_calibrator_distribution(
     # Run checks in priority order (most distinctive failure first).
     if n_unique < min_unique_p_up:
         reason = (
-            f"only {n_unique} unique p_up values across {n_synthetic} "
-            f"synthetic alphas (min: {min_unique_p_up}) — calibrator "
-            f"likely has flat regions; the 2026-05-07-class plateau"
+            f"only {n_unique} unique p_up values across {source_label} "
+            f"(min: {min_unique_p_up}) — output likely has flat regions; "
+            f"the 2026-05-07-class plateau"
         )
         log.warning("Output-distribution gate FAILED — %s", reason)
         return OutputDistributionGateResult(
@@ -197,7 +330,7 @@ def validate_calibrator_distribution(
     if saturation_rate > max_saturation_rate:
         reason = (
             f"saturation rate {saturation_rate:.2%} exceeds {max_saturation_rate:.0%} "
-            f"({n_saturated}/{n_synthetic} outputs at floor or ceiling) — "
+            f"({n_saturated}/{len(p_ups)} outputs at floor or ceiling on {source_label}) — "
             f"calibrator clipping a wide alpha band to its bounds"
         )
         log.warning("Output-distribution gate FAILED — %s", reason)
@@ -220,7 +353,7 @@ def validate_calibrator_distribution(
     if n_directional > 0 and direction_skew > max_direction_skew:
         reason = (
             f"direction skew {direction_skew:.2%} exceeds {max_direction_skew:.0%} "
-            f"(n_up={n_up}, n_down={n_down}) — calibrator strongly biased"
+            f"(n_up={n_up}, n_down={n_down}) on {source_label} — strongly biased"
         )
         log.warning("Output-distribution gate FAILED — %s", reason)
         return OutputDistributionGateResult(

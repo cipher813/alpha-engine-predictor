@@ -258,6 +258,20 @@ WF_MEDIAN_IC_GATE = _wf_cfg.get("median_ic_gate", 0.02)
 OUTPUT_DISTRIBUTION_GATE_BLOCKING = _wf_cfg.get(
     "output_distribution_gate_blocking", False
 )
+
+# Audit Phase 2a-INFER inference-time variant of the output-distribution
+# gate (2026-05-07). When True, write_predictions raises before any S3
+# write if the live batch's p_up distribution fails the same four
+# invariants that the promotion gate checks on synthetic input.
+# Fail-closed semantics: failure → exception → SF Catch → flow-doctor
+# alert → predictions.json NOT written → executor reads prior-day
+# fallback. Default False for one observation cycle; flip via
+# predictor.yaml's walk_forward.output_distribution_gate_inference_blocking
+# after the metrics_out forensic trail confirms no false-blocks on
+# healthy live batches.
+OUTPUT_DISTRIBUTION_GATE_INFERENCE_BLOCKING = _wf_cfg.get(
+    "output_distribution_gate_inference_blocking", False
+)
 WF_N_ESTIMATORS = _wf_cfg.get("wf_n_estimators", None)  # None → use GBM_N_ESTIMATORS
 WF_EARLY_STOPPING = _wf_cfg.get("wf_early_stopping", None)  # None → use GBM_EARLY_STOPPING_ROUNDS
 
