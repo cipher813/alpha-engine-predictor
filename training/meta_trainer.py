@@ -1474,6 +1474,50 @@ def run_meta_training(
             )
             log.info("Manifest written to s3://%s/%s", bucket, cfg.META_MANIFEST_KEY)
 
+            # Track 4-of-N of audit Phase 1 horizon battery (2026-05-07):
+            # persist OOS meta-rows to S3 so the standalone analysis module
+            # (analysis/horizon_battery.py) can iterate offline — varying
+            # regime thresholds, horizon sets, bootstrap params — without
+            # waiting for the next Saturday training cycle. Parquet for
+            # efficiency on the ~10-100k row × ~25 column shape.
+            try:
+                import io as _io
+                import pandas as _pd
+                # Ensure Timestamp columns serialize cleanly; dict comprehension
+                # preserves ordering. Drop date Timestamps to ISO strings since
+                # parquet's pyarrow backend handles those natively but keeping
+                # them as strings avoids any timezone-roundtrip subtleties on
+                # the analysis-side read.
+                _df_rows = _pd.DataFrame(oos_meta_rows)
+                if "date" in _df_rows.columns:
+                    _df_rows["date"] = _pd.to_datetime(_df_rows["date"]).dt.strftime("%Y-%m-%d")
+                _buf = _io.BytesIO()
+                _df_rows.to_parquet(_buf, index=False)
+                _buf.seek(0)
+                _oos_key = f"predictor/diagnostics/oos_rows/{date_str}.parquet"
+                s3_up.put_object(
+                    Bucket=bucket, Key=_oos_key,
+                    Body=_buf.getvalue(),
+                    ContentType="application/octet-stream",
+                )
+                # Also write a 'latest' alias so the analysis module can
+                # default-read the most recent run without knowing the date.
+                _buf.seek(0)
+                s3_up.put_object(
+                    Bucket=bucket, Key="predictor/diagnostics/oos_rows/latest.parquet",
+                    Body=_buf.getvalue(),
+                    ContentType="application/octet-stream",
+                )
+                log.info(
+                    "OOS rows persisted to s3://%s/%s (%d rows × %d cols)",
+                    bucket, _oos_key, len(_df_rows), len(_df_rows.columns),
+                )
+            except Exception as e:
+                # Non-blocking — analysis can fall back to re-running training
+                # to regenerate the rows. Don't fail a training run because
+                # the diagnostic-persist step failed.
+                log.warning("OOS-row persistence to S3 failed (non-blocking): %s", e)
+
     log.info(
         "Meta-training complete: mom_IC=%.4f  vol_IC=%.4f  meta_IC=%.4f  "
         "promoted=%s  elapsed=%.0fs",
