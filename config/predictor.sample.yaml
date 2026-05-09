@@ -23,9 +23,9 @@ training:
 
 # ── Label thresholds ──────────────────────────────────────────────────────────
 labeling:
-  forward_days: 5                  # prediction horizon (trading days)
-  up_threshold: 0.02               # predicted 5d sector-relative alpha > 2% → UP
-  down_threshold: -0.02            # predicted 5d sector-relative alpha < -2% → DOWN (±2% = FLAT)
+  forward_days: 21                 # prediction horizon (trading days)
+  up_threshold: 0.02               # predicted 21d sector-relative alpha > 2% → UP
+  down_threshold: -0.02            # predicted 21d sector-relative alpha < -2% → DOWN (±2% = FLAT)
   label_clip: 0.25                 # clip extreme returns (±25%), null to disable
   adaptive_thresholds: false       # use rolling percentile thresholds instead of fixed
   adaptive_window: 63              # rolling window for adaptive percentiles (~3 months)
@@ -109,7 +109,7 @@ walk_forward:
   enabled: true
   test_window_trading_days: 126  # ~6 calendar months of trading days per fold
   min_train_days: 504            # ~2 years minimum training (trading days)
-  purge_days: 5                  # matches forward_days (prevent label leakage)
+  purge_days: 21                 # matches forward_days (prevent label leakage)
   min_folds_positive: 0.60       # 60% of folds must have IC > 0
   median_ic_gate: 0.01           # median IC across folds (lower bar — includes black swan periods)
   wf_n_estimators: 500           # faster GBM for fold validation (not production)
