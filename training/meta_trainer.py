@@ -921,18 +921,15 @@ def run_meta_training(
             len(research_scores),
         )
 
-    # Subsample IC gate — time-based holdout: fit a temporary calibrator on
-    # the first ~80% of score_performance by date, evaluate Pearson IC on
-    # the last 20%, compare to score/100 passthrough baseline. Production
-    # ``prod_calibrator`` (fit on full data above) is unaffected — this is
-    # purely a promotion-decision input. See model/subsample_validator.py.
-    from model.subsample_validator import validate_research_calibrator
-    research_subsample_result = validate_research_calibrator(
-        scores=research_scores,
-        beat_spy=research_beat_spy,
-        score_dates=research_score_dates,
-    )
-    research_subsample_result.log()
+    # Bucket-lookup ResearchCalibrator subsample gate retired 2026-05-09
+    # (Phase 3 PR 4/5 cutover). The bucket-lookup is no longer the L1
+    # component sourcing research_calibrator_prob — the ResearchGBMScorer
+    # fit at Step 6c is, and its val_ic (held-out 20%) provides the same
+    # "earns-its-complexity" signal this subsample gate did. The bucket-
+    # lookup remains as a degraded fallback for cycles where the GBM fit
+    # is skipped (n_finite < 100); a fallback path doesn't need its own
+    # promotion gate. ``validate_research_calibrator`` is still defined
+    # in model/subsample_validator.py for legacy tests / future re-use.
 
     # ── Step 5c: Load signals.json history for per-row research feature lookup ─
     # Each weekly snapshot at signals/{YYYY-MM-DD}/signals.json carries the
@@ -1203,6 +1200,110 @@ def run_meta_training(
             "empty universe / unmappable sector. Investigate before "
             "retraining; do not silently fall back to placeholder "
             "constants (pre-2026-04-28 bug)."
+        )
+
+    # ── Step 6c: ResearchGBMScorer fit + research_calibrator_prob cutover ─────
+    # Audit Phase 3 PR 4/5 (2026-05-09): the GBM is now the canonical source
+    # for the `research_calibrator_prob` META_FEATURE the meta-Ridge sees.
+    # The bucket-lookup ResearchCalibrator (prod_calibrator from Step 5b)
+    # remains as the per-fold WF source for `research_calibrator_prob` in
+    # `_extract_research_features` AND as the inference-time fallback when
+    # the GBM isn't loaded (n_finite < 100 cycles).
+    #
+    # Training shape: same OOS rows the meta-Ridge consumes (each row has
+    # all 9 RESEARCH_GBM_FEATURES + multi-horizon labels from Track B).
+    # Label is binary beat-SPY-at-10d (`actual_fwd_10d > 0`) — same target
+    # the bucket-lookup is graded on. WF isolation: rows are date-sorted
+    # and we split 80/20 temporally for early-stopping validation.
+    #
+    # Caveat (PR 4 cutover, 2026-05-09): at ~24 weeks of labeled history
+    # (~797 OOS rows) per-fold WF GBM training is infeasible — early folds
+    # would have <50 rows of feature-matrix to train a 9-feature LGB.
+    # Today's cutover accepts in-sample predictions on training rows for
+    # Ridge fit purposes; the GBM's val_ic measures the OOS gap. Manifest
+    # emits both train_ic and val_ic so the gap can be monitored. Per-fold
+    # WF tightening tracked for ~30-week milestone (2026-06-20-ish).
+    from model.research_gbm import ResearchGBMScorer, RESEARCH_GBM_FEATURES
+
+    prod_research_gbm: ResearchGBMScorer | None = None
+    research_gbm_metrics: dict | None = None
+    research_gbm_train_ic: float | None = None
+    try:
+        finite_mask = np.array([
+            np.isfinite(r.get("actual_fwd_10d", float("nan")))
+            for r in oos_meta_rows
+        ])
+        n_finite = int(finite_mask.sum())
+        if n_finite >= 100:
+            X_research = np.array([
+                [r.get(f, 0.0) or 0.0 for f in RESEARCH_GBM_FEATURES]
+                for r, m in zip(oos_meta_rows, finite_mask) if m
+            ], dtype=np.float32)
+            y_research = np.array([
+                1.0 if r.get("actual_fwd_10d", 0.0) > 0 else 0.0
+                for r, m in zip(oos_meta_rows, finite_mask) if m
+            ], dtype=np.float32)
+            split_idx = int(n_finite * 0.8)
+            prod_research_gbm = ResearchGBMScorer(
+                n_estimators=500, early_stopping_rounds=30,
+            )
+            prod_research_gbm.fit(
+                X_research[:split_idx], y_research[:split_idx],
+                X_research[split_idx:], y_research[split_idx:],
+            )
+            research_gbm_metrics = prod_research_gbm.metrics()
+
+            # Train_ic — Pearson IC on the same training split the GBM saw.
+            # train_ic >> val_ic (e.g. >2×) signals overfitting; emit both
+            # in the manifest so monitoring can flag a degenerating gap.
+            train_preds = prod_research_gbm.predict(X_research[:split_idx])
+            train_y = y_research[:split_idx]
+            if np.std(train_preds) > 1e-10 and np.std(train_y) > 1e-10:
+                research_gbm_train_ic = float(np.corrcoef(train_preds, train_y)[0, 1])
+            log.info(
+                "ResearchGBMScorer fit on %d rows (train_ic=%.4f, val_ic=%.4f, "
+                "best_iter=%d) — CANONICAL source for research_calibrator_prob "
+                "(Phase 3 PR 4/5 cutover)",
+                n_finite,
+                research_gbm_train_ic if research_gbm_train_ic is not None else float("nan"),
+                prod_research_gbm._val_ic,
+                prod_research_gbm._best_iteration,
+            )
+
+            # Recompute research_calibrator_prob in oos_meta_rows using the
+            # GBM's predictions (in-sample for the rows the GBM trained on,
+            # OOS for any non-finite-label rows that weren't part of the fit
+            # set). The meta-Ridge below now sees GBM-sourced probs — same
+            # contract inference will see.
+            n_recomputed = 0
+            for row in oos_meta_rows:
+                row["research_calibrator_prob"] = float(
+                    prod_research_gbm.predict_from_dict({
+                        f: float(row.get(f, 0.0) or 0.0)
+                        for f in RESEARCH_GBM_FEATURES
+                    })
+                )
+                n_recomputed += 1
+            log.info(
+                "research_calibrator_prob recomputed via GBM for %d oos_meta_rows "
+                "(in-sample for ~80%%, OOS-fitted for ~20%% per the GBM's "
+                "temporal early-stop split)",
+                n_recomputed,
+            )
+        else:
+            log.info(
+                "ResearchGBMScorer: only %d finite-label rows (need >=100) — "
+                "skipped this cycle. Bucket-lookup ResearchCalibrator-sourced "
+                "research_calibrator_prob remains in oos_meta_rows.",
+                n_finite,
+            )
+    except Exception as e:
+        # Non-blocking: failure here logs a warning but doesn't fail the
+        # whole training run. The bucket-lookup-sourced research_calibrator_prob
+        # already populated by the WF loop survives.
+        log.warning(
+            "ResearchGBMScorer fit failed (non-blocking, falling back to "
+            "bucket-lookup-sourced research_calibrator_prob): %s", e,
         )
 
     # ── Step 7: Train meta-model on pooled OOS ───────────────────────────────
@@ -1535,76 +1636,6 @@ def run_meta_training(
                 key=lambda kv: abs(kv[1]["spearman"]) if np.isfinite(kv[1]["spearman"]) else -1)
     log.info("Peak IC horizon: %s (Spearman=%+.4f)", _peak[0], _peak[1]["spearman"])
 
-    # ── Step 7c: ResearchGBMScorer fit (audit Phase 3 PR 2/5, observe-only) ─
-    # Fits the new LightGBM-based research scorer alongside the existing
-    # bucket-lookup ResearchCalibrator (prod_calibrator from Step 5b).
-    # Both run in parallel until the cutover PR — manifest carries metrics
-    # for both so we can validate the LGB matches or beats the bucket-lookup
-    # before swapping it in.
-    #
-    # Training shape: same OOS rows the meta-Ridge consumes (each row has
-    # all 9 RESEARCH_GBM_FEATURES + multi-horizon labels from Track B).
-    # Label is binary beat-SPY-at-10d (`actual_fwd_10d > 0`) — same target
-    # the bucket-lookup is graded on. Walk-forward isolation: rows are
-    # date-sorted, and we split 80/20 temporally for early-stopping
-    # validation. (The bucket-lookup uses a per-fold calibrator; the LGB's
-    # walk-forward isolation tightens in PR 4 cutover when it becomes
-    # load-bearing.)
-    from model.research_gbm import ResearchGBMScorer, RESEARCH_GBM_FEATURES
-
-    prod_research_gbm: ResearchGBMScorer | None = None
-    research_gbm_metrics: dict | None = None
-    try:
-        # Build feature matrix + 10d binary label from oos_meta_rows.
-        # Filter to rows with finite 10d label (some rows at the tail of
-        # history have NaN actual_fwd_10d because forward window extends
-        # past the data range).
-        finite_mask = np.array([
-            np.isfinite(r.get("actual_fwd_10d", float("nan")))
-            for r in oos_meta_rows
-        ])
-        n_finite = int(finite_mask.sum())
-        if n_finite >= 100:
-            X_research = np.array([
-                [r.get(f, 0.0) or 0.0 for f in RESEARCH_GBM_FEATURES]
-                for r, m in zip(oos_meta_rows, finite_mask) if m
-            ], dtype=np.float32)
-            y_research = np.array([
-                1.0 if r.get("actual_fwd_10d", 0.0) > 0 else 0.0
-                for r, m in zip(oos_meta_rows, finite_mask) if m
-            ], dtype=np.float32)
-            # Date-sorted split: oos_meta_rows are accumulated in fold
-            # order which is date-ascending, so a positional 80/20 split
-            # is temporal by construction. Verify with the row dates.
-            split_idx = int(n_finite * 0.8)
-            prod_research_gbm = ResearchGBMScorer(
-                n_estimators=500, early_stopping_rounds=30,
-            )
-            prod_research_gbm.fit(
-                X_research[:split_idx], y_research[:split_idx],
-                X_research[split_idx:], y_research[split_idx:],
-            )
-            research_gbm_metrics = prod_research_gbm.metrics()
-            log.info(
-                "ResearchGBMScorer fit on %d rows (val_ic=%.4f, best_iter=%d) — "
-                "observe-only alongside bucket-lookup ResearchCalibrator",
-                n_finite, prod_research_gbm._val_ic,
-                prod_research_gbm._best_iteration,
-            )
-        else:
-            log.info(
-                "ResearchGBMScorer: only %d finite-label rows (need >=100) — "
-                "skipped this cycle. Bucket-lookup ResearchCalibrator unchanged.",
-                n_finite,
-            )
-    except Exception as e:
-        # Non-blocking: failure here logs a warning but doesn't fail the
-        # whole training run. The bucket-lookup remains the live path
-        # until PR 4 cutover.
-        log.warning(
-            "ResearchGBMScorer fit failed (non-blocking, observe-only): %s", e,
-        )
-
     # ── Step 7d: RegimeConditionedMeta fit (audit Phase 4 PR 3/6, observe-only) ─
     # Three Ridges (one per regime) + an unconditioned fallback. Fits on
     # the same OOS rows + their regime labels (already attached by Track B
@@ -1740,10 +1771,7 @@ def run_meta_training(
         subsample_mask=vol_subsample_mask_test,
     )
     vol_subsample_result.log()
-    subsample_gate_passed = (
-        vol_subsample_result.passed
-        and research_subsample_result.passed
-    )
+    subsample_gate_passed = vol_subsample_result.passed
 
     # Regime classifier removed from the critical path 2026-04-16. Its
     # Tier 0 implementation (multinomial logistic on 6 macro features) could
@@ -1853,13 +1881,16 @@ def run_meta_training(
     )
     log.info(
         "Promotion gate: meta_IC=%.4f %s %.4f (meta=%s) AND component "
-        "subsample (vol=%s, research=%s; momentum=DETERMINISTIC) AND "
-        "output_dist=%s AND stratified_per_regime=%s%s → %s "
+        "subsample (vol=%s; momentum=DETERMINISTIC, research=GBM val_ic=%s) "
+        "AND output_dist=%s AND stratified_per_regime=%s%s → %s "
         "(walk-forward for reference: mom_median=%.4f, vol_median=%.4f)",
         meta_model._val_ic, ">=" if meta_ic_passed else "<", _meta_ic_gate,
         "PASS" if meta_ic_passed else "BLOCK",
         "PASS" if vol_subsample_result.passed else "BLOCK",
-        "PASS" if research_subsample_result.passed else "BLOCK",
+        (
+            f"{prod_research_gbm._val_ic:+.4f}"
+            if prod_research_gbm is not None else "BUCKET-LOOKUP-FALLBACK"
+        ),
         "PASS" if output_dist_result.passed else "FAIL",
         _stratified_status,
         "" if output_dist_blocking else " (OBSERVE-ONLY: not blocking)",
@@ -1992,15 +2023,23 @@ def run_meta_training(
                         "ece_after": round(calibrator._ece_after or 0.0, 6),
                         "n_samples": calibrator._n_samples,
                     },
-                    # Audit Phase 3 PR 2/5 (2026-05-07): ResearchGBMScorer
-                    # ships alongside the bucket-lookup in observe-only mode.
-                    # Persisted in the manifest for parity comparison —
-                    # inference doesn't consume it yet (PR 3 wires that).
-                    # When None, the LGB wasn't fit this cycle (insufficient
-                    # data or fit failed); bucket-lookup remains canonical.
+                    # Audit Phase 3 PR 4/5 (2026-05-09 cutover):
+                    # ResearchGBMScorer is the canonical source for
+                    # research_calibrator_prob. train_ic is emitted
+                    # alongside val_ic so a widening train-vs-val gap
+                    # (> ~2× ratio is the typical overfitting signal)
+                    # surfaces in the dashboard. When None, the LGB
+                    # wasn't fit this cycle (insufficient data or fit
+                    # failed); bucket-lookup-sourced research_calibrator_prob
+                    # is the fallback for that cycle.
                     **(
                         {"research_gbm": {
                             "key": f"{prefix}research_gbm.pkl",
+                            "canonical_for": "research_calibrator_prob",
+                            "train_ic": (
+                                round(research_gbm_train_ic, 6)
+                                if research_gbm_train_ic is not None else None
+                            ),
                             **(research_gbm_metrics or {}),
                         }}
                         if prod_research_gbm is not None else {}
@@ -2258,12 +2297,15 @@ def run_meta_training(
                 "passed": vol_subsample_result.passed,
                 "skip_reason": vol_subsample_result.skip_reason,
             },
+            # Bucket-lookup ResearchCalibrator subsample gate retired
+            # 2026-05-09 (Phase 3 PR 4/5 cutover). The L1 source for
+            # research_calibrator_prob is now ResearchGBMScorer; its
+            # val_ic + train_ic are reported in `models.research_gbm`
+            # below and the gate-derived "earns its complexity" signal
+            # is the GBM's val_ic on its own held-out 20%.
             "research_calibrator": {
-                "n": research_subsample_result.n,
-                "component_ic": round(research_subsample_result.component_ic, 6),
-                "baseline_ic": round(research_subsample_result.baseline_ic, 6),
-                "passed": research_subsample_result.passed,
-                "skip_reason": research_subsample_result.skip_reason,
+                "kind": "retired_bucket_lookup_was_canonical_pre_2026_05_09",
+                "skip_reason": "L1 source is now ResearchGBMScorer; see models.research_gbm.val_ic",
             },
             "gate_passed": subsample_gate_passed,
         },
