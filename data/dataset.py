@@ -119,19 +119,58 @@ def cross_sectional_rank_normalize(
         idx_arr = np.array(indices)
         for f in range(n_features):
             vals = X[idx_arr, f]
-            # argsort-of-argsort gives ranks (0-based); average ties
-            order = vals.argsort()
-            ranks = np.empty_like(order, dtype=np.float32)
-            ranks[order] = np.arange(n, dtype=np.float32)
-            # Handle ties: average the ranks for equal values
-            unique_vals, inverse = np.unique(vals, return_inverse=True)
-            if len(unique_vals) < n:
+
+            # NaN-aware ranking: rank only the non-NaN values, then
+            # assign every NaN entry 0.5 (cross-sectional median rank).
+            # ``np.argsort`` places NaN at the END of the sorted order, so
+            # the legacy "argsort + arange" path mapped NaN inputs to rank
+            # = n-1 → percentile 1.0. That's actively misleading: a
+            # short-history ticker with NaN momentum_20d ended up at the
+            # top of the cross-section across every NaN feature
+            # simultaneously, and the GBM learned a spurious
+            # "rank=1.0 cluster" pattern. 2026-05-09 weekly training:
+            # momentum subsample IC was -0.17 vs baseline +0.32 on the
+            # 467-row short-history slice, blocking promotion despite
+            # meta-IC of 0.0764. Treating NaN as "no signal → median
+            # rank" puts those rows on the neutral line where they
+            # belong, lets the GBM learn from the actual non-NaN
+            # population, and lets the meta-Ridge weigh the component
+            # honestly.
+            nan_mask_f = np.isnan(vals)
+            if nan_mask_f.all():
+                # Every row is NaN for this feature today (e.g. an alt
+                # data feature missing universe-wide on a given date) —
+                # neutral 0.5 for everyone, no rank computable.
+                X_ranked[idx_arr, f] = 0.5
+                continue
+
+            non_nan_idx_local = np.where(~nan_mask_f)[0]
+            non_nan_vals = vals[non_nan_idx_local]
+            n_non_nan = non_nan_idx_local.size
+
+            if n_non_nan <= 1:
+                # Only one non-NaN row — give it the midpoint and the
+                # rest 0.5. No meaningful ranking with N=1.
+                X_ranked[idx_arr, f] = 0.5
+                continue
+
+            order = non_nan_vals.argsort()
+            local_ranks = np.empty_like(order, dtype=np.float32)
+            local_ranks[order] = np.arange(n_non_nan, dtype=np.float32)
+            # Handle ties: average the ranks for equal values within
+            # the non-NaN slice.
+            unique_vals, inverse = np.unique(non_nan_vals, return_inverse=True)
+            if len(unique_vals) < n_non_nan:
                 for uv_idx in range(len(unique_vals)):
                     mask = inverse == uv_idx
                     if mask.sum() > 1:
-                        ranks[mask] = ranks[mask].mean()
-            # Scale to (0, 1): rank / (n - 1) maps to [0, 1]
-            X_ranked[idx_arr, f] = ranks / max(n - 1, 1)
+                        local_ranks[mask] = local_ranks[mask].mean()
+            # Scale non-NaN ranks to (0, 1).
+            scaled_non_nan = local_ranks / max(n_non_nan - 1, 1)
+
+            ranks_full = np.full(n, 0.5, dtype=np.float32)
+            ranks_full[non_nan_idx_local] = scaled_non_nan
+            X_ranked[idx_arr, f] = ranks_full
 
     return X_ranked
 

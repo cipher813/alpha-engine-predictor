@@ -75,6 +75,100 @@ class TestCrossSectionalRankNormalize:
         result = cross_sectional_rank_normalize(features, dates)
         assert not np.isnan(result).any()
 
+    def test_nan_input_gets_neutral_rank_05(self):
+        """Regression test for the 2026-05-09 momentum subsample IC bug.
+
+        Pre-fix: numpy ``argsort`` placed NaN at the end, so NaN inputs
+        got rank=n-1 → percentile 1.0 (top of the cross-section). The
+        GBM then learned a spurious "rank=1.0 cluster" pattern across
+        every NaN feature that short-history tickers shared. Subsample
+        IC gate caught this as -0.17 component_ic vs +0.32 baseline_ic.
+
+        Post-fix: NaN entries get 0.5 (cross-sectional median rank),
+        leaving them on the neutral line where they belong. The non-NaN
+        rows still rank-normalize to (0, 1) over the non-NaN subset.
+        """
+        # 1 date, 5 tickers: third ticker has NaN in feature 0
+        dates = ["2026-04-08"] * 5
+        features = np.array(
+            [[1.0, 1.0],
+             [2.0, 2.0],
+             [np.nan, 3.0],   # NaN row — must get 0.5 in feature 0
+             [4.0, 4.0],
+             [5.0, 5.0]],
+            dtype=np.float32,
+        )
+        result = cross_sectional_rank_normalize(features, dates)
+        # NaN row in feature 0 → 0.5 (neutral median rank), NOT 1.0 (top)
+        assert result[2, 0] == 0.5, (
+            f"NaN should rank to 0.5 (median), got {result[2, 0]} — "
+            "the legacy argsort path mapped NaN to rank=n-1 / (n-1) = 1.0"
+        )
+        # Feature 1 has no NaNs — must rank-normalize to (0, 1) over the
+        # full 5-ticker cross-section (verifying the non-NaN path is
+        # intact).
+        assert result[0, 1] == 0.0  # smallest
+        assert result[4, 1] == 1.0  # largest
+
+        # Feature 0 non-NaN ranks: 1.0→0, 2.0→1, 4.0→2, 5.0→3 over 4
+        # non-NaN rows → scaled by (4-1)=3 → [0, 1/3, 2/3, 1]
+        assert result[0, 0] == 0.0
+        assert abs(result[1, 0] - 1.0 / 3.0) < 1e-6
+        assert abs(result[3, 0] - 2.0 / 3.0) < 1e-6
+        assert result[4, 0] == 1.0
+
+    def test_all_nan_feature_assigns_05_to_everyone(self):
+        """If every value for a feature on a given date is NaN (e.g. an
+        alt-data feature missing universe-wide), every row gets 0.5 —
+        no rank computable, neutral assignment is the only sensible
+        behavior."""
+        dates = ["2026-04-08"] * 4
+        features = np.array(
+            [[np.nan, 1.0],
+             [np.nan, 2.0],
+             [np.nan, 3.0],
+             [np.nan, 4.0]],
+            dtype=np.float32,
+        )
+        result = cross_sectional_rank_normalize(features, dates)
+        assert (result[:, 0] == 0.5).all()
+        # Other feature unaffected
+        assert result[0, 1] == 0.0
+        assert result[3, 1] == 1.0
+
+    def test_single_non_nan_row_neutral(self):
+        """Edge case: only one non-NaN value for a feature on a date.
+        Cannot rank a 1-element set meaningfully — assign 0.5 to all
+        rows (NaN and the lone non-NaN alike). Better than crashing or
+        forcing the lone row to rank=0."""
+        dates = ["2026-04-08"] * 4
+        features = np.array(
+            [[np.nan, 1.0],
+             [np.nan, 2.0],
+             [3.0,    3.0],
+             [np.nan, 4.0]],
+            dtype=np.float32,
+        )
+        result = cross_sectional_rank_normalize(features, dates)
+        assert (result[:, 0] == 0.5).all()
+
+    def test_existing_non_nan_behavior_unchanged(self):
+        """Ensure the NaN-aware refactor doesn't drift the all-non-NaN
+        path. Cross-sectional ranks must still be (0, 1) percentile
+        with deterministic ordering."""
+        dates = ["2026-04-08"] * 5
+        features = np.array(
+            [[10.0],
+             [20.0],
+             [30.0],
+             [40.0],
+             [50.0]],
+            dtype=np.float32,
+        )
+        result = cross_sectional_rank_normalize(features, dates)
+        expected = np.array([[0.0], [0.25], [0.5], [0.75], [1.0]], dtype=np.float32)
+        assert np.allclose(result, expected, atol=1e-6)
+
 
 class TestLoadNormStats:
     def test_loads_valid_json(self):
