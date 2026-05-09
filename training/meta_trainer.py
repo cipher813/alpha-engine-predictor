@@ -1935,6 +1935,16 @@ def run_meta_training(
             manifest = {
                 "date": date_str,
                 "version": "v3.0-meta",
+                # Horizon-of-record + label-domain top-level metadata (added
+                # 2026-05-09 post Track A PR 5/6 cutover) so downstream
+                # consumers — dashboard, backtester analytics, evaluator —
+                # can read the predictor's training horizon + target domain
+                # without re-deriving from filenames or hardcoding. Per the
+                # predictor-21d-migration plan: column names + display
+                # strings should be horizon-agnostic, parameterized by this
+                # field instead of literal "5d" / "21d" strings.
+                "forward_days": int(cfg.FORWARD_DAYS),
+                "label_domain": "canonical_log",  # vs "arithmetic_legacy" pre Track A PR 5/6
                 "promoted": promoted,
                 "models": {
                     "momentum": {
