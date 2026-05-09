@@ -46,52 +46,11 @@ class TestSafePearsonIC:
         assert _safe_pearson_ic(np.array([]), np.array([])) == 0.0
 
 
-# ── momentum_baseline_predict ────────────────────────────────────────────────
-
-
-class TestMomentumBaseline:
-    def test_clean_features_match_fallback_formula(self):
-        """The baseline mirrors run_inference.py:267-271 exactly:
-        0.4·m5 + 0.3·m20 + 0.2·ma50 + 0.1·(rsi-50)/100"""
-        from model.subsample_validator import momentum_baseline_predict
-        feature_names = ["momentum_5d", "momentum_20d", "price_vs_ma50", "rsi_14"]
-        X = np.array([[0.05, 0.10, 0.02, 70.0]])
-        preds = momentum_baseline_predict(X, feature_names)
-        expected = 0.4 * 0.05 + 0.3 * 0.10 + 0.2 * 0.02 + 0.1 * (70 - 50) / 100
-        assert preds[0] == pytest.approx(expected)
-
-    def test_nan_features_use_neutral_defaults(self):
-        from model.subsample_validator import momentum_baseline_predict
-        feature_names = ["momentum_5d", "momentum_20d", "price_vs_ma50", "rsi_14"]
-        # NaN row: should use defaults 0/0/0/50 → baseline = 0
-        X = np.array([[np.nan, np.nan, np.nan, np.nan]])
-        preds = momentum_baseline_predict(X, feature_names)
-        assert preds[0] == pytest.approx(0.0)
-
-    def test_partial_nan_uses_neutral_for_missing_only(self):
-        from model.subsample_validator import momentum_baseline_predict
-        feature_names = ["momentum_5d", "momentum_20d", "price_vs_ma50", "rsi_14"]
-        X = np.array([[0.05, np.nan, np.nan, np.nan]])
-        preds = momentum_baseline_predict(X, feature_names)
-        # m5=0.05; rest neutral → 0.4 * 0.05 = 0.02
-        assert preds[0] == pytest.approx(0.02)
-
-    def test_missing_feature_name_uses_default(self):
-        """If MOMENTUM_FEATURES is reordered or a feature is absent,
-        the baseline still produces a real-valued prediction."""
-        from model.subsample_validator import momentum_baseline_predict
-        feature_names = ["momentum_5d"]  # only one feature available
-        X = np.array([[0.10]])
-        preds = momentum_baseline_predict(X, feature_names)
-        # m5=0.10, others default 0/0/50 → 0.4 * 0.10 + 0.1 * (50-50)/100 = 0.04
-        assert preds[0] == pytest.approx(0.04)
-
-    def test_batch_shape_preserved(self):
-        from model.subsample_validator import momentum_baseline_predict
-        feature_names = ["momentum_5d", "momentum_20d", "price_vs_ma50", "rsi_14"]
-        X = np.random.default_rng(0).normal(0, 0.1, size=(50, 4))
-        preds = momentum_baseline_predict(X, feature_names)
-        assert preds.shape == (50,)
+# Tests for the deterministic momentum scorer (formerly the
+# ``momentum_baseline_predict`` named baseline) live in
+# ``tests/test_momentum_scorer.py``. The function moved out of
+# subsample_validator on 2026-05-09 when the L1 stopped being a
+# GBM that needed a baseline to beat and became the formula itself.
 
 
 # ── volatility_baseline_predict ──────────────────────────────────────────────

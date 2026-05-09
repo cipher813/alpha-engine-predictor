@@ -266,6 +266,7 @@ from model.research_features import (
     SECTOR_NAME_CANONICAL as _SECTOR_NAME_CANONICAL,
     extract_research_features as _extract_research_features,
 )
+from model import momentum_scorer
 
 
 def _load_signals_history(s3, bucket: str) -> dict[str, dict]:
@@ -998,21 +999,14 @@ def run_meta_training(
     wf_n_est = getattr(cfg, "WF_N_ESTIMATORS", None) or cfg.GBM_N_ESTIMATORS
     wf_es = getattr(cfg, "WF_EARLY_STOPPING", None) or cfg.GBM_EARLY_STOPPING_ROUNDS
 
-    # Momentum base params: YAML defaults from config.MOMENTUM_GBM_* with
-    # optional S3 override from config/predictor_momentum_params.json (written
-    # by the backtester's hyperparam sweep). Volatility base keeps the shared
-    # GBM params — only momentum has the weak-signal / overfitting issue.
-    mom_tuned_params = dict(cfg.MOMENTUM_GBM_TUNED_PARAMS)
-    mom_n_est = cfg.MOMENTUM_GBM_N_ESTIMATORS
-    mom_es = cfg.MOMENTUM_GBM_EARLY_STOPPING_ROUNDS
-    _s3_override = _load_momentum_params_from_s3(bucket)
-    if _s3_override:
-        if "tuned_params" in _s3_override:
-            mom_tuned_params.update(_s3_override["tuned_params"])
-        mom_n_est = _s3_override.get("n_estimators", mom_n_est)
-        mom_es = _s3_override.get("early_stopping_rounds", mom_es)
-        log.info("Momentum params overridden from S3: n_est=%d es=%d keys=%s",
-                 mom_n_est, mom_es, list(_s3_override.get("tuned_params", {}).keys()))
+    # Momentum L1 hyperparams (cfg.MOMENTUM_GBM_*, S3 override
+    # config/predictor_momentum_params.json) are no longer consumed —
+    # the L1 component is now the deterministic baseline at
+    # model/momentum_scorer.py. Config keys are left in place for
+    # backward compatibility with downstream readers (backtester
+    # hyperparam sweep) but their values are inert until / unless a
+    # future momentum L1 model returns through a named-baseline
+    # promotion gate.
 
     # Collect OOS predictions for meta-model training
     oos_meta_rows = []  # list of dicts with meta-features + actual outcome
@@ -1066,14 +1060,18 @@ def run_meta_training(
         else:
             fold_calibrator = prod_calibrator
 
-        # Train momentum model (low-capacity — see mom_tuned_params above)
-        n_sub = int(len(tr) * 0.85)
-        mom_scorer = GBMScorer(params=mom_tuned_params, n_estimators=mom_n_est,
-                               early_stopping_rounds=mom_es)
-        mom_scorer.fit(X_mom[tr[:n_sub]], y_fwd[tr[:n_sub]],
-                       X_mom[tr[n_sub:]], y_fwd[tr[n_sub:]],
-                       feature_names=cfg.MOMENTUM_FEATURES)
-        mom_preds = mom_scorer.predict(X_mom[te])
+        # Momentum L1 component is now the deterministic weighted-blend
+        # baseline (was a low-capacity LightGBM). Across 16 weeks of
+        # walk-forward validation the GBM consistently failed to beat
+        # the baseline (GBM val_IC ~0.01, baseline val_IC ~0.31), so
+        # the GBM was a calibration tax on the meta-Ridge stack.
+        # Replaced 2026-05-09. See model/momentum_scorer.py for the
+        # single source of truth and PR alpha-engine-predictor (post-#111)
+        # for the rationale.
+        n_sub = int(len(tr) * 0.85)  # retained for volatility split below
+        mom_preds = momentum_scorer.predict_array(
+            X_mom_raw[te], cfg.MOMENTUM_FEATURES,
+        )
         mom_ic = float(np.corrcoef(mom_preds, y_fwd[te])[0, 1]) if np.std(mom_preds) > 1e-10 else 0.0
         mom_fold_ics.append(mom_ic)
 
@@ -1695,15 +1693,15 @@ def run_meta_training(
     n_val_raw = int(N * cfg.VAL_FRAC)
     val_end = min(n_train + n_val_raw, N)
 
-    # Momentum production model (low-capacity — see mom_tuned_params above)
-    prod_mom = GBMScorer(params=mom_tuned_params, n_estimators=mom_n_est,
-                         early_stopping_rounds=mom_es)
-    prod_mom.fit(X_mom[:n_train], y_fwd[:n_train],
-                 X_mom[n_train:val_end], y_fwd[n_train:val_end],
-                 feature_names=cfg.MOMENTUM_FEATURES)
-    mom_test_preds = prod_mom.predict(X_mom[val_end:])
+    # Momentum L1 component is the deterministic weighted-blend baseline.
+    # No fit step — the formula is fixed (see model/momentum_scorer.py).
+    # test_IC is computed against the held-out slice for manifest reporting
+    # and parity with the volatility component below.
+    mom_test_preds = momentum_scorer.predict_array(
+        X_mom_raw[val_end:], cfg.MOMENTUM_FEATURES,
+    )
     mom_test_ic = float(np.corrcoef(mom_test_preds, y_fwd[val_end:])[0, 1]) if len(mom_test_preds) > 1 else 0.0
-    log.info("Momentum production: test_IC=%.4f  best_iter=%d", mom_test_ic, prod_mom._best_iteration)
+    log.info("Momentum production (deterministic baseline): test_IC=%.4f", mom_test_ic)
 
     # Volatility production model
     prod_vol = GBMScorer(params=tuned_params, n_estimators=cfg.GBM_N_ESTIMATORS,
@@ -1723,29 +1721,16 @@ def run_meta_training(
     # otherwise the GBM isn't earning its complexity on the slice that
     # mimics inference-time short-history tickers (SNDK-class).
     #
-    # Hard-fail block: if any component fails its subsample gate, the
-    # whole deploy is blocked. The meta-model is structurally trained on
-    # the L1 outputs; promoting a stack with a regressed component would
-    # ship a model with a known weakness on short-history tickers, which
-    # the data layer is now actively shipping (PR #78).
+    # Momentum is no longer in this gate: its component IS the named
+    # baseline (deterministic weighted blend, model/momentum_scorer.py),
+    # so a "component vs baseline" comparison is vacuous. Volatility +
+    # research calibrator retain the gate.
     from model.subsample_validator import (
-        momentum_baseline_predict, volatility_baseline_predict,
-        validate_component,
+        volatility_baseline_predict, validate_component,
     )
-    mom_subsample_mask_test = mom_nan_mask[val_end:]
     vol_subsample_mask_test = vol_nan_mask[val_end:]
-    mom_baseline_preds = momentum_baseline_predict(
-        X_mom_raw[val_end:], cfg.MOMENTUM_FEATURES,
-    )
     vol_baseline_preds = volatility_baseline_predict(
         X_vol_raw[val_end:], cfg.VOLATILITY_FEATURES,
-    )
-    mom_subsample_result = validate_component(
-        component_name="momentum",
-        component_preds=mom_test_preds,
-        baseline_preds=mom_baseline_preds,
-        y_true=y_fwd[val_end:],
-        subsample_mask=mom_subsample_mask_test,
     )
     vol_subsample_result = validate_component(
         component_name="volatility",
@@ -1754,11 +1739,9 @@ def run_meta_training(
         y_true=np.abs(y_fwd[val_end:]),
         subsample_mask=vol_subsample_mask_test,
     )
-    mom_subsample_result.log()
     vol_subsample_result.log()
     subsample_gate_passed = (
-        mom_subsample_result.passed
-        and vol_subsample_result.passed
+        vol_subsample_result.passed
         and research_subsample_result.passed
     )
 
@@ -1870,12 +1853,11 @@ def run_meta_training(
     )
     log.info(
         "Promotion gate: meta_IC=%.4f %s %.4f (meta=%s) AND component "
-        "subsample (mom=%s, vol=%s, research=%s) AND output_dist=%s "
-        "AND stratified_per_regime=%s%s → %s "
+        "subsample (vol=%s, research=%s; momentum=DETERMINISTIC) AND "
+        "output_dist=%s AND stratified_per_regime=%s%s → %s "
         "(walk-forward for reference: mom_median=%.4f, vol_median=%.4f)",
         meta_model._val_ic, ">=" if meta_ic_passed else "<", _meta_ic_gate,
         "PASS" if meta_ic_passed else "BLOCK",
-        "PASS" if mom_subsample_result.passed else "BLOCK",
         "PASS" if vol_subsample_result.passed else "BLOCK",
         "PASS" if research_subsample_result.passed else "BLOCK",
         "PASS" if output_dist_result.passed else "FAIL",
@@ -1902,8 +1884,14 @@ def run_meta_training(
             # prior training cycle is left in place; inference no longer loads
             # it (see inference/stages/load_model.py). Cleanup of the stale
             # S3 artifact is tracked in the Tier 1 regime roadmap entry.
+            #
+            # Momentum LightGBM removed from upload set 2026-05-09 — its L1
+            # component is now the deterministic baseline at
+            # model/momentum_scorer.py. Existing s3://.../momentum_model.txt
+            # from prior training cycles is left in place; inference's
+            # tolerant load_meta_models block stops loading it (see
+            # inference/stages/load_model.py).
             models = {
-                "momentum": (prod_mom, "momentum_model.txt"),
                 "volatility": (prod_vol, "volatility_model.txt"),
                 "research_calibrator": (prod_calibrator, "research_calibrator.json"),
                 "meta_model": (meta_model, "meta_model.pkl"),
@@ -1983,7 +1971,11 @@ def run_meta_training(
                 "version": "v3.0-meta",
                 "promoted": promoted,
                 "models": {
-                    "momentum": {"key": f"{prefix}momentum_model.txt", "test_ic": round(mom_test_ic, 6)},
+                    "momentum": {
+                        "kind": "deterministic_baseline",
+                        "test_ic": round(mom_test_ic, 6),
+                        "formula": "0.4*m5 + 0.3*m20 + 0.2*price_vs_ma50 + 0.1*(rsi-50)/100",
+                    },
                     "volatility": {"key": f"{prefix}volatility_model.txt", "test_ic": round(vol_test_ic, 6)},
                     # regime: removed from manifest 2026-04-16 (Tier 0 model
                     # retired; see Step 8 note and roadmap).
@@ -2250,12 +2242,14 @@ def run_meta_training(
             "passes_wf": mom_median_ic > 0 and vol_median_ic > 0,
         },
         "short_history_subsample": {
+            # Momentum subsample gate retired 2026-05-09 — its L1 component
+            # is now the deterministic baseline so component-vs-baseline is
+            # vacuous. Carrying explicit kind="deterministic_baseline" here
+            # so dashboard / health-check consumers can detect the change
+            # without inferring from missing keys.
             "momentum": {
-                "n": mom_subsample_result.n,
-                "component_ic": round(mom_subsample_result.component_ic, 6),
-                "baseline_ic": round(mom_subsample_result.baseline_ic, 6),
-                "passed": mom_subsample_result.passed,
-                "skip_reason": mom_subsample_result.skip_reason,
+                "kind": "deterministic_baseline",
+                "skip_reason": "component is the named baseline (no GBM to validate)",
             },
             "volatility": {
                 "n": vol_subsample_result.n,

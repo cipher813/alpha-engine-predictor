@@ -26,11 +26,6 @@ short-warmup tickers like SNDK / SARO / SOLS / Q).
 Named baselines (intentionally simple — the "minimum bar" a GBM must
 clear to justify its complexity):
 
-  - **Momentum**: weighted average of raw momentum features
-    ``(0.4·m5 + 0.3·m20 + 0.2·ma50 + 0.1·(rsi-50)/100)`` — matches the
-    direct-fallback path at ``run_inference.py:264-271`` so the gate
-    asks "does the GBM beat the fallback the inference path already
-    knows how to use when GBM IC < 0.02?"
   - **Volatility**: realized 20-day volatility passthrough — directly
     correlates with future absolute return.
 
@@ -99,33 +94,6 @@ def _safe_pearson_ic(preds: np.ndarray, y: np.ndarray) -> float:
         return 0.0
     ic = float(np.corrcoef(preds, y)[0, 1])
     return ic if np.isfinite(ic) else 0.0
-
-
-def momentum_baseline_predict(
-    X_mom_raw: np.ndarray, feature_names: list[str],
-) -> np.ndarray:
-    """Named baseline for the momentum component: weighted average of
-    raw momentum features matching the direct-fallback formula at
-    ``inference/stages/run_inference.py:267-271``.
-
-    Uses ``np.nan_to_num`` with neutral defaults (0 for momentum/MA
-    features, 50 for RSI) so short-history NaN rows produce a real-
-    valued baseline prediction the GBM must beat.
-    """
-    name_to_idx = {n: i for i, n in enumerate(feature_names)}
-
-    def _get(name: str, default: float) -> np.ndarray:
-        idx = name_to_idx.get(name)
-        if idx is None:
-            return np.full(X_mom_raw.shape[0], default, dtype=np.float64)
-        col = X_mom_raw[:, idx].astype(np.float64)
-        return np.where(np.isnan(col), default, col)
-
-    m5 = _get("momentum_5d", 0.0)
-    m20 = _get("momentum_20d", 0.0)
-    ma50 = _get("price_vs_ma50", 0.0)
-    rsi = _get("rsi_14", 50.0)
-    return 0.4 * m5 + 0.3 * m20 + 0.2 * ma50 + 0.1 * (rsi - 50) / 100
 
 
 def volatility_baseline_predict(

@@ -51,14 +51,10 @@ def _load_meta_models(ctx: PipelineContext) -> None:
             pass
         return local
 
-    # Momentum model (GBM)
-    try:
-        from model.gbm_scorer import GBMScorer
-        path = _dl(f"{prefix}momentum_model.txt", "meta_momentum.txt")
-        ctx.meta_models["momentum"] = GBMScorer.load(path)
-        log.info("Loaded momentum model")
-    except Exception as e:
-        log.warning("Momentum model not available: %s", e)
+    # Momentum L1 component is the deterministic weighted-blend baseline
+    # (model/momentum_scorer.py) — no S3 weights to load. Existing
+    # s3://.../momentum_model.txt from prior training cycles is left in
+    # place; cleanup is a separate concern.
 
     # Volatility model (GBM)
     try:

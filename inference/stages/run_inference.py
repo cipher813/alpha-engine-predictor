@@ -16,6 +16,7 @@ import pandas as pd
 
 import config as cfg
 from inference.pipeline import PipelineContext, PipelineAbort
+from model.momentum_scorer import predict_dict as _momentum_scorer_predict_dict
 
 log = logging.getLogger(__name__)
 
@@ -202,7 +203,9 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
     # Training still imports it — only inference was migrated.
     from model.meta_model import META_FEATURES, MACRO_FEATURE_META_MAP
 
-    mom_scorer = ctx.meta_models.get("momentum")
+    # Momentum L1 component is the deterministic baseline at
+    # model/momentum_scorer.py — no scorer to look up. The
+    # ctx.meta_models["momentum"] entry was retired 2026-05-09.
     vol_scorer = ctx.meta_models.get("volatility")
     # regime_model removed from ctx.meta_models lookup 2026-04-16 — Tier 0
     # classifier no longer loaded by load_model.py.
@@ -230,19 +233,19 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
     # loaded (early observation cycle, or training-side fit was skipped).
     canonical_meta_model = ctx.meta_models.get("canonical_meta")
 
-    if mom_scorer is None and vol_scorer is None and meta_model is None:
+    if vol_scorer is None and meta_model is None:
         # Per feedback_hard_fail_until_stable: this is a cold-start load
         # failure, not a transient condition. Silent fallback to the old v2
         # path (deleted 2026-04-15) would degrade quality without alerting.
+        # Momentum L1 is now deterministic (no S3 weights), so absence of a
+        # momentum scorer is no longer a load-failure signal.
         raise RuntimeError(
-            "All Layer-1 and meta-model scorers failed to load. Check "
+            "Volatility and meta-model scorers both failed to load. Check "
             "load_model.py diagnostics and verify predictor/weights/meta/ "
             "in S3 is populated and readable."
         )
 
-    _mom_ic = getattr(mom_scorer, "_val_ic", 0) if mom_scorer else 0
-    _mom_mode = "GBM" if _mom_ic >= 0.02 else "direct (GBM IC=%.4f < 0.02)" % _mom_ic
-    log.info("Momentum scoring mode: %s", _mom_mode)
+    log.info("Momentum scoring mode: deterministic baseline (model/momentum_scorer.py)")
 
     # ── Step 1: Compute raw macro features (once, market-wide) ──────────────
     # RegimePredictor used here as a pure feature-engineering utility via
@@ -353,24 +356,13 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
     # alpha-engine-predictor PR #107 closed the NaN→1.0 rank-norm bug
     # (training-side); this closes the inference-side counterpart.
     #
-    # Fallback paths (GBM IC < 0.02) intentionally stay on raw values —
-    # the direct weighted-sum momentum formula was designed against raw
-    # feature units (5d/20d returns, MA50 ratio, RSI 0-100) and changes
-    # meaning if rank-normed.
-    _mom_ic = getattr(mom_scorer, "_val_ic", 0) if mom_scorer else 0
+    # Momentum is the deterministic baseline (model/momentum_scorer.py)
+    # which operates on raw feature units (5d/20d returns, MA50 ratio,
+    # RSI 0-100) per-ticker, so no rank-norm batch is built here.
     present_tickers = [t for t in ctx.tickers if t in precomputed]
     ticker_to_batch_idx = {t: i for i, t in enumerate(present_tickers)}
     n_present = len(present_tickers)
     today_dates = [ctx.date_str] * n_present  # one cross-section per inference run
-
-    X_mom_ranked: np.ndarray | None = None
-    if mom_scorer is not None and _mom_ic >= 0.02 and n_present >= 1:
-        from data.dataset import cross_sectional_rank_normalize as _rank_norm
-        X_mom_raw = np.stack([
-            precomputed[t][cfg.MOMENTUM_FEATURES].to_numpy(dtype=np.float32)
-            for t in present_tickers
-        ])
-        X_mom_ranked = _rank_norm(X_mom_raw, today_dates).astype(np.float32)
 
     X_vol_ranked: np.ndarray | None = None
     if vol_scorer is not None and n_present >= 1:
@@ -392,31 +384,10 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
             ctx.n_skipped += 1
             continue
 
-        # Layer 1A: Momentum model
-        # If the momentum GBM has low quality (IC < 0.02 or best_iter <= 1),
-        # fall back to a direct weighted average of raw momentum features.
-        # This avoids a near-constant output from a barely-trained model.
-        # LightGBM handles NaN inputs natively (treats as missing, picks
-        # default branch direction in tree splits) — no fillna upstream.
-        momentum_score = 0.0
-        if mom_scorer is not None and _mom_ic >= 0.02 and X_mom_ranked is not None:
-            idx = ticker_to_batch_idx[ticker]
-            mom_x = X_mom_ranked[idx:idx + 1]  # rank-normed slice, shape (1, n_features)
-            momentum_score = float(mom_scorer.predict(mom_x)[0])
-        else:
-            # Direct weighted-sum fallback. Use _safe_get_numeric so NaN
-            # short-history features degrade to neutral (0 / 50 baseline)
-            # instead of poisoning the weighted sum — Python's ``nan or 0``
-            # returns nan because nan is truthy. Stays on RAW values: the
-            # formula's coefficients (0.4·m5 + 0.3·m20 + 0.2·ma50 + ...)
-            # are calibrated against raw feature units, not rank-normed.
-            _m5 = _safe_get_numeric(latest, "momentum_5d", 0.0)
-            _m20 = _safe_get_numeric(latest, "momentum_20d", 0.0)
-            _ma50 = _safe_get_numeric(latest, "price_vs_ma50", 0.0)
-            _rsi = _safe_get_numeric(latest, "rsi_14", 50.0)
-            momentum_score = (
-                0.4 * _m5 + 0.3 * _m20 + 0.2 * _ma50 + 0.1 * (_rsi - 50) / 100
-            )
+        # Layer 1A: Momentum L1 component — deterministic weighted-blend
+        # baseline (model/momentum_scorer.py). NaN / None / non-finite
+        # inputs degrade to neutral defaults inside predict_dict.
+        momentum_score = _momentum_scorer_predict_dict(latest)
 
         # Layer 1B: Volatility model. LightGBM handles NaN natively; if
         # predict raises that's a real load/inference fault we want loud,
