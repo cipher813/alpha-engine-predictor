@@ -1307,122 +1307,83 @@ def run_meta_training(
         )
 
     # ── Step 7: Train meta-model on pooled OOS ───────────────────────────────
+    # Audit Track A PR 5/6 cutover (2026-05-09): the meta-Ridge now trains on
+    # canonical alpha labels (`actual_fwd_canonical` — log-domain risk-matched
+    # vs vol-cohort EW basket), retiring the legacy `actual_fwd` arithmetic
+    # target. Today's smoke (legacy still canonical) showed canonical Ridge
+    # at val_ic≈0.19 on canonical labels vs legacy Ridge at val_ic≈0.07 on
+    # legacy labels — 2.6× stronger meta-Ridge under the canonical target.
+    #
+    # Filter to rows with finite canonical labels (NaN for tickers that were
+    # unclassifiable into a vol cohort, or cohorts with <2 members). The
+    # full meta_X is preserved as `meta_X_all` for downstream diagnostics
+    # that span all rows; the Ridge fit + isotonic + per-regime stack all
+    # consume the canonical-finite subset.
     log.info("Training meta-model on %d OOS rows...", len(oos_meta_rows))
-    meta_X = np.array([[r[f] for f in META_FEATURES] for r in oos_meta_rows])
-    meta_y = np.array([r["actual_fwd"] for r in oos_meta_rows])
+    meta_X_all = np.array([[r[f] for f in META_FEATURES] for r in oos_meta_rows])
+    meta_y_all = np.array([r["actual_fwd"] for r in oos_meta_rows])  # legacy, kept for diagnostics
+    canonical_y_full = np.array([
+        r.get("actual_fwd_canonical", float("nan")) for r in oos_meta_rows
+    ])
+    canonical_finite_mask = np.isfinite(canonical_y_full)
+    n_canonical = int(canonical_finite_mask.sum())
+    if n_canonical < 100:
+        raise RuntimeError(
+            f"Track A cutover: only {n_canonical} OOS rows have finite "
+            "actual_fwd_canonical labels (need ≥100). Check Step 3b's "
+            "canonical-alpha computation — vol-cohort assignment may have "
+            "failed for the majority of tickers, or the canonical-alpha "
+            "module raised non-fatally and skipped the population."
+        )
+    meta_X = meta_X_all[canonical_finite_mask]
+    meta_y = canonical_y_full[canonical_finite_mask]
     meta_model = MetaModel(alpha=1.0)
     meta_model.fit(meta_X, meta_y, feature_names=META_FEATURES)
+    log.info(
+        "Meta-Ridge fit on canonical labels: n_canonical=%d / n_total=%d "
+        "(val_ic_canonical=%.4f)",
+        n_canonical, len(oos_meta_rows), meta_model._val_ic,
+    )
 
-    # ── Step 7e: Parallel canonical-label Ridge (audit Track A PR 3/6) ──────
-    # Fits a second Ridge on the same META_FEATURES but with canonical
-    # alpha labels (log-domain risk-matched vs vol-cohort EW basket) as
-    # the regression target instead of legacy ``actual_fwd``. Persisted
-    # alongside the legacy Ridge in observe-only mode — inference doesn't
-    # consume it yet (Track A PR 4 wires that). Cutover is PR 5 after the
-    # parity comparison validates direction-of-shift.
-    #
-    # Same parallel-observation pattern as Phase 3 PR 2 (research-LGB) and
-    # Phase 4 PR 3 (per-regime Ridge stack). Manifest carries val_ic for
-    # both Ridges so the cutover decision is data-driven.
-    canonical_meta_model: MetaModel | None = None
-    canonical_meta_model_metrics: dict | None = None
-    try:
-        canonical_y_full = np.array([
-            r.get("actual_fwd_canonical", float("nan")) for r in oos_meta_rows
-        ])
-        canonical_finite_mask = np.isfinite(canonical_y_full)
-        if canonical_finite_mask.sum() >= 100:
-            canonical_meta_model = MetaModel(alpha=1.0).fit(
-                meta_X[canonical_finite_mask],
-                canonical_y_full[canonical_finite_mask],
-                feature_names=META_FEATURES,
-            )
-            # Compute IC of canonical Ridge against canonical labels (its own
-            # training target) AND against legacy labels (parity comparison
-            # — does training on canonical labels degrade legacy-label IC?).
-            canonical_preds = canonical_meta_model.predict(
-                meta_X[canonical_finite_mask]
-            )
-            canonical_y_subset = canonical_y_full[canonical_finite_mask]
-            legacy_y_subset = meta_y[canonical_finite_mask]
-            ic_canonical_ridge_vs_canonical = (
-                float(np.corrcoef(canonical_preds, canonical_y_subset)[0, 1])
-                if np.std(canonical_preds) > 0 else 0.0
-            )
-            # IC of canonical Ridge on legacy labels (cross-target).
-            mask_finite_legacy = np.isfinite(legacy_y_subset)
-            if mask_finite_legacy.sum() >= 50:
-                ic_canonical_ridge_vs_legacy = float(np.corrcoef(
-                    canonical_preds[mask_finite_legacy],
-                    legacy_y_subset[mask_finite_legacy],
-                )[0, 1])
-            else:
-                ic_canonical_ridge_vs_legacy = float("nan")
+    # Parity diagnostic: canonical Ridge predictions vs legacy labels
+    # (cross-target). Useful for monitoring whether the cutover degrades
+    # the historical reporting metric. Same 4-cell-grid spirit as Track A
+    # PR 3's observe-only diagnostic; post-cutover we only retain the
+    # canonical→legacy cross-IC because the legacy-Ridge half is gone.
+    legacy_y_subset = meta_y_all[canonical_finite_mask]
+    mask_finite_legacy = np.isfinite(legacy_y_subset)
+    if mask_finite_legacy.sum() >= 50:
+        canonical_preds_for_diag = meta_model.predict(meta_X).ravel()
+        ic_canonical_ridge_vs_legacy = float(np.corrcoef(
+            canonical_preds_for_diag[mask_finite_legacy],
+            legacy_y_subset[mask_finite_legacy],
+        )[0, 1])
+    else:
+        ic_canonical_ridge_vs_legacy = float("nan")
+    log.info(
+        "Canonical-vs-legacy diagnostic: ic_canonical_ridge_vs_legacy=%s "
+        "(post-cutover monitoring; canonical is canonical)",
+        f"{ic_canonical_ridge_vs_legacy:+.4f}"
+        if np.isfinite(ic_canonical_ridge_vs_legacy) else "n/a",
+    )
 
-            # IC of LEGACY Ridge on canonical labels (cross-target,
-            # apples-to-apples comparison closer for the cutover decision).
-            # Track A PR 5 cutover gate compares
-            # ``ic_canonical_ridge_vs_canonical`` against
-            # ``ic_legacy_ridge_vs_canonical`` (NOT
-            # ``ic_legacy_ridge_vs_legacy`` — different targets, can't
-            # compare directly). Pre-fix the 2x2 grid was incomplete; one
-            # cell missing meant the cutover decision had to lean on the
-            # apples-to-oranges (legacy_vs_legacy) pairing. Origin: 2026-05-09
-            # canonical Ridge first observation flagged the gap.
-            legacy_preds_on_canonical_mask = meta_model.predict(
-                meta_X[canonical_finite_mask]
-            ).ravel()
-            ic_legacy_ridge_vs_canonical = (
-                float(np.corrcoef(legacy_preds_on_canonical_mask, canonical_y_subset)[0, 1])
-                if np.std(legacy_preds_on_canonical_mask) > 0 else 0.0
-            )
+    # Filter oos_meta_rows to canonical-finite rows so downstream consumers
+    # (horizon battery, row_regimes, regime_conditioned_meta, isotonic
+    # calibrator) align naturally with meta_X / meta_y / Ridge predictions.
+    # Pre-cutover the Ridge fit on the full row set; post-cutover the fit
+    # is on the canonical-finite subset and every downstream operation
+    # against Ridge outputs must use the same subset.
+    oos_meta_rows = [
+        r for r, ok in zip(oos_meta_rows, canonical_finite_mask) if ok
+    ]
 
-            canonical_meta_model_metrics = {
-                "type": "canonical_meta_model_v1",
-                "fitted": True,
-                "n_samples": int(canonical_finite_mask.sum()),
-                "ic_canonical_ridge_vs_canonical": (
-                    round(ic_canonical_ridge_vs_canonical, 6)
-                    if np.isfinite(ic_canonical_ridge_vs_canonical) else None
-                ),
-                "ic_canonical_ridge_vs_legacy": (
-                    round(ic_canonical_ridge_vs_legacy, 6)
-                    if np.isfinite(ic_canonical_ridge_vs_legacy) else None
-                ),
-                "ic_legacy_ridge_vs_legacy": round(meta_model._val_ic, 6),
-                "ic_legacy_ridge_vs_canonical": (
-                    round(ic_legacy_ridge_vs_canonical, 6)
-                    if np.isfinite(ic_legacy_ridge_vs_canonical) else None
-                ),
-                "feature_names": list(META_FEATURES),
-                "coefficients": canonical_meta_model._coefficients,
-            }
-            log.info(
-                "Canonical Ridge fit: n=%d, "
-                "ic_canonical_ridge_vs_canonical=%s, "
-                "ic_canonical_ridge_vs_legacy=%s, "
-                "ic_legacy_ridge_vs_legacy=%.4f, "
-                "ic_legacy_ridge_vs_canonical=%s "
-                "— observe-only Track A PR 3/6",
-                int(canonical_finite_mask.sum()),
-                f"{ic_canonical_ridge_vs_canonical:.4f}"
-                if np.isfinite(ic_canonical_ridge_vs_canonical) else "n/a",
-                f"{ic_canonical_ridge_vs_legacy:.4f}"
-                if np.isfinite(ic_canonical_ridge_vs_legacy) else "n/a",
-                meta_model._val_ic,
-                f"{ic_legacy_ridge_vs_canonical:.4f}"
-                if np.isfinite(ic_legacy_ridge_vs_canonical) else "n/a",
-            )
-        else:
-            log.info(
-                "Canonical Ridge: only %d finite canonical labels (need >=100) — "
-                "skipped this cycle. Legacy meta-Ridge unchanged.",
-                int(canonical_finite_mask.sum()),
-            )
-    except Exception as e:
-        log.warning(
-            "Canonical Ridge fit failed (non-blocking, observe-only): %s", e,
-        )
+    # Step 7e (parallel canonical-label Ridge, audit Track A PR 3) retired
+    # 2026-05-09 (Track A PR 5/6 cutover). The single Ridge above NOW
+    # trains on canonical labels; there is no parallel "legacy Ridge" to
+    # compare against. Post-cutover monitoring uses
+    # ``ic_canonical_ridge_vs_legacy`` emitted from the diagnostic above
+    # (one cross-target IC; the 4-cell grid collapsed to 1 cell since
+    # canonical-vs-canonical IS the production val_ic).
 
     # ── Step 7.1: Multi-horizon forward IC diagnostic (ROADMAP Predictor P2) ─
     # Evaluate how well the 5d-trained meta-model ranks tickers at multiple
@@ -1552,52 +1513,28 @@ def run_meta_training(
 
     # Audit Track A PR 2/6 (2026-05-07): canonical-label IC diagnostic.
     # Computes Pearson correlation of meta_preds_oos_insample (single-Ridge
-    # output trained on legacy ``actual_fwd`` labels) against the canonical
-    # alpha labels (log-domain risk-matched vs vol-cohort EW basket).
-    # If the IC against canonical is meaningfully different from IC against
-    # legacy, that's the audit's expected direction-of-shift signal —
-    # evidence that the meta-Ridge would benefit from training on canonical
-    # labels (Track A PR 3 ships that parallel Ridge fit; PR 5 cuts over).
-    canonical_ic_metrics: dict = {"computed": False}
-    try:
-        y_canonical = np.array([
-            r.get("actual_fwd_canonical", float("nan")) for r in oos_meta_rows
-        ])
-        canonical_mask = np.isfinite(y_canonical)
-        if canonical_mask.sum() >= 100:
-            canonical_ic = float(
-                np.corrcoef(
-                    meta_preds_oos_insample[canonical_mask],
-                    y_canonical[canonical_mask],
-                )[0, 1]
-            )
-            legacy_ic_against_legacy = float(meta_model._val_ic)
-            canonical_ic_metrics = {
-                "computed": True,
-                "n_finite_canonical_labels": int(canonical_mask.sum()),
-                "n_total_rows": len(oos_meta_rows),
-                "single_ridge_ic_vs_canonical": (
-                    round(canonical_ic, 6) if np.isfinite(canonical_ic) else None
-                ),
-                "single_ridge_ic_vs_legacy": round(legacy_ic_against_legacy, 6),
-            }
-            log.info(
-                "Canonical-label IC diagnostic: single-Ridge vs canonical=%s, "
-                "vs legacy=%.4f (n_canonical=%d / n_total=%d) — observe-only Track A PR 2",
-                f"{canonical_ic:.4f}" if np.isfinite(canonical_ic) else "n/a",
-                legacy_ic_against_legacy,
-                int(canonical_mask.sum()), len(oos_meta_rows),
-            )
-        else:
-            log.info(
-                "Canonical-label IC diagnostic: only %d finite canonical labels "
-                "(need >=100) — skipped",
-                int(canonical_mask.sum()),
-            )
-    except Exception as e:
-        log.warning(
-            "Canonical-label IC diagnostic failed (non-blocking, observe-only): %s", e,
-        )
+    # Track A PR 5/6 cutover (2026-05-09): the legacy-Ridge-vs-canonical
+    # IC diagnostic that lived here became vacuous post-cutover (the
+    # single Ridge IS canonical-trained; "single_ridge_ic_vs_canonical"
+    # is the same as meta_model._val_ic). The legacy parity comparison
+    # (``ic_canonical_ridge_vs_legacy``) now ships out of Step 7 above
+    # in `track_a_canonical_diagnostic` for cross-cycle trend monitoring.
+    canonical_ic_metrics: dict = {
+        "computed": True,
+        "n_finite_canonical_labels": n_canonical,
+        "n_total_rows": n_canonical,  # post-cutover oos_meta_rows is canonical-filtered
+        "single_ridge_ic_vs_canonical": round(meta_model._val_ic, 6),
+        "single_ridge_ic_vs_legacy": (
+            round(ic_canonical_ridge_vs_legacy, 6)
+            if np.isfinite(ic_canonical_ridge_vs_legacy) else None
+        ),
+        "post_cutover_note": (
+            "Post Track A PR 5/6 cutover: meta_model trains on canonical "
+            "labels; single_ridge_ic_vs_canonical IS meta_model._val_ic. "
+            "single_ridge_ic_vs_legacy is the cross-target diagnostic for "
+            "cross-cycle trend monitoring."
+        ),
+    }
 
     # Backwards-compat: keep spearman_5d / spearman_21d scalars for the
     # existing result-dict field consumers (email, dashboard, etc.).
@@ -1953,14 +1890,12 @@ def run_meta_training(
                 models["regime_conditioned_meta"] = (
                     prod_regime_conditioned_meta, "regime_conditioned_meta.pkl",
                 )
-            # Audit Track A PR 3/6: canonical-label Ridge ships in
-            # observe-only mode. Inference doesn't load it yet (PR 4
-            # wires that). The legacy meta_model.pkl above remains the
-            # canonical alpha source.
-            if canonical_meta_model is not None:
-                models["canonical_meta_model"] = (
-                    canonical_meta_model, "canonical_meta_model.pkl",
-                )
+            # Audit Track A PR 5/6 cutover (2026-05-09): canonical_meta_model
+            # retired from the upload set. The single meta_model.pkl above
+            # is now trained on canonical labels — no separate canonical
+            # parallel. Existing s3://.../canonical_meta_model.pkl from
+            # the observe-only era is left in place; inference's tolerant
+            # loader stops reading it (see load_model.py).
             # Dated archive is always written (records what training produced
             # regardless of gate decision). Live path is only overwritten when
             # the promotion gate passes — otherwise live weights stay at the
@@ -2066,20 +2001,19 @@ def run_meta_training(
                         }}
                         if prod_regime_conditioned_meta is not None else {}
                     ),
-                    # Audit Track A PR 3/6 (2026-05-07): canonical-label
-                    # Ridge observe-only metrics. Carries val_ic for the
-                    # canonical Ridge against both canonical and legacy
-                    # labels — PR 5's cutover decision compares
-                    # ic_canonical_ridge_vs_canonical against
-                    # ic_legacy_ridge_vs_legacy to confirm the canonical
-                    # Ridge dominates against its own (canonical) target.
-                    **(
-                        {"canonical_meta_model": {
-                            "key": f"{prefix}canonical_meta_model.pkl",
-                            **(canonical_meta_model_metrics or {}),
-                        }}
-                        if canonical_meta_model is not None else {}
+                    # Track A PR 5/6 cutover (2026-05-09): canonical_meta_model
+                    # observe-only entry retired. The meta_model entry above
+                    # IS the canonical Ridge. Post-cutover monitoring is
+                    # ic_canonical_ridge_vs_legacy at the diagnostics block
+                    # below.
+                },
+                "track_a_canonical_diagnostic": {
+                    "ic_canonical_ridge_vs_legacy": (
+                        round(ic_canonical_ridge_vs_legacy, 6)
+                        if np.isfinite(ic_canonical_ridge_vs_legacy) else None
                     ),
+                    "n_canonical": n_canonical,
+                    "n_total": len(oos_meta_rows),
                 },
                 "walk_forward": {
                     "momentum_median_ic": round(mom_median_ic, 6),
