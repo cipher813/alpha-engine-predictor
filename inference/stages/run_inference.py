@@ -336,6 +336,51 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
     max_r = getattr(cfg, "LABEL_CLIP", 0.15)
     precomputed = _load_precomputed_features_from_arcticdb(ctx)
 
+    # ── Cross-sectional rank-normalize today's batch ────────────────────────
+    # Training rank-normalizes via ``cross_sectional_rank_normalize`` per-date
+    # (``data/dataset.py``) before fitting the L1 GBMs; the GBM's split
+    # thresholds are learned on percentile ranks in (0, 1). Inference must
+    # apply the same transform across today's full ticker batch — without
+    # this, raw feature values land in ranges the GBM never saw, and tree
+    # splits learned at e.g. ``rank < 0.42`` route every ticker into one
+    # leaf, producing a small number of degenerate predictions.
+    #
+    # Origin: 2026-05-09 audit. Friday's production predictions
+    # degenerated to 7 unique p_up values across 27 tickers (5 saturated
+    # at 0.010); the SaturdayHealthCheck DriftDetection alarm fired
+    # "93% predict DOWN" — both signatures of leaf-clustering caused by
+    # the inference-vs-training feature distribution gap. The
+    # alpha-engine-predictor PR #107 closed the NaN→1.0 rank-norm bug
+    # (training-side); this closes the inference-side counterpart.
+    #
+    # Fallback paths (GBM IC < 0.02) intentionally stay on raw values —
+    # the direct weighted-sum momentum formula was designed against raw
+    # feature units (5d/20d returns, MA50 ratio, RSI 0-100) and changes
+    # meaning if rank-normed.
+    _mom_ic = getattr(mom_scorer, "_val_ic", 0) if mom_scorer else 0
+    present_tickers = [t for t in ctx.tickers if t in precomputed]
+    ticker_to_batch_idx = {t: i for i, t in enumerate(present_tickers)}
+    n_present = len(present_tickers)
+    today_dates = [ctx.date_str] * n_present  # one cross-section per inference run
+
+    X_mom_ranked: np.ndarray | None = None
+    if mom_scorer is not None and _mom_ic >= 0.02 and n_present >= 1:
+        from data.dataset import cross_sectional_rank_normalize as _rank_norm
+        X_mom_raw = np.stack([
+            precomputed[t][cfg.MOMENTUM_FEATURES].to_numpy(dtype=np.float32)
+            for t in present_tickers
+        ])
+        X_mom_ranked = _rank_norm(X_mom_raw, today_dates).astype(np.float32)
+
+    X_vol_ranked: np.ndarray | None = None
+    if vol_scorer is not None and n_present >= 1:
+        from data.dataset import cross_sectional_rank_normalize as _rank_norm
+        X_vol_raw = np.stack([
+            precomputed[t][cfg.VOLATILITY_FEATURES].to_numpy(dtype=np.float32)
+            for t in present_tickers
+        ])
+        X_vol_ranked = _rank_norm(X_vol_raw, today_dates).astype(np.float32)
+
     for ticker in ctx.tickers:
         latest = precomputed.get(ticker)
         if latest is None:
@@ -353,16 +398,18 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
         # This avoids a near-constant output from a barely-trained model.
         # LightGBM handles NaN inputs natively (treats as missing, picks
         # default branch direction in tree splits) — no fillna upstream.
-        _mom_ic = getattr(mom_scorer, "_val_ic", 0) if mom_scorer else 0
         momentum_score = 0.0
-        if mom_scorer is not None and _mom_ic >= 0.02:
-            mom_x = latest[cfg.MOMENTUM_FEATURES].to_numpy(dtype=np.float32).reshape(1, -1)
+        if mom_scorer is not None and _mom_ic >= 0.02 and X_mom_ranked is not None:
+            idx = ticker_to_batch_idx[ticker]
+            mom_x = X_mom_ranked[idx:idx + 1]  # rank-normed slice, shape (1, n_features)
             momentum_score = float(mom_scorer.predict(mom_x)[0])
         else:
             # Direct weighted-sum fallback. Use _safe_get_numeric so NaN
             # short-history features degrade to neutral (0 / 50 baseline)
             # instead of poisoning the weighted sum — Python's ``nan or 0``
-            # returns nan because nan is truthy.
+            # returns nan because nan is truthy. Stays on RAW values: the
+            # formula's coefficients (0.4·m5 + 0.3·m20 + 0.2·ma50 + ...)
+            # are calibrated against raw feature units, not rank-normed.
             _m5 = _safe_get_numeric(latest, "momentum_5d", 0.0)
             _m20 = _safe_get_numeric(latest, "momentum_20d", 0.0)
             _ma50 = _safe_get_numeric(latest, "price_vs_ma50", 0.0)
@@ -375,8 +422,9 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
         # predict raises that's a real load/inference fault we want loud,
         # not a per-ticker silent zero.
         expected_move = 0.0
-        if vol_scorer is not None:
-            vol_x = latest[cfg.VOLATILITY_FEATURES].to_numpy(dtype=np.float32).reshape(1, -1)
+        if vol_scorer is not None and X_vol_ranked is not None:
+            idx = ticker_to_batch_idx[ticker]
+            vol_x = X_vol_ranked[idx:idx + 1]  # rank-normed slice, shape (1, n_features)
             expected_move = float(vol_scorer.predict(vol_x)[0])
 
         # Layer 1C: Research calibrator + research-feature extraction
