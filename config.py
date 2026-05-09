@@ -272,6 +272,22 @@ OUTPUT_DISTRIBUTION_GATE_BLOCKING = _wf_cfg.get(
 OUTPUT_DISTRIBUTION_GATE_INFERENCE_BLOCKING = _wf_cfg.get(
     "output_distribution_gate_inference_blocking", False
 )
+
+# Audit Phase 4 PR 5 (2026-05-09) — Regime-conditioned inference cutover.
+# When True, ``inference/stages/run_inference.py`` swaps the production
+# ``predicted_alpha`` from the single-Ridge canonical to the per-regime
+# Ridge stack's ``regime_conditioned_alpha`` whenever the regime classifier
+# + RegimeConditionedMeta both produced a value for the ticker. Falls
+# back per-ticker to single-Ridge when the regime stack didn't produce
+# a value (e.g. RegimePredictorV2 hasn't cleared its own gate post-
+# class-weighting fix from PR #109; or per-regime Ridge missing for
+# the predicted regime). Default False so the cutover stays inactive
+# until ``analysis.regime_cutover_gate`` confirms the audit's
+# 1.15× relative-IC-lift criterion clears on real data — flipping
+# this flag is the operator's deliberate cutover action.
+REGIME_CONDITIONED_INFERENCE_ENABLED = _wf_cfg.get(
+    "regime_conditioned_inference_enabled", False
+)
 WF_N_ESTIMATORS = _wf_cfg.get("wf_n_estimators", None)  # None → use GBM_N_ESTIMATORS
 WF_EARLY_STOPPING = _wf_cfg.get("wf_early_stopping", None)  # None → use GBM_EARLY_STOPPING_ROUNDS
 

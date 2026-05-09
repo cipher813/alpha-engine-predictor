@@ -575,6 +575,32 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
                 + 0.2 * expected_move * np.sign(momentum_score)
             )
 
+        # Audit Phase 4 PR 5 cutover: when the operator has confirmed the
+        # cutover gate passes (offline ``analysis.regime_cutover_gate`` →
+        # flip ``regime_conditioned_inference_enabled`` in predictor.yaml),
+        # swap ``alpha`` to the regime-conditioned ensemble value. Falls
+        # back per-ticker to the single-Ridge ``alpha`` whenever the
+        # regime stack didn't produce a value for that ticker (regime
+        # classifier not loaded, prediction failed, or per-regime Ridge
+        # missing for the predicted regime). ``predicted_alpha_source``
+        # surfaces in the result dict so the operator can audit the
+        # source of each row's prediction post-cutover.
+        #
+        # Safe-by-construction: when the flag is False (default), this
+        # block is a no-op and inference behaves exactly as the pre-cutover
+        # single-Ridge production path. When the flag is True but the
+        # regime stack hasn't been promoted yet (e.g. RegimePredictorV2
+        # hasn't cleared its own gate this cycle), each ticker's
+        # regime_conditioned_alpha is None → fallback to single-Ridge
+        # alpha → again no observable behaviour change.
+        predicted_alpha_source = "single_ridge"
+        if (
+            getattr(cfg, "REGIME_CONDITIONED_INFERENCE_ENABLED", False)
+            and regime_conditioned_alpha is not None
+        ):
+            alpha = regime_conditioned_alpha
+            predicted_alpha_source = "regime_conditioned"
+
         # The manual research-signal adjustment that lived here pre-2026-04-28
         # was a workaround for the meta-trainer hardcoding research features
         # to constants — Ridge zeroed those coefficients, so the inference
@@ -639,6 +665,15 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
                 round(regime_conditioned_alpha, 6)
                 if regime_conditioned_alpha is not None else None
             ),
+            # Audit Phase 4 PR 5 cutover: which ridge produced
+            # ``predicted_alpha`` for this row. ``"single_ridge"`` when
+            # the flag is off OR the regime stack didn't produce a value
+            # for this ticker; ``"regime_conditioned"`` when the cutover
+            # is active AND the per-regime Ridge produced a value.
+            # Distinct from ``predicted_regime`` (always populated when
+            # the V2 detector loaded; describes the ROUTING decision,
+            # not whether routing was used in production).
+            "predicted_alpha_source": predicted_alpha_source,
             # Audit Track A PR 4/6: canonical-label Ridge parallel output.
             # Rides alongside predicted_alpha (legacy single-Ridge canonical)
             # in observe-only mode. None when the canonical Ridge isn't
