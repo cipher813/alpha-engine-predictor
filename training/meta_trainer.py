@@ -1259,6 +1259,25 @@ def run_meta_training(
                 )[0, 1])
             else:
                 ic_canonical_ridge_vs_legacy = float("nan")
+
+            # IC of LEGACY Ridge on canonical labels (cross-target,
+            # apples-to-apples comparison closer for the cutover decision).
+            # Track A PR 5 cutover gate compares
+            # ``ic_canonical_ridge_vs_canonical`` against
+            # ``ic_legacy_ridge_vs_canonical`` (NOT
+            # ``ic_legacy_ridge_vs_legacy`` — different targets, can't
+            # compare directly). Pre-fix the 2x2 grid was incomplete; one
+            # cell missing meant the cutover decision had to lean on the
+            # apples-to-oranges (legacy_vs_legacy) pairing. Origin: 2026-05-09
+            # canonical Ridge first observation flagged the gap.
+            legacy_preds_on_canonical_mask = meta_model.predict(
+                meta_X[canonical_finite_mask]
+            ).ravel()
+            ic_legacy_ridge_vs_canonical = (
+                float(np.corrcoef(legacy_preds_on_canonical_mask, canonical_y_subset)[0, 1])
+                if np.std(legacy_preds_on_canonical_mask) > 0 else 0.0
+            )
+
             canonical_meta_model_metrics = {
                 "type": "canonical_meta_model_v1",
                 "fitted": True,
@@ -1272,12 +1291,19 @@ def run_meta_training(
                     if np.isfinite(ic_canonical_ridge_vs_legacy) else None
                 ),
                 "ic_legacy_ridge_vs_legacy": round(meta_model._val_ic, 6),
+                "ic_legacy_ridge_vs_canonical": (
+                    round(ic_legacy_ridge_vs_canonical, 6)
+                    if np.isfinite(ic_legacy_ridge_vs_canonical) else None
+                ),
                 "feature_names": list(META_FEATURES),
                 "coefficients": canonical_meta_model._coefficients,
             }
             log.info(
-                "Canonical Ridge fit: n=%d, ic_canonical_ridge_vs_canonical=%s, "
-                "ic_canonical_ridge_vs_legacy=%s, ic_legacy_ridge_vs_legacy=%.4f "
+                "Canonical Ridge fit: n=%d, "
+                "ic_canonical_ridge_vs_canonical=%s, "
+                "ic_canonical_ridge_vs_legacy=%s, "
+                "ic_legacy_ridge_vs_legacy=%.4f, "
+                "ic_legacy_ridge_vs_canonical=%s "
                 "— observe-only Track A PR 3/6",
                 int(canonical_finite_mask.sum()),
                 f"{ic_canonical_ridge_vs_canonical:.4f}"
@@ -1285,6 +1311,8 @@ def run_meta_training(
                 f"{ic_canonical_ridge_vs_legacy:.4f}"
                 if np.isfinite(ic_canonical_ridge_vs_legacy) else "n/a",
                 meta_model._val_ic,
+                f"{ic_legacy_ridge_vs_canonical:.4f}"
+                if np.isfinite(ic_legacy_ridge_vs_canonical) else "n/a",
             )
         else:
             log.info(

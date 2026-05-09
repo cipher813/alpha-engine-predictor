@@ -192,6 +192,11 @@ class RegimePredictorV2:
         self._oos_accuracy: float | None = None
         self._per_class_recall: dict[str, float] | None = None
         self._macro_f1: float | None = None
+        # Per-class sample weights computed at fit time (inverse-proportional
+        # to class frequency). Surfaced via metrics() so the manifest shows
+        # what balance the model was trained against — the same row that
+        # documents oos_accuracy + per_class_recall.
+        self._class_weights: dict[str, float] | None = None
 
     @property
     def feature_names(self) -> list[str]:
@@ -214,6 +219,14 @@ class RegimePredictorV2:
         feature_names: list[str] | None = None,
     ) -> "RegimePredictorV2":
         """Fit 3-class LightGBM on (features, regime label) pairs.
+
+        Uses balanced sample weights so the minority class (typically bear,
+        ~10-15% of the past-decade label distribution under triple-barrier
+        ±5% / 21d) gets a fair gradient share. Without weighting, the
+        softmax loss pulls the model toward always-predict-majority and
+        bear_recall collapses to 0 (the 2026-05-09 first-cycle observation:
+        oos_acc=44%, bear_recall=0%, bull_recall=86%, macro_f1=0.29 —
+        worse than always-bull majority baseline).
 
         Args:
             X_train: (n, n_features) feature matrix
@@ -256,8 +269,31 @@ class RegimePredictorV2:
         else:
             self._feature_names = list(REGIME_V2_FEATURES[:X_train.shape[1]])
 
+        # Balanced class weights — inverse-proportional to class frequency
+        # in y_train so the loss treats every class as if it were
+        # equally-frequent. Mirrors sklearn's class_weight="balanced":
+        # weight_c = n_samples / (n_classes * count_c). Applies to training
+        # only; validation evaluation stays unweighted so the honest gate
+        # metrics reflect natural-frequency performance.
+        class_counts = np.bincount(y_train.astype(int), minlength=3)
+        class_weights = (
+            len(y_train) / (3 * class_counts.clip(min=1))
+        ).astype(np.float32)
+        sample_weights = class_weights[y_train.astype(int)]
+        self._class_weights = {
+            REGIME_CLASSES[i]: float(class_weights[i]) for i in range(3)
+        }
+        log.info(
+            "RegimePredictorV2 class balance: bear=%d (w=%.3f), neutral=%d (w=%.3f), "
+            "bull=%d (w=%.3f) — sample_weights applied",
+            int(class_counts[0]), float(class_weights[0]),
+            int(class_counts[1]), float(class_weights[1]),
+            int(class_counts[2]), float(class_weights[2]),
+        )
+
         train_set = lgb.Dataset(
-            X_train, label=y_train, feature_name=self._feature_names,
+            X_train, label=y_train, weight=sample_weights,
+            feature_name=self._feature_names,
         )
         valid_sets = [train_set]
         valid_names = ["train"]
@@ -419,6 +455,10 @@ class RegimePredictorV2:
             ),
             "macro_f1": (
                 round(self._macro_f1, 6) if self._macro_f1 is not None else None
+            ),
+            "class_weights": (
+                {k: round(v, 4) for k, v in self._class_weights.items()}
+                if self._class_weights is not None else None
             ),
         }
 
