@@ -97,6 +97,7 @@ class MetaModel:
         X: np.ndarray,
         y: np.ndarray,
         feature_names: list[str] | None = None,
+        sample_weight: np.ndarray | None = None,
     ) -> "MetaModel":
         """
         Fit ridge regression on Layer 1 OOS outputs.
@@ -106,6 +107,11 @@ class MetaModel:
         X : array of shape (N, n_meta_features) — stacked Layer 1 outputs
         y : array of shape (N,) — actual forward returns or binary outcomes
         feature_names : names for coefficient reporting
+        sample_weight : array of shape (N,) or None — per-row sample weights
+            (optional). Used by the Stage 3 triple-barrier parallel Ridge to
+            apply LdP Ch. 4.4 average-uniqueness weights, downweighting rows
+            whose forward windows overlap heavily with neighbors. Sklearn
+            Ridge accepts unnormalized weights and rescales internally.
         """
         from sklearn.linear_model import Ridge
 
@@ -114,6 +120,10 @@ class MetaModel:
 
         # Remove NaN rows
         valid = np.all(np.isfinite(X), axis=1) & np.isfinite(y)
+        if sample_weight is not None:
+            sample_weight = np.asarray(sample_weight, dtype=np.float64).ravel()
+            valid &= np.isfinite(sample_weight)
+            sample_weight = sample_weight[valid]
         X = X[valid]
         y = y[valid]
 
@@ -123,7 +133,7 @@ class MetaModel:
 
         self._n_samples = len(y)
         self._model = Ridge(alpha=self.alpha, fit_intercept=True)
-        self._model.fit(X, y)
+        self._model.fit(X, y, sample_weight=sample_weight)
         self._fitted = True
 
         # Store coefficients for interpretability
