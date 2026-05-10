@@ -743,6 +743,51 @@ def main(
         except Exception as _sum_err:
             log.warning("Training summary write failed (non-blocking): %s", _sum_err)
 
+    # Step 2e: Triple-barrier cutover gate (Stage 3 PR 5 SF wiring).
+    # Runs after model upload + training summary so the gate has access
+    # to the freshly-promoted meta_model_tb.pkl and the most recent ~6
+    # weeks of inference predictions. Result lands at
+    # ``s3://{bucket}/predictor/variant_gates/triple_barrier_{date}.json``
+    # and is merged into the training summary dict so the email and
+    # downstream consumers can surface it.
+    #
+    # Failure is non-blocking — the gate is observe-only until
+    # ``triple_barrier.enforce_cutover`` flips in alpha-engine-config.
+    # Until ~6-9 weeks of parallel-observation data accumulate (PR 3
+    # inference path needs to write meta_alpha_tb fields + the 21d
+    # forward window needs to close), the gate naturally returns an
+    # insufficient-data verdict per ``min_pairs=100``.
+    if not dry_run:
+        try:
+            from analysis.triple_barrier_cutover_runner import run_gate as _run_tb_gate
+            _gate_payload = _run_tb_gate(
+                bucket=bucket,
+                n_days=42,
+                horizon_days=21,
+                threshold=1.15,
+                write_to_s3=True,
+            )
+            result["triple_barrier_cutover_gate"] = {
+                "passed": _gate_payload.get("passed"),
+                "n_pairs": _gate_payload.get("n_pairs"),
+                "baseline_ic": _gate_payload.get("baseline_ic"),
+                "variant_ic": _gate_payload.get("variant_ic"),
+                "relative_lift": _gate_payload.get("relative_lift"),
+                "n_realized_filled": _gate_payload.get("n_realized_filled"),
+                "reason": _gate_payload.get("reason"),
+            }
+            log.info(
+                "Stage 3 cutover gate: passed=%s n_pairs=%d lift=%s",
+                _gate_payload.get("passed"),
+                _gate_payload.get("n_pairs", 0),
+                _gate_payload.get("relative_lift"),
+            )
+        except Exception as _gate_err:
+            log.warning(
+                "Stage 3 cutover gate failed (non-blocking, observe-only): %s",
+                _gate_err,
+            )
+
     # Step 3: Email
     if not dry_run:
         send_training_email(result, date_str)
