@@ -244,6 +244,10 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
     # note and roadmap). The 6 macro features below feed the meta ridge
     # directly; no classifier in the loop.
     macro_row_for_meta: dict[str, float] = {name: 0.0 for name in MACRO_FEATURE_META_MAP.values()}
+    # Stage 1c (regime-conditioning rebuild): keep regime_features_df at
+    # function scope so the macro-aug volatility GBM can apply
+    # time-series z-score against the same history.
+    regime_features_df: pd.DataFrame = pd.DataFrame()
     try:
         from model.regime_predictor import RegimePredictor as _RPFeatureBuilder
         spy_s = ctx.macro.get("SPY") if ctx.macro else None
@@ -282,6 +286,39 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
         # will see a degenerate row — predictions that day are effectively
         # equivalent to the pre-macro-features v3.0 model. Tracked via log scan.
         log.error("Macro feature build failed: %s — using zero-fill defaults", e)
+
+    # Stage 1c: today's z-scored macro vector for the macro-aug volatility
+    # GBM. Time-series z-score over the full regime_features_df history;
+    # take the last row. Broadcast to every ticker on the per-ticker
+    # feature concat. None when history is too thin (< MACRO_NORM_WINDOW
+    # min_periods) or the regime build failed — parallel field rides as
+    # null in that case.
+    today_macros_zscored: np.ndarray | None = None
+    if not regime_features_df.empty and len(regime_features_df) >= 60:
+        try:
+            from data.dataset import time_series_zscore_normalize
+            macro_subset = regime_features_df[
+                list(cfg.MACRO_NORM_FEATURES)
+            ].to_numpy(dtype=np.float64)
+            macro_dates_list = list(pd.DatetimeIndex(regime_features_df.index))
+            macro_zscored_full = time_series_zscore_normalize(
+                macro_subset, macro_dates_list,
+                window=cfg.MACRO_NORM_WINDOW,
+            )
+            if macro_zscored_full.size and not np.isnan(macro_zscored_full[-1]).all():
+                today_macros_zscored = macro_zscored_full[-1]
+                log.info(
+                    "Macro z-score for vol-aug GBM (Stage 1c): "
+                    "today's vector finite=%d/%d (window=%d)",
+                    int(np.isfinite(today_macros_zscored).sum()),
+                    today_macros_zscored.shape[0],
+                    cfg.MACRO_NORM_WINDOW,
+                )
+        except Exception as e:
+            log.warning(
+                "Macro z-score for vol-aug GBM failed (parallel observe-only, "
+                "non-blocking): %s", e,
+            )
 
     # ── Step 2: Load research signals for calibrator ─────────────────────────
     # Read signals/latest.json for composite scores, conviction, and the
@@ -363,6 +400,27 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
         ])
         X_vol_ranked = _rank_norm(X_vol_raw, today_dates).astype(np.float32)
 
+    # Stage 1c: macro-augmented rank+z-score batch for the parallel
+    # vol-aug GBM. Schema must match training feature order:
+    # [VOLATILITY_FEATURES rank-normed, MACRO_NORM_FEATURES z-scored].
+    # Same n_features the aug GBM was trained on (12 = 6 + 6) per
+    # Stage 1b's VOL_AUG_FEATURES list. Today's z-scored macros are
+    # broadcast to every ticker because macros are constant cross-
+    # sectionally on a given date.
+    vol_scorer_aug = ctx.meta_models.get("volatility_macro_aug")
+    X_vol_aug_ranked: np.ndarray | None = None
+    if (
+        vol_scorer_aug is not None
+        and X_vol_ranked is not None
+        and today_macros_zscored is not None
+    ):
+        macro_block = np.tile(
+            today_macros_zscored.astype(np.float32), (n_present, 1),
+        )
+        X_vol_aug_ranked = np.concatenate(
+            [X_vol_ranked, macro_block], axis=1,
+        ).astype(np.float32)
+
     for ticker in ctx.tickers:
         latest = precomputed.get(ticker)
         if latest is None:
@@ -387,6 +445,29 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
             idx = ticker_to_batch_idx[ticker]
             vol_x = X_vol_ranked[idx:idx + 1]  # rank-normed slice, shape (1, n_features)
             expected_move = float(vol_scorer.predict(vol_x)[0])
+
+        # Stage 1c parallel observation: macro-augmented vol GBM rides
+        # alongside the plain vol GBM. ``expected_move_macro_aug`` is None
+        # when the aug GBM isn't loaded, today's macros couldn't be
+        # z-scored (insufficient history), or the per-ticker predict raises.
+        # Plain ``expected_move`` is the L2 ridge input until Stage 1d
+        # cuts over.
+        expected_move_macro_aug: float | None = None
+        if vol_scorer_aug is not None and X_vol_aug_ranked is not None:
+            idx_aug = ticker_to_batch_idx.get(ticker)
+            if idx_aug is not None:
+                try:
+                    expected_move_macro_aug = float(
+                        vol_scorer_aug.predict(
+                            X_vol_aug_ranked[idx_aug:idx_aug + 1]
+                        )[0]
+                    )
+                except Exception as e:
+                    log.debug(
+                        "volatility_macro_aug.predict failed for %s "
+                        "(parallel observe-only, non-blocking): %s",
+                        ticker, e,
+                    )
 
         # Layer 1C: Research calibrator + research-feature extraction
         # Centralized in ``model.research_features.extract_research_features``
@@ -528,6 +609,17 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
             # canonical alpha now (meta_model trained on canonical labels).
             "momentum_confirmation": round(momentum_score, 6),
             "expected_move": round(expected_move, 6),
+            # Stage 1c parallel-observation field: macro-augmented vol
+            # GBM prediction. Rides alongside ``expected_move`` for offline
+            # ``analysis.variant_cutover_gate`` evaluation. None when the
+            # aug GBM isn't loaded, today's macros couldn't be z-scored
+            # (history too thin or regime build failed), or the per-ticker
+            # predict raised. The plain ``expected_move`` remains the L2
+            # ridge input until Stage 1d cuts over after the gate clears.
+            "expected_move_macro_aug": (
+                round(expected_move_macro_aug, 6)
+                if expected_move_macro_aug is not None else None
+            ),
             # regime_bull/regime_bear removed from per-ticker output 2026-04-16
             # (Tier 0 classifier retired). Downstream consumers (dashboard,
             # executor veto gate) must not expect these keys; the LLM macro

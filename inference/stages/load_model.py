@@ -103,6 +103,29 @@ def _load_meta_models(ctx: PipelineContext) -> None:
     except Exception as e:
         log.debug("ResearchGBMScorer not available (observe-only OK): %s", e)
 
+    # Stage 1c (regime-conditioning rebuild): macro-augmented volatility
+    # GBM ships ALONGSIDE the plain volatility GBM in observe-only mode.
+    # Inference predicts with both; ``expected_move_macro_aug`` rides as
+    # a parallel field in predictions JSON. The plain ``expected_move``
+    # remains canonical until Stage 1d cuts over after the
+    # variant_cutover_gate clears (≥15% relative IC lift on accumulated
+    # parallel-observation data).
+    #
+    # Loader is tolerant: if the file is absent (early observation period
+    # before Sat training fires, or any cycle where parallel fit failed),
+    # inference proceeds with plain volatility only. The parallel field
+    # rides as null in the output JSON.
+    try:
+        from model.gbm_scorer import GBMScorer
+        path = _dl(
+            f"{prefix}volatility_macro_aug_model.txt",
+            "volatility_macro_aug.txt",
+        )
+        ctx.meta_models["volatility_macro_aug"] = GBMScorer.load(path)
+        log.info("Loaded volatility GBM (Stage 1b macro-aug, observe-only)")
+    except Exception as e:
+        log.debug("volatility_macro_aug not available (observe-only OK): %s", e)
+
     # Meta-model (ridge stacker)
     try:
         from model.meta_model import MetaModel
