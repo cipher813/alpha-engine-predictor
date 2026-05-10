@@ -222,6 +222,13 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
     # canonical Ridge — the parallel observe-only canonical_meta_model
     # was retired with the cutover.
     meta_model = ctx.meta_models.get("meta")
+    # Stage 3 PR 3 (regime-conditioning rebuild): parallel triple-barrier
+    # L2 Ridge — runs alongside the canonical Ridge in observe-only mode.
+    # When loaded, predict per-ticker and emit ``meta_alpha_tb`` parallel
+    # field in predictions JSON for offline ``analysis.variant_cutover_gate``
+    # evaluation. None when the artifact is absent (early observation
+    # period or any cycle where Step 7b's n_tb_finite<100 skipped fit).
+    meta_model_tb = ctx.meta_models.get("meta_tb")
 
     if vol_scorer is None and meta_model is None:
         # Per feedback_hard_fail_until_stable: this is a cold-start load
@@ -624,6 +631,24 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
 
         alpha = float(np.clip(alpha, -max_r, max_r))
 
+        # Stage 3 PR 3: parallel triple-barrier Ridge prediction. Same
+        # META_FEATURES input as the canonical Ridge — only the supervision
+        # label and Ch.4 sample weights differ at training time. Variant_
+        # cutover_gate compares this prediction stream vs predicted_alpha
+        # against realized alpha to decide whether triple-barrier labels
+        # produce a >=15% relative IC lift. None when meta_model_tb isn't
+        # loaded (early observation period or Step 7b skipped fit). Runs
+        # AFTER the canonical alpha is computed + clipped so a TB-side
+        # exception cannot leak into the canonical path under any condition.
+        meta_alpha_tb: float | None = None
+        if meta_model_tb is not None and meta_model_tb.is_fitted:
+            try:
+                meta_alpha_tb = float(meta_model_tb.predict_single(meta_features))
+                meta_alpha_tb = float(np.clip(meta_alpha_tb, -max_r, max_r))
+            except Exception as _e:
+                log.debug("meta_alpha_tb predict failed for %s: %s", ticker, _e)
+                meta_alpha_tb = None
+
         # Calibrated confidence
         _cal = getattr(ctx, "calibrator", None)
         if _cal is not None and _cal.is_fitted:
@@ -682,6 +707,14 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
             "expected_move_risk_aug": (
                 round(expected_move_risk_aug, 6)
                 if expected_move_risk_aug is not None else None
+            ),
+            # Stage 3 PR 3 parallel-observation field: triple-barrier
+            # L2 Ridge prediction. variant_cutover_gate compares this
+            # against predicted_alpha (canonical Ridge) on prediction
+            # pairs vs realized alpha. Cutover is Stage 3 PR 5.
+            "meta_alpha_tb": (
+                round(meta_alpha_tb, 6)
+                if meta_alpha_tb is not None else None
             ),
             # regime_bull/regime_bear removed from per-ticker output 2026-04-16
             # (Tier 0 classifier retired). Downstream consumers (dashboard,

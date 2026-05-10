@@ -159,6 +159,27 @@ def _load_meta_models(ctx: PipelineContext) -> None:
     # s3://.../canonical_meta_model.pkl from the observe-only era is
     # left in place; cleanup is a separate concern.
 
+    # Stage 3 PR 3 (regime-conditioning rebuild): parallel triple-barrier
+    # L2 Ridge ships ALONGSIDE the canonical Ridge in observe-only mode.
+    # Inference predicts with both; ``meta_alpha_tb`` rides as a parallel
+    # field in predictions JSON. The canonical ``meta_alpha`` remains
+    # authoritative until Stage 3 PR 5 cuts over after the
+    # variant_cutover_gate clears (≥15% relative IC lift on accumulated
+    # parallel-observation data over ≥3 Saturday SF firings).
+    #
+    # Loader is tolerant: if the file is absent (early observation period
+    # before Sat training fires, or any cycle where parallel fit had
+    # n_tb_finite<100 and was skipped), inference proceeds with the
+    # canonical Ridge only. The parallel field rides as null in the
+    # output JSON.
+    try:
+        from model.meta_model import MetaModel
+        path = _dl(f"{prefix}meta_model_tb.pkl", "meta_model_tb.pkl")
+        ctx.meta_models["meta_tb"] = MetaModel.load(path)
+        log.info("Loaded meta-model (Stage 3 triple-barrier, observe-only)")
+    except Exception as e:
+        log.debug("meta_model_tb not available (observe-only OK): %s", e)
+
     # Calibrator (Platt scaling on meta-model output)
     ctx.calibrator = None
     if getattr(cfg, "CALIBRATION_ENABLED", True):
