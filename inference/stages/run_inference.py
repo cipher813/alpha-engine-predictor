@@ -785,10 +785,10 @@ def _rescale_cross_sectional(ctx: "PipelineContext") -> None:
     "calibrator collapse" investigation step #5.
 
     Without a calibrator (legacy fallback path), rescaling is mandatory:
-    meta ridge outputs cluster in ~[-0.01, +0.01], narrower than
-    LABEL_CLIP (±0.15). Linear p_up values collapse toward 0.5 for
-    everything. META_ALPHA_CLIP floors the batch max_abs so tiny, noisy
-    alpha spreads don't inflate to extreme confidences.
+    meta ridge outputs cluster well inside LABEL_CLIP (±0.40 in log-domain
+    decimal post 2026-05-09 21d cutover). Linear p_up values collapse
+    toward 0.5 for everything. META_ALPHA_CLIP floors the batch max_abs
+    so tiny, noisy alpha spreads don't inflate to extreme confidences.
     """
     _cal = getattr(ctx, "calibrator", None)
     _calibrated = _cal is not None and getattr(_cal, "is_fitted", False)
@@ -826,7 +826,15 @@ def _rescale_cross_sectional(ctx: "PipelineContext") -> None:
             "rescaling. This path should only fire before the first "
             "post-migration retrain ships an isotonic calibrator to S3."
         )
-    _META_ALPHA_CLIP = 0.02  # 2% — reasonable expected range for 5d alpha
+    # Floor for the batch max_abs alpha when the linear-heuristic rescale
+    # is engaged (no calibrator OR calibrator-collapse variance fallback).
+    # Sized for the expected magnitude of cohort-level alpha at the active
+    # 21d log-domain horizon — roughly ~5% per the manifest's synthetic-batch
+    # output_distribution_gate (alpha_range ≈ [-0.05, +0.05]). Pre-cutover
+    # value was 0.02 (5d arithmetic); bumped 2026-05-10 alongside the email
+    # log-domain footnote so a fallback firing on a compressed cohort
+    # doesn't inflate p_up toward saturation against a now-undersized clip.
+    _META_ALPHA_CLIP = 0.05
     alphas = [p.get("predicted_alpha", 0) or 0 for p in ctx.predictions]
     if not alphas:
         return
