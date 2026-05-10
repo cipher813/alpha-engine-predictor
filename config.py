@@ -362,6 +362,16 @@ MACRO_NORM_FEATURES = [
     "vix_term_slope",
     "yield_curve_slope",
     "market_breadth",
+    # Stage 2c-partial additions (2026-05-10):
+    # - vix_vix3m_ratio: institutional-canonical VIX term-structure
+    #   normalization (ratio > 1 = backwardation/stress; < 1 = contango).
+    #   Distinct from vix_term_slope which is bps-style normalized diff.
+    # - market_breadth_200d: secular bull-vs-bear regime indicator.
+    #   Distinct from market_breadth (50d cyclical breadth).
+    # Stage 2c-full (gated on Stage 2.5 + 2.5b data ingestion + backfill):
+    # yield_curve_10y_2y, hy_oas_level, hy_oas_change_21d.
+    "vix_vix3m_ratio",
+    "market_breadth_200d",
 ]
 # Rolling window for time-series z-score. 252 trading days = 1 year, the
 # institutional default for macro normalization (captures one full regime

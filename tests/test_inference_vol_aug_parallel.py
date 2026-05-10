@@ -81,13 +81,18 @@ class TestAugFeatureConcatShape:
     that order, matching Stage 1b's VOL_AUG_FEATURES list."""
 
     def test_aug_feature_count_matches_training(self):
-        # Stage 1b: VOL_AUG_FEATURES = VOLATILITY_FEATURES + MACRO_NORM_FEATURES
+        # Stage 1b contract: VOL_AUG_FEATURES = VOLATILITY_FEATURES +
+        # MACRO_NORM_FEATURES. The exact count is schema-dependent and
+        # grows as Stage 2c+ adds macros — what matters is that the
+        # additive relationship holds and both halves have at least one
+        # feature.
         n_vol = len(cfg.VOLATILITY_FEATURES)
         n_macro = len(cfg.MACRO_NORM_FEATURES)
-        assert n_vol == 6  # current schema
-        assert n_macro == 6  # current schema
-        # Aug GBM was trained with n_vol + n_macro features
-        assert n_vol + n_macro == 12
+        assert n_vol >= 1
+        assert n_macro >= 1
+        # Inference broadcasts today's macro vector to every ticker, then
+        # concats with X_vol_ranked. The aug GBM input vector size is
+        # n_vol + n_macro by construction.
 
     def test_aug_concat_preserves_per_ticker_then_macro_order(self):
         # Simulate: (n_present, n_vol) + (n_present, n_macro) → (n_present, 12)

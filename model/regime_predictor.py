@@ -121,7 +121,15 @@ class RegimePredictor:
         """
         Build regime feature matrix from macro time series.
 
-        Returns DataFrame indexed by date with columns matching FEATURE_NAMES.
+        Returns DataFrame indexed by date with the canonical
+        FEATURE_NAMES columns plus extended macros consumed by Stage 1+
+        of the regime-conditioning rebuild (vix_vix3m_ratio,
+        market_breadth_200d). Stage 1b's macro-aug volatility GBM reads
+        whichever subset is listed in ``cfg.MACRO_NORM_FEATURES``.
+
+        FEATURE_NAMES retains the original 6-column contract that the
+        retired Tier-0 classifier consumed; the extended macros are
+        additive columns.
         """
         df = pd.DataFrame(index=spy_series.index)
 
@@ -144,8 +152,18 @@ class RegimePredictor:
             vix_aligned = vix_series.reindex(df.index, method="ffill")
             vix3m_aligned = vix3m_series.reindex(df.index, method="ffill")
             df["vix_term_slope"] = (vix_aligned - vix3m_aligned) / 20.0
+            # vix_vix3m_ratio: institutional-canonical normalization of the
+            # VIX term structure (Stage 2c-partial). Ratio > 1.0 = backwardation
+            # (front-month vol > 3M vol = stress regime); ratio < 1.0 = contango
+            # (3M vol > front-month = calmer expected forward regime).
+            # Distinct from vix_term_slope which is bps-style normalized
+            # difference. Both flow through to L1 macro-aug GBM and L2 Ridge.
+            df["vix_vix3m_ratio"] = (
+                vix_aligned / vix3m_aligned.replace(0, float("nan"))
+            ).fillna(1.0)
         else:
             df["vix_term_slope"] = 0.0
+            df["vix_vix3m_ratio"] = 1.0
 
         # Yield curve slope (10Y - 3M, normalized)
         if tnx_series is not None and irx_series is not None:
@@ -155,32 +173,58 @@ class RegimePredictor:
         else:
             df["yield_curve_slope"] = 0.0
 
-        # Market breadth: % of stocks above 50-day MA
+        # Market breadth: % of stocks above 50-day MA AND % above 200-day MA
+        # (Stage 2c-partial 2026-05-10). 50d captures cyclical breadth; 200d
+        # captures secular bull-vs-bear regime — different cycle stages.
+        # Institutional dashboards (Bloomberg, BlackRock Aladdin) include both.
         if all_close_prices and len(all_close_prices) >= 10:
-            breadth_by_date: dict[pd.Timestamp, list[int]] = {}
+            breadth_50_by_date: dict[pd.Timestamp, list[int]] = {}
+            breadth_200_by_date: dict[pd.Timestamp, list[int]] = {}
             for ticker, close_s in all_close_prices.items():
-                if close_s is None or len(close_s) < 50:
+                if close_s is None:
                     continue
-                ma50 = close_s.rolling(50).mean()
-                above = (close_s > ma50).astype(int)
-                for dt, val in above.items():
-                    if pd.notna(val) and dt in df.index:
-                        breadth_by_date.setdefault(dt, []).append(int(val))
+                if len(close_s) >= 50:
+                    ma50 = close_s.rolling(50).mean()
+                    above_50 = (close_s > ma50).astype(int)
+                    for dt, val in above_50.items():
+                        if pd.notna(val) and dt in df.index:
+                            breadth_50_by_date.setdefault(dt, []).append(int(val))
+                if len(close_s) >= 200:
+                    ma200 = close_s.rolling(200).mean()
+                    above_200 = (close_s > ma200).astype(int)
+                    for dt, val in above_200.items():
+                        if pd.notna(val) and dt in df.index:
+                            breadth_200_by_date.setdefault(dt, []).append(int(val))
 
-            breadth_series = pd.Series(
-                {dt: np.mean(vals) for dt, vals in breadth_by_date.items() if len(vals) >= 10},
-                dtype=float,
+            def _mean_to_series(by_date: dict, min_tickers: int = 10) -> pd.Series:
+                # sort_index() is required — by_date is built by iterating
+                # tickers in arbitrary order, so insertion order is
+                # non-monotonic. reindex(method="ffill") raises "index must
+                # be monotonic" on unsorted inputs. Surfaced during the
+                # 2026-04-16 local dry-run; Saturday production training
+                # happened to pick up a sorted order by coincidence.
+                if not by_date:
+                    return pd.Series(dtype=float)
+                s = pd.Series(
+                    {dt: np.mean(vals) for dt, vals in by_date.items()
+                     if len(vals) >= min_tickers},
+                    dtype=float,
+                )
+                return s.sort_index() if not s.empty else s
+
+            b50 = _mean_to_series(breadth_50_by_date)
+            b200 = _mean_to_series(breadth_200_by_date)
+            df["market_breadth"] = (
+                b50.reindex(df.index, method="ffill").fillna(0.5)
+                if not b50.empty else 0.5
             )
-            # sort_index() is required — breadth_by_date is built by iterating
-            # tickers in arbitrary order, so insertion order is non-monotonic.
-            # reindex(method="ffill") raises "index must be monotonic increasing
-            # or decreasing" on unsorted inputs. Surfaced during the 2026-04-16
-            # local dry-run; Saturday production training happened to pick up a
-            # sorted order by coincidence.
-            breadth_series = breadth_series.sort_index()
-            df["market_breadth"] = breadth_series.reindex(df.index, method="ffill").fillna(0.5)
+            df["market_breadth_200d"] = (
+                b200.reindex(df.index, method="ffill").fillna(0.5)
+                if not b200.empty else 0.5
+            )
         else:
             df["market_breadth"] = 0.5  # neutral default
+            df["market_breadth_200d"] = 0.5
 
         return df.dropna()
 
