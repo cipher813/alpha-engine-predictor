@@ -423,7 +423,7 @@ def run_meta_training(
     data_path = Path(data_dir)
 
     from data.dataset import _load_ticker_parquet, cross_sectional_rank_normalize
-    from data.label_generator import compute_labels
+    from data.label_generator import compute_labels, compute_triple_barrier_alpha_labels
     # compute_features is intentionally NOT imported — training reads
     # pre-computed features from ArcticDB via the parquet cache written
     # by store/arctic_reader.py:download_from_arctic. Source of truth is
@@ -540,6 +540,11 @@ def run_meta_training(
     risk_chunks: list[np.ndarray] = []
     fwd_chunks: list[np.ndarray] = []
     fwd_horizons_chunks: list[np.ndarray] = []
+    # Stage 3 PR 2 (regime-conditioning rebuild): parallel triple-barrier
+    # alpha labels alongside the canonical fixed-21d-horizon target. NaN
+    # at front-of-history (vol-window warm-up) and tail (past data end)
+    # — these align naturally with the canonical fwd_chunks tail-drop.
+    fwd_tb_chunks: list[np.ndarray] = []
 
     for path in all_parquets:
         ticker = path.stem
@@ -566,6 +571,19 @@ def run_meta_training(
                 raw_df, forward_days=cfg.FORWARD_DAYS,
                 up_threshold=cfg.UP_THRESHOLD, down_threshold=cfg.DOWN_THRESHOLD,
                 benchmark_returns=sector_etf_s if sector_etf_s is not None else spy_series,
+            )
+            # Stage 3 PR 2: parallel triple-barrier alpha label, vol-scaled
+            # barriers (LdP Ch. 3.4). Sector-neutral residual log-returns;
+            # σ_t = EWMA std of residual log-return; barrier = k × σ_t.
+            # Front-of-history rows where σ_t hasn't warmed up get NaN
+            # labels and are filtered downstream at the parallel-Ridge fit.
+            labeled = compute_triple_barrier_alpha_labels(
+                labeled,
+                benchmark_returns=sector_etf_s if sector_etf_s is not None else spy_series,
+                forward_window=cfg.TRIPLE_BARRIER_FORWARD_WINDOW,
+                vol_window=cfg.TRIPLE_BARRIER_VOL_WINDOW,
+                vol_multiplier=cfg.TRIPLE_BARRIER_VOL_MULTIPLIER,
+                min_periods=cfg.TRIPLE_BARRIER_MIN_PERIODS,
             )
         except Exception as exc:
             reject_label_error.append((ticker, f"{type(exc).__name__}: {exc}"))
@@ -620,6 +638,15 @@ def run_meta_training(
         )
         fwd_chunks.append(
             labeled["forward_return_5d"].to_numpy(dtype=np.float32)
+        )
+        # Stage 3 PR 2: triple-barrier label per row, aligned to the same
+        # tail-dropped index as fwd_chunks. Column may be absent if the
+        # PR 1 generator returned early (empty input); fall back to NaN.
+        fwd_tb_chunks.append(
+            labeled.get(
+                "triple_barrier_alpha_21d",
+                pd.Series(float("nan"), index=labeled.index),
+            ).to_numpy(dtype=np.float32)
         )
         fwd_horizons_chunks.append(np.column_stack([
             labeled.get(
@@ -681,12 +708,13 @@ def run_meta_training(
     X_risk_unsorted = np.concatenate(risk_chunks, axis=0)
     y_fwd_unsorted = np.concatenate(fwd_chunks)
     y_fwd_horizons_unsorted = np.concatenate(fwd_horizons_chunks, axis=0)
+    y_fwd_tb_unsorted = np.concatenate(fwd_tb_chunks)
 
     # Free the chunk lists — referenced data has been copied into the
     # contiguous arrays above. Without this `del` the chunks linger
     # through walk-forward and double the RSS we just reduced.
     del date_chunks, ticker_chunks, mom_chunks, vol_chunks, risk_chunks
-    del fwd_chunks, fwd_horizons_chunks
+    del fwd_chunks, fwd_horizons_chunks, fwd_tb_chunks
 
     # Stable sort by date so ties keep ticker-order deterministic for
     # snapshot tests + reproducibility.
@@ -720,14 +748,21 @@ def run_meta_training(
     X_risk = X_risk_unsorted[sort_idx]
     y_fwd = y_fwd_unsorted[sort_idx]
     y_fwd_horizons = y_fwd_horizons_unsorted[sort_idx]
+    y_fwd_tb = y_fwd_tb_unsorted[sort_idx]
 
     del date_unsorted, ticker_unsorted
     del X_mom_unsorted, X_vol_unsorted, X_risk_unsorted
-    del y_fwd_unsorted, y_fwd_horizons_unsorted
+    del y_fwd_unsorted, y_fwd_horizons_unsorted, y_fwd_tb_unsorted
 
     # Winsorize
     if cfg.LABEL_CLIP:
         y_fwd = np.clip(y_fwd, -cfg.LABEL_CLIP, cfg.LABEL_CLIP)
+        # Stage 3 PR 2: triple-barrier labels are already capped at the
+        # vol-scaled barrier per row (LdP path-walking), so winsorization
+        # is largely a no-op. Apply for symmetry with y_fwd in case the
+        # barrier ever yields a value beyond LABEL_CLIP at extreme vol;
+        # NaN values are preserved by np.clip.
+        y_fwd_tb = np.clip(y_fwd_tb, -cfg.LABEL_CLIP, cfg.LABEL_CLIP)
 
     # Capture NaN masks BEFORE rank-normalization erases them (NaN inputs
     # become rank 1.0 after argsort → numpy puts NaN at the end). Used by
@@ -1123,6 +1158,14 @@ def run_meta_training(
                     "expected_move": float(vol_preds[local_idx]),
                     **research_features,
                     "actual_fwd": float(y_fwd[idx]),
+                    # Stage 3 PR 2: parallel triple-barrier alpha label
+                    # (vol-scaled barriers per LdP Ch. 3.4). NaN at front-of-
+                    # history rows where σ_t didn't warm up; the parallel
+                    # Ridge fit at Step 7b filters NaN rows separately from
+                    # the canonical fit. Carrying ticker so Step 7b can
+                    # compute per-ticker LdP Ch. 4.4 sample weights.
+                    "actual_fwd_triple_barrier": float(y_fwd_tb[idx]),
+                    "ticker": ticker,
                     # Track 1-of-2 of the audit Phase 1 horizon battery (2026-05-07):
                     # carry the row's date so subsequent IC computations can
                     # subsample to non-overlapping windows. Cheap (one column),
@@ -1354,6 +1397,88 @@ def run_meta_training(
         f"{ic_canonical_ridge_vs_legacy:+.4f}"
         if np.isfinite(ic_canonical_ridge_vs_legacy) else "n/a",
     )
+
+    # ── Step 7b: Parallel triple-barrier L2 Ridge (Stage 3 PR 2, observe-only) ─
+    # Audit Phase 4 / regime-conditioning rebuild Stage 3: fit a parallel
+    # Ridge on the same META_FEATURES but supervised on the triple-barrier
+    # alpha label (vol-scaled barriers per LdP Ch. 3.4). Sample weights
+    # follow LdP Ch. 4.4: average-uniqueness weights computed per-ticker
+    # so heavily-overlapping consecutive-day labels for the same ticker
+    # don't double-count their gradient contribution. Inference (PR 3)
+    # adds the parallel field; cutover (PR 5) flips `enforce_cutover`
+    # after ≥3 Saturday SF firings of variant_cutover_gate show ≥15%
+    # relative IC lift over the canonical fixed-21d Ridge.
+    #
+    # The parallel fit operates on the FULL `oos_meta_rows` set (before
+    # the canonical-finite filter below) since triple-barrier finiteness
+    # is a different mask than canonical finiteness — front-of-history
+    # vol-warmup vs cohort assignability.
+    from labeling.sample_weights import average_uniqueness_weights
+    meta_model_tb: MetaModel | None = None
+    tb_y_full = np.array([
+        r.get("actual_fwd_triple_barrier", float("nan")) for r in oos_meta_rows
+    ])
+    tb_finite_mask = np.isfinite(tb_y_full)
+    n_tb_finite = int(tb_finite_mask.sum())
+    if n_tb_finite >= 100:
+        tb_X = meta_X_all[tb_finite_mask]
+        tb_y = tb_y_full[tb_finite_mask]
+        # LdP Ch. 4.4 average-uniqueness weights — per-ticker so different
+        # tickers don't pollute each other's concurrency. Window-start is
+        # the row's date in trading-day-position space; window length is
+        # the triple-barrier forward window.
+        tb_dates = np.array([
+            r["date"] for r in oos_meta_rows if r is not None
+        ])[tb_finite_mask]
+        tb_tickers = np.array([
+            r.get("ticker", "_unknown") for r in oos_meta_rows
+        ])[tb_finite_mask]
+        # Convert pd.Timestamp dates to integer day positions (relative
+        # to the earliest date) for the uniqueness algorithm.
+        date_min_ts = pd.Timestamp(min(tb_dates))
+        date_positions = np.array([
+            int((pd.Timestamp(d) - date_min_ts).days) for d in tb_dates
+        ], dtype=np.int64)
+        tb_sample_weights = average_uniqueness_weights(
+            window_starts=date_positions,
+            window_length=cfg.TRIPLE_BARRIER_FORWARD_WINDOW,
+            group_ids=tb_tickers,
+        )
+        meta_model_tb = MetaModel(alpha=1.0)
+        meta_model_tb.fit(
+            tb_X, tb_y,
+            feature_names=META_FEATURES,
+            sample_weight=tb_sample_weights,
+        )
+        log.info(
+            "Triple-barrier Meta-Ridge fit (Stage 3 PR 2 observe-only): "
+            "n_tb_finite=%d / n_total=%d (val_ic_tb=%.4f)",
+            n_tb_finite, len(oos_meta_rows), meta_model_tb._val_ic,
+        )
+        # Cross-target diagnostic: IC of TB Ridge predictions against the
+        # canonical label, parallel to the canonical-vs-legacy diagnostic
+        # above. Tells us whether the TB Ridge ranks tickers similarly
+        # to the canonical Ridge on the canonical-grading axis.
+        canonical_y_for_tb = canonical_y_full[tb_finite_mask]
+        canonical_finite_for_tb = np.isfinite(canonical_y_for_tb)
+        if canonical_finite_for_tb.sum() >= 50:
+            tb_preds_for_diag = meta_model_tb.predict(tb_X).ravel()
+            ic_tb_ridge_vs_canonical = float(np.corrcoef(
+                tb_preds_for_diag[canonical_finite_for_tb],
+                canonical_y_for_tb[canonical_finite_for_tb],
+            )[0, 1])
+            log.info(
+                "Triple-barrier-vs-canonical diagnostic: ic_tb_ridge_vs_canonical=%+.4f "
+                "(observe-only — variant_cutover_gate uses prediction-pairs vs "
+                "actual realized alpha, not this in-sample cross-IC)",
+                ic_tb_ridge_vs_canonical,
+            )
+    else:
+        log.info(
+            "Triple-barrier Meta-Ridge: only %d finite-label rows (need >=100) — "
+            "skipped this cycle. Canonical Ridge unaffected.",
+            n_tb_finite,
+        )
 
     # Filter oos_meta_rows to canonical-finite rows so downstream consumers
     # (horizon battery, row_regimes, isotonic calibrator) align naturally
@@ -1957,6 +2082,15 @@ def run_meta_training(
                 models["volatility_risk_aug"] = (
                     prod_vol_risk_aug, "volatility_risk_aug_model.txt",
                 )
+            # Stage 3 PR 2 (regime-conditioning rebuild): parallel triple-barrier
+            # L2 Ridge ships ALONGSIDE the canonical Ridge in observe-only mode.
+            # Inference (PR 3) emits a parallel `meta_alpha_tb` field; cutover
+            # (PR 5) flips `enforce_cutover` after ≥3 Sat-SF firings of
+            # variant_cutover_gate show ≥15% relative IC lift. When
+            # meta_model_tb is None (insufficient TB-finite labels this cycle),
+            # the key is omitted — canonical Ridge remains the sole live writer.
+            if meta_model_tb is not None:
+                models["meta_model_tb"] = (meta_model_tb, "meta_model_tb.pkl")
             # Audit Track A PR 5/6 cutover (2026-05-09): canonical_meta_model
             # retired from the upload set. The single meta_model.pkl above
             # is now trained on canonical labels — no separate canonical
