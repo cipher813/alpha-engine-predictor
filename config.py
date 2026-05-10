@@ -343,6 +343,32 @@ VOLATILITY_FEATURES = [
     "atr_14_pct", "realized_vol_20d", "vol_ratio_10_60",
     "iv_rank", "dist_from_52w_high", "dist_from_52w_low",
 ]
+
+# Stage 1 of regime-conditioning rebuild (plan: regime-conditioning-260510.md)
+# — macros consumed by L1 GBMs as time-series-z-scored features. Cross-
+# sectional rank-norm degenerates these to 0.5 for every ticker because
+# they're constant across tickers on a given date; time-series z-score
+# over a rolling window preserves the regime signal (high VIX vs low VIX).
+# Trees discover interactions with rank-normed per-ticker features
+# through sequential splits — institutional SOTA per-feature normalization.
+#
+# Source: ``regime_features_df`` columns (built by
+# ``model.regime_predictor.RegimePredictor.build_features()`` — kept as
+# feature-engineering utility after the Tier-0 classifier was retired).
+MACRO_NORM_FEATURES = [
+    "spy_20d_return",
+    "spy_20d_vol",
+    "vix_level",
+    "vix_term_slope",
+    "yield_curve_slope",
+    "market_breadth",
+]
+# Rolling window for time-series z-score. 252 trading days = 1 year, the
+# institutional default for macro normalization (captures one full regime
+# cycle without being overly slow to adapt). ``min_periods`` is set in
+# ``data.dataset.time_series_zscore_normalize`` (default 60 = 3 months).
+MACRO_NORM_WINDOW = 252
+
 # Regime predictor uses macro series directly (not GBM features)
 # Research calibrator uses signals.json fields (not price features)
 

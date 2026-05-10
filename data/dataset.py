@@ -174,6 +174,71 @@ def cross_sectional_rank_normalize(
 
     return X_ranked
 
+
+def time_series_zscore_normalize(
+    X: np.ndarray,
+    dates: list,
+    window: int = 252,
+    min_periods: int = 60,
+) -> np.ndarray:
+    """Point-in-time rolling z-score for time-series-only features.
+
+    For each unique date d, normalizes column values using rolling stats
+    from the [d-window, d-1] window — strictly past data, no look-ahead.
+    Returns NaN for dates that don't have ``min_periods`` of trailing
+    history; downstream LightGBM consumers handle NaN natively.
+
+    Used for MARKET-WIDE features (VIX, yield curve, breadth, etc.) that
+    are constant across tickers on a given date — cross-sectional rank-norm
+    would degenerate to 0.5 for every row, but time-series z-score
+    preserves the cross-temporal signal (regime is high vs low VIX).
+    Trees discover interactions with rank-normed per-ticker features
+    automatically through sequential splits — institutional SOTA pattern.
+
+    Args:
+        X: shape (N, n_features) — raw feature values, sorted by date.
+            Macro features are constant across tickers on a date; this
+            function deduplicates per-date before computing rolling stats.
+        dates: list of pd.Timestamp, length N, sorted ascending
+        window: rolling window size (default 252 trading days = 1 year)
+        min_periods: minimum trailing periods to compute z-score
+            (default 60 = 3 months — gates early dates with thin history)
+
+    Returns:
+        X_zscored : shape (N, n_features) — point-in-time rolling z-scores
+            in float32. NaN for dates with insufficient history.
+    """
+    if X.shape[0] == 0:
+        return X.astype(np.float32)
+    if len(dates) != X.shape[0]:
+        raise ValueError(
+            f"dates length {len(dates)} does not match X rows {X.shape[0]}"
+        )
+
+    # Build a date-indexed DataFrame; deduplicate to first-occurrence per
+    # date so the rolling window operates on N_dates rows, not N_total
+    # rows (macros are constant within a date — replicating across
+    # tickers would distort the rolling mean toward heavily-tickered
+    # dates).
+    df_full = pd.DataFrame(X, index=pd.DatetimeIndex(dates))
+    per_date = df_full.loc[~df_full.index.duplicated(keep="first")].sort_index()
+
+    # Rolling stats use PAST data only via shift(1) — at date d, the
+    # rolling window is [d-window, d-1], excluding d itself. No look-ahead.
+    rolling = per_date.rolling(window, min_periods=min_periods)
+    rolling_mean = rolling.mean().shift(1)
+    rolling_std = rolling.std().shift(1)
+    z_per_date = (per_date - rolling_mean) / rolling_std
+
+    # Map z-scored values back to every (date, ticker) row in original
+    # order. ``reindex(dates)`` broadcasts each unique-date z-score to
+    # all rows on that date.
+    z_for_each_row = z_per_date.reindex(pd.DatetimeIndex(dates)).to_numpy(
+        dtype=np.float32,
+    )
+    return z_for_each_row
+
+
 def load_norm_stats(path: str) -> tuple[np.ndarray, np.ndarray]:
     """
     Load saved normalization statistics from a JSON file.
