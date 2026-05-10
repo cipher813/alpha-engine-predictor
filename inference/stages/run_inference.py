@@ -428,6 +428,33 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
             [X_vol_ranked, macro_block], axis=1,
         ).astype(np.float32)
 
+    # Stage 2b: risk-augmented rank-norm batch for the parallel vol-risk
+    # GBM. Schema must match training feature order:
+    # [VOLATILITY_FEATURES rank-normed, RISK_AUG_FEATURES rank-normed].
+    # Both halves are per-ticker (cross-sectionally varying) so the same
+    # rank-norm pipeline applies to both. Total 11 features (6 vol + 5 risk).
+    # Tolerant of missing risk features per ticker (NaN-fill via reindex);
+    # LightGBM handles NaN natively.
+    vol_scorer_risk_aug = ctx.meta_models.get("volatility_risk_aug")
+    X_vol_risk_aug_ranked: np.ndarray | None = None
+    if vol_scorer_risk_aug is not None and X_vol_ranked is not None:
+        try:
+            X_risk_raw = np.stack([
+                precomputed[t]
+                .reindex(columns=cfg.RISK_AUG_FEATURES)
+                .to_numpy(dtype=np.float32)
+                for t in present_tickers
+            ])
+            X_risk_ranked = _rank_norm(X_risk_raw, today_dates).astype(np.float32)
+            X_vol_risk_aug_ranked = np.concatenate(
+                [X_vol_ranked, X_risk_ranked], axis=1,
+            ).astype(np.float32)
+        except Exception as e:
+            log.warning(
+                "Risk feature batch build failed (parallel observe-only, "
+                "non-blocking): %s", e,
+            )
+
     for ticker in ctx.tickers:
         latest = precomputed.get(ticker)
         if latest is None:
@@ -472,6 +499,27 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
                 except Exception as e:
                     log.debug(
                         "volatility_macro_aug.predict failed for %s "
+                        "(parallel observe-only, non-blocking): %s",
+                        ticker, e,
+                    )
+
+        # Stage 2b parallel observation: risk-augmented vol GBM. Same
+        # pattern as macro-aug — None when the aug GBM isn't loaded or
+        # the per-ticker predict raises. Plain expected_move is canonical
+        # until Stage 2d cuts over.
+        expected_move_risk_aug: float | None = None
+        if vol_scorer_risk_aug is not None and X_vol_risk_aug_ranked is not None:
+            idx_risk = ticker_to_batch_idx.get(ticker)
+            if idx_risk is not None:
+                try:
+                    expected_move_risk_aug = float(
+                        vol_scorer_risk_aug.predict(
+                            X_vol_risk_aug_ranked[idx_risk:idx_risk + 1]
+                        )[0]
+                    )
+                except Exception as e:
+                    log.debug(
+                        "volatility_risk_aug.predict failed for %s "
                         "(parallel observe-only, non-blocking): %s",
                         ticker, e,
                     )
@@ -626,6 +674,14 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
             "expected_move_macro_aug": (
                 round(expected_move_macro_aug, 6)
                 if expected_move_macro_aug is not None else None
+            ),
+            # Stage 2b parallel-observation field: risk-augmented vol GBM
+            # prediction. Same evaluation framework as
+            # expected_move_macro_aug — variant_cutover_gate compares
+            # against expected_move (plain). Cutover is Stage 2d.
+            "expected_move_risk_aug": (
+                round(expected_move_risk_aug, 6)
+                if expected_move_risk_aug is not None else None
             ),
             # regime_bull/regime_bear removed from per-ticker output 2026-04-16
             # (Tier 0 classifier retired). Downstream consumers (dashboard,

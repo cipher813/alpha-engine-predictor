@@ -532,6 +532,12 @@ def run_meta_training(
     ticker_chunks: list[np.ndarray] = []
     mom_chunks: list[np.ndarray] = []
     vol_chunks: list[np.ndarray] = []
+    # Stage 2b: per-ticker risk features for the parallel
+    # ``prod_vol_risk_aug`` variant. Tolerant of missing columns
+    # (NaN-fill rather than reject) so older parquets without the
+    # alpha-engine-data #202 risk features still flow through plain
+    # vol GBM training. LightGBM handles NaN natively.
+    risk_chunks: list[np.ndarray] = []
     fwd_chunks: list[np.ndarray] = []
     fwd_horizons_chunks: list[np.ndarray] = []
 
@@ -603,6 +609,15 @@ def run_meta_training(
         vol_chunks.append(
             labeled[cfg.VOLATILITY_FEATURES].to_numpy(dtype=np.float32)
         )
+        # Stage 2b: per-ticker risk features. ``reindex`` returns NaN
+        # for any column missing from the parquet — older feature_engineer
+        # outputs (pre-#202) lack these columns, but LightGBM handles
+        # NaN natively so the parallel variant trains on whatever subset
+        # is populated.
+        risk_chunks.append(
+            labeled.reindex(columns=cfg.RISK_AUG_FEATURES)
+                   .to_numpy(dtype=np.float32)
+        )
         fwd_chunks.append(
             labeled["forward_return_5d"].to_numpy(dtype=np.float32)
         )
@@ -663,13 +678,14 @@ def run_meta_training(
     ticker_unsorted = np.concatenate(ticker_chunks)
     X_mom_unsorted = np.concatenate(mom_chunks, axis=0)
     X_vol_unsorted = np.concatenate(vol_chunks, axis=0)
+    X_risk_unsorted = np.concatenate(risk_chunks, axis=0)
     y_fwd_unsorted = np.concatenate(fwd_chunks)
     y_fwd_horizons_unsorted = np.concatenate(fwd_horizons_chunks, axis=0)
 
     # Free the chunk lists — referenced data has been copied into the
     # contiguous arrays above. Without this `del` the chunks linger
     # through walk-forward and double the RSS we just reduced.
-    del date_chunks, ticker_chunks, mom_chunks, vol_chunks
+    del date_chunks, ticker_chunks, mom_chunks, vol_chunks, risk_chunks
     del fwd_chunks, fwd_horizons_chunks
 
     # Stable sort by date so ties keep ticker-order deterministic for
@@ -701,11 +717,13 @@ def run_meta_training(
     all_tickers = ticker_unsorted[sort_idx].tolist()
     X_mom = X_mom_unsorted[sort_idx]
     X_vol = X_vol_unsorted[sort_idx]
+    X_risk = X_risk_unsorted[sort_idx]
     y_fwd = y_fwd_unsorted[sort_idx]
     y_fwd_horizons = y_fwd_horizons_unsorted[sort_idx]
 
     del date_unsorted, ticker_unsorted
-    del X_mom_unsorted, X_vol_unsorted, y_fwd_unsorted, y_fwd_horizons_unsorted
+    del X_mom_unsorted, X_vol_unsorted, X_risk_unsorted
+    del y_fwd_unsorted, y_fwd_horizons_unsorted
 
     # Winsorize
     if cfg.LABEL_CLIP:
@@ -724,6 +742,10 @@ def run_meta_training(
     # Cross-sectional rank normalize (per-date, per-feature)
     X_mom = cross_sectional_rank_normalize(X_mom, all_dates)
     X_vol = cross_sectional_rank_normalize(X_vol, all_dates)
+    # Stage 2b: rank-norm risk features alongside vol. Per-ticker
+    # cross-sectional variation lets the trees split on relative rank
+    # (e.g., "this ticker is in the top 10% of beta cross-section today").
+    X_risk = cross_sectional_rank_normalize(X_risk, all_dates)
 
     N = len(y_fwd)
     log.info("Arrays built: %d samples, mom=%d features, vol=%d features",
@@ -1669,6 +1691,58 @@ def run_meta_training(
         prod_vol_macro_aug = None
         vol_macro_aug_test_ic = None
 
+    # ── Step 8a-2: Parallel risk-augmented volatility GBM (Stage 2b observe-only) ──
+    # Per regime-conditioning rebuild plan: train a parallel volatility
+    # GBM that consumes the existing rank-normed vol features PLUS the
+    # rank-normed per-ticker risk features (beta_60d, idio_vol_60d,
+    # vol_of_vol_30d, max_drawdown_60d, realized_vol_63d). Mirrors the
+    # Stage 1b macro-aug variant but for risk dimensions LightGBM trees
+    # cannot split on through the existing 6 vol features.
+    #
+    # Ships ALONGSIDE the plain volatility GBM. Inference loads it
+    # observe-only (Stage 2b inference path adds expected_move_risk_aug
+    # parallel field). Cutover (Stage 2d) happens after the
+    # variant_cutover_gate fires (≥15% relative IC lift over plain).
+    X_vol_risk_aug = np.concatenate([X_vol, X_risk], axis=1)
+    VOL_RISK_AUG_FEATURES = list(cfg.VOLATILITY_FEATURES) + list(cfg.RISK_AUG_FEATURES)
+    prod_vol_risk_aug: GBMScorer | None = None
+    vol_risk_aug_test_ic: float | None = None
+    try:
+        prod_vol_risk_aug = GBMScorer(
+            params=tuned_params, n_estimators=cfg.GBM_N_ESTIMATORS,
+            early_stopping_rounds=cfg.GBM_EARLY_STOPPING_ROUNDS,
+        )
+        prod_vol_risk_aug.fit(
+            X_vol_risk_aug[:n_train], np.abs(y_fwd[:n_train]),
+            X_vol_risk_aug[n_train:val_end], np.abs(y_fwd[n_train:val_end]),
+            feature_names=VOL_RISK_AUG_FEATURES,
+        )
+        vol_risk_aug_test_preds = prod_vol_risk_aug.predict(X_vol_risk_aug[val_end:])
+        vol_risk_aug_test_ic = (
+            float(np.corrcoef(vol_risk_aug_test_preds, np.abs(y_fwd[val_end:]))[0, 1])
+            if len(vol_risk_aug_test_preds) > 1 else 0.0
+        )
+        lift = vol_risk_aug_test_ic - vol_test_ic
+        relative_lift = (
+            vol_risk_aug_test_ic / vol_test_ic
+            if vol_test_ic > 1e-6 else float("nan")
+        )
+        log.info(
+            "Volatility-with-risk (Stage 2b parallel observe-only): "
+            "test_IC=%.4f vs plain test_IC=%.4f (abs_lift=%+.4f, "
+            "rel_lift=%.3fx)  best_iter=%d  n_features=%d",
+            vol_risk_aug_test_ic, vol_test_ic, lift, relative_lift,
+            prod_vol_risk_aug._best_iteration,
+            prod_vol_risk_aug._booster.num_feature(),
+        )
+    except Exception as e:
+        log.warning(
+            "Volatility-with-risk parallel fit failed (non-blocking, "
+            "observe-only): %s", e,
+        )
+        prod_vol_risk_aug = None
+        vol_risk_aug_test_ic = None
+
     # ── Step 8b: Short-history subsample IC gate ─────────────────────────────
     # Per ROADMAP P1 "NaN-feature handling audit + short-history subsample
     # validation" + feedback_component_baseline_validation: each L1 GBM
@@ -1873,6 +1947,16 @@ def run_meta_training(
                 models["volatility_macro_aug"] = (
                     prod_vol_macro_aug, "volatility_macro_aug_model.txt",
                 )
+            # Stage 2b (regime-conditioning rebuild): parallel risk-augmented
+            # volatility GBM ships ALONGSIDE the plain volatility GBM in
+            # observe-only mode. Inference reads it via Stage 2b's parallel
+            # field; cutover (Stage 2d) happens after the variant_cutover_gate
+            # fires. When prod_vol_risk_aug is None (parallel fit failed or
+            # risk features absent from all parquets), the key is omitted.
+            if prod_vol_risk_aug is not None:
+                models["volatility_risk_aug"] = (
+                    prod_vol_risk_aug, "volatility_risk_aug_model.txt",
+                )
             # Audit Track A PR 5/6 cutover (2026-05-09): canonical_meta_model
             # retired from the upload set. The single meta_model.pkl above
             # is now trained on canonical labels — no separate canonical
@@ -2006,6 +2090,39 @@ def run_meta_training(
                             "macro_norm_window": cfg.MACRO_NORM_WINDOW,
                         }}
                         if prod_vol_macro_aug is not None else {}
+                    ),
+                    # Stage 2b (regime-conditioning rebuild): parallel
+                    # risk-augmented volatility GBM observe-only metrics.
+                    # Mirrors the volatility_macro_aug shape so the same
+                    # variant_cutover_gate analyzer can compare it against
+                    # plain vol baseline. Cutover is Stage 2d after the
+                    # gate fires. When None, parallel fit failed or risk
+                    # features were absent from all parquets.
+                    **(
+                        {"volatility_risk_aug": {
+                            "key": f"{prefix}volatility_risk_aug_model.txt",
+                            "test_ic": (
+                                round(vol_risk_aug_test_ic, 6)
+                                if vol_risk_aug_test_ic is not None else None
+                            ),
+                            "test_ic_plain_vol": round(vol_test_ic, 6),
+                            "abs_lift": (
+                                round(vol_risk_aug_test_ic - vol_test_ic, 6)
+                                if vol_risk_aug_test_ic is not None else None
+                            ),
+                            "relative_lift": (
+                                round(vol_risk_aug_test_ic / vol_test_ic, 4)
+                                if (
+                                    vol_risk_aug_test_ic is not None
+                                    and vol_test_ic > 1e-6
+                                ) else None
+                            ),
+                            "val_ic": float(prod_vol_risk_aug._val_ic or 0.0),
+                            "best_iteration": prod_vol_risk_aug._best_iteration,
+                            "n_features": prod_vol_risk_aug._booster.num_feature(),
+                            "risk_features": list(cfg.RISK_AUG_FEATURES),
+                        }}
+                        if prod_vol_risk_aug is not None else {}
                     ),
                     # Track A PR 5/6 cutover (2026-05-09): canonical_meta_model
                     # observe-only entry retired. The meta_model entry above

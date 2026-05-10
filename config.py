@@ -344,6 +344,26 @@ VOLATILITY_FEATURES = [
     "iv_rank", "dist_from_52w_high", "dist_from_52w_low",
 ]
 
+# Stage 2b of regime-conditioning rebuild (plan: regime-conditioning-260510.md)
+# — per-ticker risk features written to ArcticDB by alpha-engine-data Stage
+# 2a (#202) and Stage 2a-extended (realized_vol_63d). Each varies cross-
+# sectionally on a given date, so the existing rank-norm pipeline applies
+# directly. Feeds the parallel ``prod_vol_risk_aug`` GBM (Stage 2b parallel
+# observation) alongside the plain volatility GBM. Captures distinct risk
+# dimensions the existing 6 vol features cannot split on:
+#   - beta_60d:        systematic market exposure
+#   - idio_vol_60d:    residual risk (after removing market-beta exposure)
+#   - vol_of_vol_30d:  vol-regime stability
+#   - max_drawdown_60d: recent left-tail risk
+#   - realized_vol_63d: 3-month vol regime (pairs with 20d for term structure)
+RISK_AUG_FEATURES = [
+    "beta_60d",
+    "idio_vol_60d",
+    "vol_of_vol_30d",
+    "max_drawdown_60d",
+    "realized_vol_63d",
+]
+
 # Stage 1 of regime-conditioning rebuild (plan: regime-conditioning-260510.md)
 # — macros consumed by L1 GBMs as time-series-z-scored features. Cross-
 # sectional rank-norm degenerates these to 0.5 for every ticker because

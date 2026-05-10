@@ -126,6 +126,24 @@ def _load_meta_models(ctx: PipelineContext) -> None:
     except Exception as e:
         log.debug("volatility_macro_aug not available (observe-only OK): %s", e)
 
+    # Stage 2b (regime-conditioning rebuild): parallel risk-augmented
+    # volatility GBM. Reads per-ticker risk features (beta_60d, idio_vol_60d,
+    # vol_of_vol_30d, max_drawdown_60d, realized_vol_63d) from ArcticDB
+    # alongside the existing vol features. expected_move_risk_aug rides
+    # alongside expected_move as the parallel field. Same loader pattern
+    # as Stage 1b: tolerant of absence (early observation period or any
+    # cycle where the parallel fit failed).
+    try:
+        from model.gbm_scorer import GBMScorer
+        path = _dl(
+            f"{prefix}volatility_risk_aug_model.txt",
+            "volatility_risk_aug.txt",
+        )
+        ctx.meta_models["volatility_risk_aug"] = GBMScorer.load(path)
+        log.info("Loaded volatility GBM (Stage 2b risk-aug, observe-only)")
+    except Exception as e:
+        log.debug("volatility_risk_aug not available (observe-only OK): %s", e)
+
     # Meta-model (ridge stacker)
     try:
         from model.meta_model import MetaModel
