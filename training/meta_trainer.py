@@ -323,6 +323,45 @@ def _load_signals_history(s3, bucket: str) -> dict[str, dict]:
     return history
 
 
+def _build_macro_array(
+    all_dates: list,
+    regime_features_df: pd.DataFrame,
+    macro_features: list[str],
+) -> np.ndarray:
+    """Build (N, n_macros) array broadcasting per-date macro values to every row.
+
+    Used by Stage 1b for parallel-observation macro-augmented volatility
+    GBM training. Each per-(date, ticker) row gets the same macro values
+    on a given date — macros are constant cross-sectionally. Rows whose
+    date isn't in ``regime_features_df.index`` get NaN; LightGBM handles
+    NaN natively.
+
+    Args:
+        all_dates: list of pd.Timestamp, length N (per-(date, ticker) rows).
+        regime_features_df: date-indexed DataFrame (from
+            ``RegimePredictor.build_features``). Columns must include
+            every name in ``macro_features``.
+        macro_features: list of column names to extract, in canonical
+            order. The output array preserves this column order.
+
+    Returns:
+        (N, n_macros) float64 array.
+    """
+    n = len(all_dates)
+    n_macros = len(macro_features)
+    X_macro = np.full((n, n_macros), np.nan, dtype=np.float64)
+
+    if regime_features_df.empty:
+        return X_macro
+
+    macro_subset = regime_features_df[macro_features]
+    for i, d in enumerate(all_dates):
+        if d in macro_subset.index:
+            X_macro[i] = macro_subset.loc[d].to_numpy(dtype=np.float64)
+
+    return X_macro
+
+
 def _build_signals_lookup_by_test_date(
     signals_history: dict[str, dict],
     test_dates: list,
@@ -739,6 +778,40 @@ def run_meta_training(
     regime_y_aligned = regime_y.loc[common_dates].to_numpy().astype(int)
 
     log.info("Regime data: %d dates with features+labels", len(common_dates))
+
+    # ── Step 4b: Build macro feature array for Stage 1b parallel observation ─
+    # Stage 1b of the regime-conditioning rebuild (plan doc:
+    # alpha-engine-docs/private/regime-conditioning-260510.md). Builds a
+    # (N, 6) macro array broadcasting per-date values to every per-(date,
+    # ticker) row in all_dates, then applies time-series z-score over a
+    # rolling 252-day window.
+    #
+    # Per-feature normalization is the institutional SOTA pattern: cross-
+    # sectional rank-norm for ticker features (existing X_vol, X_mom),
+    # time-series z-score for macros (this block). Macros are constant
+    # across tickers on a given date — rank-norm degenerates them to 0.5
+    # for every row, losing all signal. Z-score over rolling window
+    # preserves the regime signal (high VIX vs low VIX) and lets trees
+    # discover macro-conditioned interactions through sequential splits.
+    #
+    # Used downstream by the parallel macro-augmented volatility GBM
+    # (Step 7e). When regime_features_df doesn't have a date, that row
+    # gets NaN for every macro — LightGBM handles NaN natively.
+    from data.dataset import time_series_zscore_normalize
+
+    X_macro_raw = _build_macro_array(
+        all_dates, regime_features_df, list(cfg.MACRO_NORM_FEATURES),
+    )
+    X_macro_zscored = time_series_zscore_normalize(
+        X_macro_raw, all_dates, window=cfg.MACRO_NORM_WINDOW,
+    )
+    log.info(
+        "Macro feature array (Stage 1b): %d rows × %d cols, "
+        "rolling z-score window=%d, finite_pct=%.2f",
+        X_macro_zscored.shape[0], X_macro_zscored.shape[1],
+        cfg.MACRO_NORM_WINDOW,
+        100.0 * float(np.isfinite(X_macro_zscored).all(axis=1).mean()),
+    )
 
     # ── Step 5: Load research calibrator data from S3 ────────────────────────
     research_scores = np.array([])
@@ -1527,6 +1600,64 @@ def run_meta_training(
     vol_test_ic = float(np.corrcoef(vol_test_preds, np.abs(y_fwd[val_end:]))[0, 1]) if len(vol_test_preds) > 1 else 0.0
     log.info("Volatility production: test_IC=%.4f  best_iter=%d", vol_test_ic, prod_vol._best_iteration)
 
+    # ── Step 8a: Parallel macro-augmented volatility GBM (Stage 1b observe-only) ──
+    # Per regime-conditioning rebuild plan: train a parallel volatility
+    # GBM that consumes the rank-normed per-ticker volatility features
+    # PLUS the time-series-z-scored macros (from Step 4b). Trees discover
+    # macro-conditioned interactions through sequential splits — the
+    # institutional SOTA pattern (per-feature normalization).
+    #
+    # Ships ALONGSIDE the plain volatility GBM. Inference doesn't read it
+    # yet (Stage 1c wires inference parallel observation; Stage 1d cuts
+    # over after the variant_cutover_gate fires). This PR is training-side
+    # parallel observation only — same pattern as audit Phase 3 PR 2/5
+    # (ResearchGBMScorer parallel-observe before cutover).
+    #
+    # The augmented variant feeds 12 features (6 vol + 6 macro) vs the
+    # plain variant's 6 vol features. Subsample IC gate (Step 8b) runs
+    # against the plain variant only — adding the aug variant to the gate
+    # would require coupling the gate to the cutover decision, which we
+    # explicitly defer.
+    X_vol_aug = np.concatenate([X_vol, X_macro_zscored], axis=1)
+    VOL_AUG_FEATURES = list(cfg.VOLATILITY_FEATURES) + list(cfg.MACRO_NORM_FEATURES)
+    prod_vol_macro_aug: GBMScorer | None = None
+    vol_macro_aug_test_ic: float | None = None
+    try:
+        prod_vol_macro_aug = GBMScorer(
+            params=tuned_params, n_estimators=cfg.GBM_N_ESTIMATORS,
+            early_stopping_rounds=cfg.GBM_EARLY_STOPPING_ROUNDS,
+        )
+        prod_vol_macro_aug.fit(
+            X_vol_aug[:n_train], np.abs(y_fwd[:n_train]),
+            X_vol_aug[n_train:val_end], np.abs(y_fwd[n_train:val_end]),
+            feature_names=VOL_AUG_FEATURES,
+        )
+        vol_aug_test_preds = prod_vol_macro_aug.predict(X_vol_aug[val_end:])
+        vol_macro_aug_test_ic = (
+            float(np.corrcoef(vol_aug_test_preds, np.abs(y_fwd[val_end:]))[0, 1])
+            if len(vol_aug_test_preds) > 1 else 0.0
+        )
+        lift = vol_macro_aug_test_ic - vol_test_ic
+        relative_lift = (
+            vol_macro_aug_test_ic / vol_test_ic
+            if vol_test_ic > 1e-6 else float("nan")
+        )
+        log.info(
+            "Volatility-with-macros (Stage 1b parallel observe-only): "
+            "test_IC=%.4f vs plain test_IC=%.4f (abs_lift=%+.4f, "
+            "rel_lift=%.3fx)  best_iter=%d  n_features=%d",
+            vol_macro_aug_test_ic, vol_test_ic, lift, relative_lift,
+            prod_vol_macro_aug._best_iteration,
+            prod_vol_macro_aug._booster.num_feature(),
+        )
+    except Exception as e:
+        log.warning(
+            "Volatility-with-macros parallel fit failed (non-blocking, "
+            "observe-only): %s", e,
+        )
+        prod_vol_macro_aug = None
+        vol_macro_aug_test_ic = None
+
     # ── Step 8b: Short-history subsample IC gate ─────────────────────────────
     # Per ROADMAP P1 "NaN-feature handling audit + short-history subsample
     # validation" + feedback_component_baseline_validation: each L1 GBM
@@ -1719,6 +1850,18 @@ def run_meta_training(
             # is omitted — bucket-lookup remains the canonical path.
             if prod_research_gbm is not None:
                 models["research_gbm"] = (prod_research_gbm, "research_gbm.pkl")
+            # Stage 1b (regime-conditioning rebuild): parallel macro-augmented
+            # volatility GBM ships ALONGSIDE the plain volatility GBM in
+            # observe-only mode. Persisted to dated archive + live prefix
+            # alongside the plain variant. Inference doesn't load it yet
+            # (Stage 1c wires inference parallel observation; Stage 1d cuts
+            # over after the variant_cutover_gate clears). When
+            # prod_vol_macro_aug is None (parallel fit failed), the key is
+            # omitted — plain volatility GBM remains the canonical path.
+            if prod_vol_macro_aug is not None:
+                models["volatility_macro_aug"] = (
+                    prod_vol_macro_aug, "volatility_macro_aug_model.txt",
+                )
             # Audit Track A PR 5/6 cutover (2026-05-09): canonical_meta_model
             # retired from the upload set. The single meta_model.pkl above
             # is now trained on canonical labels — no separate canonical
@@ -1817,6 +1960,41 @@ def run_meta_training(
                             **(research_gbm_metrics or {}),
                         }}
                         if prod_research_gbm is not None else {}
+                    ),
+                    # Stage 1b (regime-conditioning rebuild): macro-augmented
+                    # volatility GBM observe-only metrics. Carries test_IC
+                    # for both variants + abs/relative lift so cumulative
+                    # observation across Saturday SF firings can be fed to
+                    # ``analysis.variant_cutover_gate`` for the cutover
+                    # decision. Inference doesn't read this artifact yet
+                    # (Stage 1c) — purely training-side parallel observation.
+                    # When None, parallel fit failed this cycle (no impact
+                    # on prod_vol training).
+                    **(
+                        {"volatility_macro_aug": {
+                            "key": f"{prefix}volatility_macro_aug_model.txt",
+                            "test_ic": (
+                                round(vol_macro_aug_test_ic, 6)
+                                if vol_macro_aug_test_ic is not None else None
+                            ),
+                            "test_ic_plain_vol": round(vol_test_ic, 6),
+                            "abs_lift": (
+                                round(vol_macro_aug_test_ic - vol_test_ic, 6)
+                                if vol_macro_aug_test_ic is not None else None
+                            ),
+                            "relative_lift": (
+                                round(vol_macro_aug_test_ic / vol_test_ic, 4)
+                                if (
+                                    vol_macro_aug_test_ic is not None
+                                    and vol_test_ic > 1e-6
+                                ) else None
+                            ),
+                            "val_ic": float(prod_vol_macro_aug._val_ic or 0.0),
+                            "best_iteration": prod_vol_macro_aug._best_iteration,
+                            "n_features": prod_vol_macro_aug._booster.num_feature(),
+                            "macro_norm_window": cfg.MACRO_NORM_WINDOW,
+                        }}
+                        if prod_vol_macro_aug is not None else {}
                     ),
                     # Track A PR 5/6 cutover (2026-05-09): canonical_meta_model
                     # observe-only entry retired. The meta_model entry above
