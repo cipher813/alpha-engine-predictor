@@ -14,8 +14,27 @@ Pipeline:
   3. Load price + sector_map from S3 to compute realized 21d sector-
      neutral residual log-return per (date, ticker)
   4. Invoke ``validate_cutover_gate`` with 15% relative-lift threshold
-  5. Write result JSON to
-     ``s3://{bucket}/predictor/variant_gates/triple_barrier_{date}.json``
+  5. Write result JSON via the canonical lib helpers
+     (``alpha_engine_lib.eval_artifacts``):
+     ``s3://{bucket}/predictor/variant_gates/triple_barrier/{run_id}.json``
+     plus a ``latest.json`` operator-fetch sidecar at the prefix root.
+
+S3 layout (canonical eval-style flat layout codified in
+``alpha_engine_lib.eval_artifacts`` v0.8.0)::
+
+    predictor/variant_gates/triple_barrier/
+      ├── 2605160200.json                # YYMMDDHHMM run_id
+      ├── 2605161430.json                # second run same day → distinct key
+      ├── 2605230200.json
+      └── latest.json                    # most-recent run — operator UX
+
+Same-day re-runs land at distinct ``run_id`` keys instead of overwriting,
+preserving forensic capture. The ``latest.json`` sidecar provides a
+single-fetch endpoint for dashboards / evaluator email rendering. Per
+the Alpha Engine ``DATE_CONVENTIONS.md`` dual-tracking convention, every
+payload carries both ``calendar_date`` (wall-clock UTC) and
+``trading_day`` (last closed NYSE session) so downstream consumers can
+query along either axis.
 
 The realized alpha uses the same fixed-21d sector-neutral residual that
 the canonical Ridge trains on — NOT the triple-barrier path-dependent
@@ -51,7 +70,6 @@ per day.
 from __future__ import annotations
 
 import argparse
-import datetime
 import json
 import logging
 import sys
@@ -64,6 +82,12 @@ log = logging.getLogger(__name__)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import config as cfg  # noqa: E402
+from alpha_engine_lib.dates import now_dual  # noqa: E402
+from alpha_engine_lib.eval_artifacts import (  # noqa: E402
+    eval_artifact_key,
+    eval_latest_key,
+    new_eval_run_id,
+)
 from analysis.variant_cutover_gate import (  # noqa: E402
     _load_prediction_history,
     compute_realized_alpha_for_pairs,
@@ -87,8 +111,11 @@ DEFAULT_HORIZON = 21
 DEFAULT_WINDOW_DAYS = 42
 
 # Default S3 prefix where gate result JSONs land. Operator dashboards
-# and the eventual evaluator-email surfacer read from here.
-DEFAULT_OUTPUT_PREFIX = "predictor/variant_gates"
+# and the eventual evaluator-email surfacer read from here. The
+# ``triple_barrier/`` sub-prefix isolates this gate from any future
+# variant gates (Stage 4 continuous regime feature, Stage 5 meta-
+# labeling) that will land their own sub-prefixes here.
+DEFAULT_OUTPUT_PREFIX = "predictor/variant_gates/triple_barrier"
 
 
 def _load_prices_from_s3(
@@ -151,12 +178,27 @@ def run_gate(
     threshold: float = 1.15,
     output_s3_key: str | None = None,
     write_to_s3: bool = True,
+    write_latest: bool = True,
     s3_client=None,
     prices_by_ticker: dict | None = None,
     sector_map: dict | None = None,
     prediction_pairs: list[dict] | None = None,
+    run_id: str | None = None,
 ) -> dict:
     """End-to-end Stage 3 cutover-gate evaluation.
+
+    Default S3 layout — canonical eval-style flat layout codified in
+    ``alpha_engine_lib.eval_artifacts`` v0.8.0::
+
+        predictor/variant_gates/triple_barrier/
+          {run_id}.json   ← per-invocation artifact (YYMMDDHHMM encodes date)
+          latest.json     ← single-fetch operator UX (mirror)
+
+    Same-minute re-runs collide by design (production cron cadence makes
+    this impossible; tests inject explicit ``run_id``). Both
+    ``calendar_date`` (UTC wall-clock) and ``trading_day`` (last closed
+    NYSE session) are embedded in every payload per
+    ``DATE_CONVENTIONS.md``.
 
     Args:
         bucket: S3 bucket. Defaults to ``cfg.RESEARCH_BUCKET``.
@@ -164,22 +206,30 @@ def run_gate(
         horizon_days: forward-realized window. Default 21 (matches
             ``cfg.FORWARD_DAYS``).
         threshold: relative-lift threshold for pass. Default 1.15 (15%).
-        output_s3_key: S3 key for the result JSON. When None, defaults
-            to ``predictor/variant_gates/triple_barrier_{today}.json``.
-        write_to_s3: when False, skip the S3 write (local-only run for
-            CLI / testing).
+        output_s3_key: S3 key for the result JSON. When None, formats
+            via ``eval_artifact_key(DEFAULT_OUTPUT_PREFIX, run_id)``.
+        write_to_s3: when False, skip the S3 write (local / test mode).
+        write_latest: when True (default), also write a copy at
+            ``eval_latest_key(DEFAULT_OUTPUT_PREFIX)`` for single-fetch
+            operator UX.
         s3_client: optional pre-configured boto3 S3 client (testing).
         prices_by_ticker / sector_map / prediction_pairs: optional
             pre-loaded inputs for testing — when provided, the runner
             skips the corresponding S3 load.
+        run_id: optional pre-minted run identifier (testing). When None,
+            a fresh ``YYMMDDHHMM`` id is minted via
+            ``alpha_engine_lib.eval_artifacts.new_eval_run_id``.
 
     Returns:
         dict-form gate result (asdict of VariantCutoverGateResult) plus
-        runner metadata: ``run_date``, ``window_days``, ``horizon_days``,
-        ``n_realized_filled``, ``n_pairs_loaded``.
+        runner metadata: ``calendar_date``, ``trading_day``, ``run_id``,
+        ``window_days``, ``horizon_days``, ``n_pairs_loaded``,
+        ``n_realized_filled``, ``s3_key`` (when ``write_to_s3=True``).
     """
     bucket = bucket or cfg.RESEARCH_BUCKET
-    run_date = datetime.date.today().isoformat()
+    dual = now_dual()
+    if run_id is None:
+        run_id = new_eval_run_id()
 
     if prediction_pairs is None:
         prediction_pairs = _load_prediction_history(
@@ -220,7 +270,18 @@ def run_gate(
 
     payload = {
         **asdict(gate_result),
-        "run_date": run_date,
+        # DATE_CONVENTIONS.md dual-tracking — facts about the artifact
+        # for downstream consumers that key off either UTC wall-clock
+        # or NYSE-session axes. The S3 path uses the YYMMDDHHMM run_id
+        # (which encodes the date itself) — these payload fields are
+        # for join queries, not addressing.
+        "calendar_date": dual.calendar_date,
+        "trading_day": dual.trading_day,
+        # First-class run identifier — same-minute collisions are by
+        # design (production cron cadence makes them effectively
+        # impossible; tests inject explicit run_ids). Per
+        # alpha_engine_lib.eval_artifacts.new_eval_run_id contract.
+        "run_id": run_id,
         "window_days": n_days,
         "horizon_days": horizon_days,
         "n_pairs_loaded": n_pairs_loaded,
@@ -231,14 +292,28 @@ def run_gate(
         import boto3
 
         s3 = s3_client or boto3.client("s3")
-        key = output_s3_key or f"{DEFAULT_OUTPUT_PREFIX}/triple_barrier_{run_date}.json"
+        key = output_s3_key or eval_artifact_key(DEFAULT_OUTPUT_PREFIX, run_id)
+        body = json.dumps(payload, indent=2, default=str).encode("utf-8")
         s3.put_object(
             Bucket=bucket,
             Key=key,
-            Body=json.dumps(payload, indent=2, default=str).encode("utf-8"),
+            Body=body,
             ContentType="application/json",
         )
         log.info("Gate result written to s3://%s/%s", bucket, key)
+        payload["s3_key"] = key
+        # Operator-UX sidecar — a stable single-fetch key. Pure copy of
+        # the dated artifact; the dated key remains the source of truth
+        # so re-runs preserve forensic capture under their own run_id.
+        if write_latest:
+            latest_key = eval_latest_key(DEFAULT_OUTPUT_PREFIX)
+            s3.put_object(
+                Bucket=bucket,
+                Key=latest_key,
+                Body=body,
+                ContentType="application/json",
+            )
+            log.info("Gate result also mirrored to s3://%s/%s", bucket, latest_key)
 
     return payload
 

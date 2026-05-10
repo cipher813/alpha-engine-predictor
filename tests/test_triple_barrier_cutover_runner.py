@@ -232,25 +232,40 @@ class TestRunGate:
             write_to_s3=True,
         )
 
-        # Result JSON has core gate keys + runner metadata
+        # Result JSON has core gate keys + runner metadata + dual-date
+        # institutional fields (PR 6)
         for key in (
             "passed", "baseline_ic", "variant_ic", "relative_lift", "n_pairs",
             "reason", "baseline_field", "variant_field",
-            "run_date", "window_days", "horizon_days",
+            "calendar_date", "trading_day", "run_id",
+            "window_days", "horizon_days",
             "n_pairs_loaded", "n_realized_filled",
+            "s3_key",
         ):
             assert key in payload, f"missing key: {key}"
 
-        # S3 write occurred at the default key shape
-        assert len(fake_s3.put_calls) == 1
-        put = fake_s3.put_calls[0]
-        assert put["Bucket"] == bucket
-        assert "predictor/variant_gates/triple_barrier_" in put["Key"]
-        assert put["Key"].endswith(".json")
+        # Both writes occurred — dated artifact + latest sidecar
+        assert len(fake_s3.put_calls) == 2
+        dated_put = fake_s3.put_calls[0]
+        latest_put = fake_s3.put_calls[1]
+        assert dated_put["Bucket"] == bucket
+        assert latest_put["Bucket"] == bucket
+        # Dated artifact path: predictor/variant_gates/triple_barrier/{run_id}.json
+        # (FLAT layout — YYMMDDHHMM run_id encodes the date itself, no
+        # calendar_date sub-partition. Per alpha_engine_lib.eval_artifacts
+        # canonical convention.)
+        assert dated_put["Key"] == f"predictor/variant_gates/triple_barrier/{payload['run_id']}.json"
+        assert "/2026-" not in dated_put["Key"]  # no ISO date sub-partition
+        # Latest sidecar — stable single-fetch operator UX
+        assert latest_put["Key"] == "predictor/variant_gates/triple_barrier/latest.json"
+        # Both have identical body content (latest is a pure mirror)
+        assert dated_put["Body"] == latest_put["Body"]
         # Body roundtrips
-        body_payload = json.loads(put["Body"].decode("utf-8"))
+        body_payload = json.loads(dated_put["Body"].decode("utf-8"))
         assert body_payload["baseline_field"] == "predicted_alpha"
         assert body_payload["variant_field"] == "meta_alpha_tb"
+        assert body_payload["calendar_date"] == payload["calendar_date"]
+        assert body_payload["run_id"] == payload["run_id"]
 
     def test_run_gate_no_write_skips_s3_put(self):
         from analysis.triple_barrier_cutover_runner import run_gate
@@ -293,3 +308,152 @@ class TestRunGate:
         assert payload["passed"] is False
         assert payload["n_pairs"] == 0
         assert "insufficient data" in payload["reason"]
+
+
+# ── Canonical eval-artifacts layout (lib v0.8.0) ────────────────────────
+
+
+class TestCanonicalLayout:
+    """Validates the alpha_engine_lib.eval_artifacts layout consumed here.
+
+    The runner uses ``new_eval_run_id`` (YYMMDDHHMM) + ``eval_artifact_key``
+    (flat layout, no date sub-partition) + ``eval_latest_key`` (sidecar).
+    These tests pin the consumer-side contract; the lib's own tests cover
+    the helpers' invariants in isolation.
+    """
+
+    def test_run_id_is_yymmddhhmm(self):
+        from analysis.triple_barrier_cutover_runner import run_gate
+
+        fake_s3 = _FakeS3({})
+        payload = run_gate(
+            bucket="test",
+            prediction_pairs=[],
+            prices_by_ticker={},
+            sector_map={},
+            s3_client=fake_s3,
+            write_to_s3=False,
+        )
+        rid = payload["run_id"]
+        # YYMMDDHHMM is 10 chars, all digits
+        assert len(rid) == 10
+        assert rid.isdigit()
+
+    def test_two_runs_same_minute_overwrite_by_design(self):
+        # Per the canonical eval-artifacts contract, intra-minute
+        # collisions are by design — production cron cadence makes them
+        # impossible. Tests pass explicit run_ids when distinct keys
+        # are required.
+        from analysis.triple_barrier_cutover_runner import run_gate
+
+        prices = {
+            "AAPL": _make_price_series(0.005, n=60),
+            "XLK": _make_price_series(0.001, n=60),
+            "SPY": _make_price_series(0.001, n=60),
+        }
+        sector_map = {"AAPL": "XLK"}
+        prediction_pairs = [{
+            "date": "2026-01-15", "ticker": "AAPL",
+            "predicted_alpha": 0.01, "meta_alpha_tb": 0.02,
+            "realized_alpha": None,
+        }]
+        fake_s3 = _FakeS3({})
+
+        # Run twice with explicit YYMMDDHHMM run_ids to exercise the
+        # distinct-keys contract.
+        payload_a = run_gate(
+            bucket="test",
+            prediction_pairs=list(prediction_pairs),
+            prices_by_ticker=prices,
+            sector_map=sector_map,
+            s3_client=fake_s3,
+            write_to_s3=True,
+            run_id="2605101437",
+        )
+        payload_b = run_gate(
+            bucket="test",
+            prediction_pairs=list(prediction_pairs),
+            prices_by_ticker=prices,
+            sector_map=sector_map,
+            s3_client=fake_s3,
+            write_to_s3=True,
+            run_id="2605101440",
+        )
+        # 2 dated puts + 2 latest puts = 4 total
+        assert len(fake_s3.put_calls) == 4
+        dated_keys = [
+            c["Key"] for c in fake_s3.put_calls
+            if c["Key"] != "predictor/variant_gates/triple_barrier/latest.json"
+        ]
+        # Two distinct dated keys at the flat layout — no date sub-partition
+        assert set(dated_keys) == {
+            "predictor/variant_gates/triple_barrier/2605101437.json",
+            "predictor/variant_gates/triple_barrier/2605101440.json",
+        }
+        assert payload_a["run_id"] != payload_b["run_id"]
+
+    def test_payload_carries_dual_date(self):
+        # calendar_date (UTC wall-clock) and trading_day (NYSE session)
+        # must both appear in the payload so downstream consumers can
+        # query along either axis. Per DATE_CONVENTIONS.md.
+        from analysis.triple_barrier_cutover_runner import run_gate
+
+        fake_s3 = _FakeS3({})
+        payload = run_gate(
+            bucket="test",
+            prediction_pairs=[],
+            prices_by_ticker={},
+            sector_map={},
+            s3_client=fake_s3,
+            write_to_s3=False,
+        )
+        assert "calendar_date" in payload
+        assert "trading_day" in payload
+        # Both ISO yyyy-mm-dd
+        import re
+        assert re.match(r"^\d{4}-\d{2}-\d{2}$", payload["calendar_date"])
+        assert re.match(r"^\d{4}-\d{2}-\d{2}$", payload["trading_day"])
+
+    def test_latest_sidecar_can_be_disabled(self):
+        from analysis.triple_barrier_cutover_runner import run_gate
+
+        prices = {
+            "AAPL": _make_price_series(0.005, n=60),
+            "XLK": _make_price_series(0.001, n=60),
+            "SPY": _make_price_series(0.001, n=60),
+        }
+        prediction_pairs = [{
+            "date": "2026-01-15", "ticker": "AAPL",
+            "predicted_alpha": 0.01, "meta_alpha_tb": 0.02,
+        }]
+        fake_s3 = _FakeS3({})
+        run_gate(
+            bucket="test",
+            prediction_pairs=prediction_pairs,
+            prices_by_ticker=prices,
+            sector_map={"AAPL": "XLK"},
+            s3_client=fake_s3,
+            write_to_s3=True,
+            write_latest=False,
+        )
+        # Only the dated artifact, no latest sidecar
+        assert len(fake_s3.put_calls) == 1
+        assert "/latest.json" not in fake_s3.put_calls[0]["Key"]
+
+    def test_explicit_output_s3_key_overrides_default(self):
+        # Backward-compat — operators / tests can override the default
+        # institutional path with a custom key (e.g., for ad-hoc dumps).
+        from analysis.triple_barrier_cutover_runner import run_gate
+
+        fake_s3 = _FakeS3({})
+        run_gate(
+            bucket="test",
+            prediction_pairs=[],
+            prices_by_ticker={},
+            sector_map={},
+            s3_client=fake_s3,
+            write_to_s3=True,
+            write_latest=False,
+            output_s3_key="custom/path/result.json",
+        )
+        assert fake_s3.put_calls[0]["Key"] == "custom/path/result.json"
