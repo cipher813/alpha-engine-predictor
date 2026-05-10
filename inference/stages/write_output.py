@@ -622,6 +622,13 @@ def _build_predictor_email(
         f'⚠ VETO = negative α + bottom-half rank'
         + (' &nbsp;|&nbsp; Mom = momentum &nbsp;|&nbsp; Vol = expected move &nbsp;|&nbsp; Res.Cal = research calibrator P(correct)' if is_meta else '')
         + f'</p>'
+        f'<p style="font-size:11px; color:#aaa; margin-top:8px;">'
+        f'ⓘ α is <b>log-domain decimal</b> at the 21d horizon (post 2026-05-09 '
+        f'canonical-alpha cutover; was 5d arithmetic %). Displayed as % for '
+        f'readability — small magnitudes are equivalent, but tail values '
+        f'diverge (e.g. -10% log ≈ -9.5% arithmetic). Direction + ranking '
+        f'unchanged.'
+        f'</p>'
         f'</body></html>'
     )
 
@@ -710,6 +717,13 @@ def _build_predictor_email(
             f"\nOPTION A VETOES ({n_vetoed}): {veto_tickers}\n"
             f"(DOWN + conf >= {int(_vt * 100)}% → executor HOLD override)\n"
         )
+
+    plain_body += (
+        "\nNote: α is log-domain decimal at the 21d horizon "
+        "(post 2026-05-09 canonical-alpha cutover; was 5d arithmetic %). "
+        "Displayed as % for readability — small magnitudes are equivalent, "
+        "tail values diverge (e.g. -10% log ≈ -9.5% arithmetic).\n"
+    )
 
     return subject, html_body, plain_body
 
