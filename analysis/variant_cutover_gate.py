@@ -333,6 +333,115 @@ def validate_cutover_gate(
     )
 
 
+def compute_realized_alpha_for_pairs(
+    pairs: list[dict],
+    horizon_days: int,
+    prices_by_ticker: dict,
+    sector_map: dict[str, str],
+) -> int:
+    """Fill ``realized_alpha`` on each pair via forward sector-neutral residual log-return.
+
+    For each (date, ticker) pair, computes the realized alpha as
+    ``log(stock_close[t+H] / stock_close[t]) - log(bench_close[t+H] / bench_close[t])``
+    where ``H = horizon_days`` and ``bench`` is the ticker's sector ETF
+    (per ``sector_map``) or SPY when no sector mapping exists. Pairs whose
+    forward window hasn't closed yet (``t+H`` past end of data) get
+    ``realized_alpha = None`` and are filtered downstream by the gate's
+    ``min_pairs`` floor.
+
+    The horizon should match the canonical fixed-horizon label
+    (``cfg.FORWARD_DAYS``) so the gate measures predictive power on the
+    institutionally-defined ground truth — if triple-barrier predictions
+    win on the fixed-21d axis, the lift is real (not measurement-axis
+    bias from grading the variant on its own training target).
+
+    Args:
+        pairs: list of dicts each carrying ``date`` (ISO YYYY-MM-DD or
+            pd.Timestamp) and ``ticker``. Mutated in place — each dict
+            gets its ``realized_alpha`` key set.
+        horizon_days: forward window in trading days (e.g., 21).
+        prices_by_ticker: ``{ticker: pd.Series of Close prices indexed
+            by trading day}``. Caller supplies — runner orchestration
+            handles the S3/ArcticDB load.
+        sector_map: ``{ticker: sector_etf_symbol}``. SPY fallback when
+            ticker not in map. The benchmark price series must be present
+            in ``prices_by_ticker`` keyed by its symbol.
+
+    Returns:
+        Number of pairs filled with a finite realized alpha (i.e., where
+        the forward window had closed). Operators/tests use this to
+        confirm enough realized data exists before invoking the gate.
+    """
+    import datetime
+    import math
+
+    import pandas as pd
+
+    n_filled = 0
+    for p in pairs:
+        date_raw = p.get("date")
+        ticker = p.get("ticker")
+        if date_raw is None or ticker is None:
+            continue
+        # Accept both ISO strings and pd.Timestamp inputs (the SF training
+        # path emits Timestamps; the CLI loads ISO strings from JSON).
+        if isinstance(date_raw, str):
+            try:
+                pred_date = pd.Timestamp(date_raw).normalize()
+            except Exception:
+                continue
+        elif isinstance(date_raw, (datetime.date, datetime.datetime, pd.Timestamp)):
+            pred_date = pd.Timestamp(date_raw).normalize()
+        else:
+            continue
+
+        stock_series = prices_by_ticker.get(ticker)
+        if stock_series is None or stock_series.empty:
+            continue
+        bench_symbol = sector_map.get(ticker, "SPY")
+        bench_series = prices_by_ticker.get(bench_symbol)
+        if bench_series is None or bench_series.empty:
+            # Fall back to SPY if the sector ETF isn't in prices_by_ticker
+            bench_series = prices_by_ticker.get("SPY")
+            if bench_series is None or bench_series.empty:
+                continue
+
+        # Find the prediction date's row in stock + bench. Use ``method='ffill'``
+        # so a non-trading day (e.g., holiday) snaps back to the prior session.
+        try:
+            stock_idx = stock_series.index.get_indexer([pred_date], method="ffill")[0]
+            bench_idx = bench_series.index.get_indexer([pred_date], method="ffill")[0]
+        except Exception:
+            continue
+        if stock_idx < 0 or bench_idx < 0:
+            continue
+
+        stock_fwd_idx = stock_idx + horizon_days
+        bench_fwd_idx = bench_idx + horizon_days
+        # Forward window hasn't closed → leave realized_alpha as None
+        if stock_fwd_idx >= len(stock_series) or bench_fwd_idx >= len(bench_series):
+            continue
+
+        try:
+            stock_t = float(stock_series.iloc[stock_idx])
+            stock_t_plus = float(stock_series.iloc[stock_fwd_idx])
+            bench_t = float(bench_series.iloc[bench_idx])
+            bench_t_plus = float(bench_series.iloc[bench_fwd_idx])
+        except Exception:
+            continue
+        if (
+            stock_t <= 0 or stock_t_plus <= 0
+            or bench_t <= 0 or bench_t_plus <= 0
+        ):
+            continue
+
+        stock_log_ret = math.log(stock_t_plus / stock_t)
+        bench_log_ret = math.log(bench_t_plus / bench_t)
+        p["realized_alpha"] = stock_log_ret - bench_log_ret
+        n_filled += 1
+    return n_filled
+
+
 def _load_prediction_history(
     bucket: str,
     n_days: int,
