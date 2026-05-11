@@ -9,14 +9,14 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow?style=flat-square)](LICENSE)
 [![Phase 2 · Reliability](https://img.shields.io/badge/Phase_2-Reliability-e9c46a?style=flat-square)](https://github.com/cipher813/alpha-engine-docs#phase-trajectory)
 
-Stacked meta-ensemble that predicts 5-day market-relative alpha for each ticker. Three Layer-1 specialized models — LightGBM momentum, LightGBM volatility, and a research-score calibrator — feed a Layer-2 Ridge meta-learner alongside research-context and raw macro features. Outputs UP/FLAT/DOWN with a confidence score and a veto gate that blocks high-confidence DOWN entries.
+Stacked meta-ensemble that predicts **21-day log-domain market-relative alpha** (`canonical_predicted_alpha` field, post-2026-05-09 cutover) for each ticker. Three Layer-1 specialized models — LightGBM momentum, LightGBM volatility, and a research-score calibrator — feed a Layer-2 Ridge meta-learner alongside research-context and raw macro features. Outputs UP/FLAT/DOWN with a confidence score and a veto gate that blocks high-confidence DOWN entries.
 
 > System overview, Step Function orchestration, and module relationships live in [`alpha-engine-docs`](https://github.com/cipher813/alpha-engine-docs). Code index lives in [`OVERVIEW.md`](OVERVIEW.md).
 
 ## What this does
 
 - **Stacked meta-ensemble** — three Layer-1 specialized models (LightGBM momentum + LightGBM volatility + research-score calibrator) plus research-context and raw macro features feed a Layer-2 Ridge meta-learner. v3.0 architecture deployed 2026-04-01.
-- **Sector-neutral training** — labels are `alpha = stock_5d_return − sector_etf_5d_return` with cross-sectional rank normalization and 5-fold walk-forward validation. Promotion gate requires both ensemble IC and per-component subsample IC to pass.
+- **Sector-neutral training** — labels are `alpha = log(stock_21d_return) − log(sector_etf_21d_return)` (canonical log-domain post-2026-05-09 cutover) with cross-sectional rank normalization and 5-fold walk-forward validation. Promotion gate requires both ensemble IC and per-component subsample IC to pass.
 - **Daily inference** — loads ensemble weights from S3, fetches prices (slim cache + daily_closes delta), recomputes features from scratch each morning so predictions shift even when the model is frozen between weekly retrains.
 - **Veto gate** — high-confidence DOWN predictions override BUY signals from Research, gating the Executor against entering declining positions. Threshold is auto-tuned weekly by the Backtester.
 - **Named-baseline discipline** — every Layer-1 component must clear an explicit named baseline before contributing to L2; the prior 4th L1 (regime classifier) was pruned 2026-04-16 after walk-forward validation showed sub-majority-class accuracy.

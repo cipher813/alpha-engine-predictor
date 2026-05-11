@@ -4,7 +4,7 @@
 
 ## Module purpose
 
-Stacked meta-ensemble that predicts 5-day market-relative alpha — three Layer-1 specialized models feeding a Layer-2 Ridge meta-learner — with a veto gate consumed by the Executor.
+Stacked meta-ensemble that predicts **21-day log-domain market-relative alpha** (`canonical_predicted_alpha` field, post-2026-05-09 cutover) — three Layer-1 specialized models feeding a Layer-2 Ridge meta-learner — with a veto gate consumed by the Executor.
 
 ## Entry points
 
