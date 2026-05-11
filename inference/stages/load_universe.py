@@ -24,18 +24,22 @@ _FALLBACK_TICKERS = [
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 
-def _read_buy_candidates_from_signals(
-    s3, bucket: str, date_str: str
-) -> list[str]:
-    """Read research's `buy_candidates` ticker list from signals.
+_CANONICAL_SIGNALS_MACRO_FIELDS = (
+    "market_regime",
+    "sector_modifiers",
+    "sector_ratings",
+)
 
-    Walks the same fallback chain `compute_coverage_delta` uses so weekday
-    runs see Saturday's signals: `signals/{date}/signals.json` →
-    `signals/latest.json`. Returns an empty list on any failure or empty
-    payload — the caller treats that as "no candidates to union".
+
+def _signals_fallback_keys(date_str: str) -> list[str]:
+    """Return S3 keys to try in priority order:
+    today's signals → prior 5 weekdays' signals → signals/latest.json.
+
+    Mirrors `compute_coverage_delta`'s lookup chain so the predictor's
+    weekday paths and the executor's coverage gate agree on which
+    research snapshot is current.
     """
     from datetime import date as _date, timedelta as _td
-    from botocore.exceptions import ClientError
 
     keys: list[str] = []
     try:
@@ -48,17 +52,61 @@ def _read_buy_candidates_from_signals(
     except Exception:
         pass
     keys.append("signals/latest.json")
+    return keys
 
-    for key in keys:
-        try:
-            obj = s3.get_object(Bucket=bucket, Key=key)
-            payload = json.loads(obj["Body"].read().decode("utf-8"))
-        except ClientError as e:
-            code = e.response.get("Error", {}).get("Code", "")
-            if code in ("NoSuchKey", "AccessDenied", "403", "404"):
-                continue
-            raise
-        except Exception:
+
+def _read_s3_signals_payload(s3, bucket: str, key: str) -> dict | None:
+    """Read a single S3 signals key. Return None on miss/permission/parse
+    error so callers can walk to the next key in the fallback chain."""
+    from botocore.exceptions import ClientError
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=key)
+        return json.loads(obj["Body"].read().decode("utf-8"))
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if code in ("NoSuchKey", "AccessDenied", "403", "404"):
+            return None
+        raise
+    except Exception:
+        return None
+
+
+def _load_signals_payload_with_fallback(
+    s3, bucket: str, date_str: str
+) -> dict:
+    """Return the first non-empty signals.json payload in the fallback
+    chain. Empty dict if nothing resolves — callers must tolerate.
+
+    Brief regime defect (2026-05-11): population/latest.json carries a
+    `market_regime` value that drifts from `signals/latest.json` (two
+    research producers, no shared source of truth — population's writer
+    today serves the pre-critic regime; signals.json carries the post-
+    critic value). Without falling back to signals.json on weekday runs
+    when today's daily snapshot doesn't exist yet, the predictor's
+    morning brief displays the pre-critic regime, and downstream
+    consumers (regime-conditional veto thresholds, sector_modifiers
+    used for sector-by-sector boost) see drift. This helper exists so
+    every load path in the file shares one fallback chain.
+    """
+    for key in _signals_fallback_keys(date_str):
+        payload = _read_s3_signals_payload(s3, bucket, key)
+        if payload:
+            return payload
+    return {}
+
+
+def _read_buy_candidates_from_signals(
+    s3, bucket: str, date_str: str
+) -> list[str]:
+    """Read research's `buy_candidates` ticker list from signals.
+
+    Walks the same fallback chain `compute_coverage_delta` uses so weekday
+    runs see Saturday's signals. Returns an empty list on any failure or
+    empty payload — the caller treats that as "no candidates to union".
+    """
+    for key in _signals_fallback_keys(date_str):
+        payload = _read_s3_signals_payload(s3, bucket, key)
+        if payload is None:
             continue
         candidates = payload.get("buy_candidates") or []
         tickers: list[str] = []
@@ -74,14 +122,42 @@ def _read_buy_candidates_from_signals(
     return []
 
 
+def _merge_canonical_macro_into(
+    data: dict, signals_payload: dict
+) -> dict:
+    """Overlay canonical macro fields (market_regime, sector_modifiers,
+    sector_ratings) from signals.json onto a payload that lacks them or
+    holds drift. Returns ``data`` mutated in place for caller chaining.
+
+    Canonical source: research's macro_agent writes the post-critic
+    regime to signals.json on Saturday runs. population/latest.json is
+    written by a separate producer that today does not propagate the
+    critic-revised regime nor sector_modifiers, so weekday morning
+    briefs render whichever value population happens to carry.
+
+    Overlay semantics: signals fields with a non-None value win. A
+    None / missing key in signals leaves whatever was on the population
+    payload intact — never blank out a real value with absence.
+    """
+    for field in _CANONICAL_SIGNALS_MACRO_FIELDS:
+        value = signals_payload.get(field)
+        if value is not None:
+            data[field] = value
+    return data
+
+
 # ── Universe functions (migrated from daily_predict.py) ──────────────────────
 
 def get_universe_tickers(
     s3_bucket: str, date_str: Optional[str] = None,
 ) -> tuple[list[str], dict]:
     """
-    Read the active ticker universe from today's signals.json in S3.
-    Falls back to _FALLBACK_TICKERS if signals.json is not available.
+    Read the active ticker universe from signals.json in S3, walking
+    the fallback chain (today → prior 5 weekdays → signals/latest.json)
+    so weekday runs see the most recent Saturday SF snapshot.
+
+    Falls back to ``_FALLBACK_TICKERS`` only when no signals payload
+    resolves anywhere in the chain.
 
     Parameters
     ----------
@@ -95,25 +171,27 @@ def get_universe_tickers(
     if date_str is None:
         date_str = datetime.now().strftime("%Y-%m-%d")
 
-    signals_key = f"signals/{date_str}/signals.json"
-
     try:
         import boto3
         s3 = boto3.client("s3")
-        obj = s3.get_object(Bucket=s3_bucket, Key=signals_key)
-        signals_data = json.loads(obj["Body"].read().decode("utf-8"))
-
-        # signals.json has a top-level "signals" list with per-ticker records
-        signals_list = signals_data.get("signals", [])
+        signals_data = _load_signals_payload_with_fallback(
+            s3, s3_bucket, date_str
+        )
+        signals_list = signals_data.get("signals", []) if signals_data else []
         tickers = [s["ticker"] for s in signals_list if "ticker" in s]
-
         if tickers:
-            log.info("Universe: %d tickers from %s", len(tickers), signals_key)
+            log.info(
+                "Universe: %d tickers from signals fallback chain", len(tickers)
+            )
             return tickers, signals_data
-        else:
-            log.warning("signals.json found but no tickers extracted — using fallback")
+        log.warning(
+            "Universe: signals payload empty / no tickers extractable — "
+            "using fallback universe"
+        )
     except Exception as exc:
-        log.info("Could not read signals.json (%s) — using fallback universe", exc)
+        log.info(
+            "Universe: signals load failed (%s) — using fallback universe", exc
+        )
 
     log.info("Using fallback universe: %d tickers", len(_FALLBACK_TICKERS))
     return _FALLBACK_TICKERS, {}
@@ -196,6 +274,23 @@ def load_watchlist(
                         "(%d new beyond population)",
                         len(buy_tickers), len(new_tickers),
                     )
+                # Overlay canonical macro fields from signals.json so the
+                # morning brief / veto-threshold logic see the post-critic
+                # regime that research's macro_agent wrote, not whatever
+                # population/latest.json's writer happened to ship. See
+                # _merge_canonical_macro_into for the multi-writer history.
+                signals_payload = _load_signals_payload_with_fallback(
+                    s3, s3_bucket, date_str
+                )
+                if signals_payload:
+                    pre = data.get("market_regime")
+                    _merge_canonical_macro_into(data, signals_payload)
+                    post = data.get("market_regime")
+                    if pre != post:
+                        log.info(
+                            "Watchlist: overlaid market_regime from signals "
+                            "(population had %r → signals has %r)", pre, post,
+                        )
                 tickers = sorted(sources.keys())
                 log.info(
                     "Watchlist: loaded %d tickers from population/latest.json"
