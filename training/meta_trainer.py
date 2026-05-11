@@ -2384,7 +2384,37 @@ def run_meta_training(
         # Tier 1 regime model ships with its own promotion gate + metrics.
         "research_calibrator_n": prod_calibrator._n_samples,
         "research_calibrator_metrics": prod_calibrator.metrics(),
+        # ── Meta-model IC fields ────────────────────────────────────────
+        # `meta_model_ic` + `meta_model_in_sample_ic` both hold the L2
+        # Ridge's IN-SAMPLE Pearson fit — `np.corrcoef(model.predict(X), y)`
+        # over the same pooled-OOF rows the Ridge was just fit on (see
+        # model/meta_model.py:149-151, no held-out split inside the
+        # Ridge fit step). Expect ~3× shrinkage to true OOS.
+        #
+        # `meta_model_oos_ic` is the honest reference: walk-forward
+        # Spearman at the active label horizon (cfg.FORWARD_DAYS),
+        # sourced from horizon_diagnostic.curve.{H}d.spearman just below.
+        # Downstream consumers (alpha-engine-backtester production_health
+        # retrain-alert plumbing, dashboard panels) MUST read
+        # meta_model_oos_ic for degradation comparisons. The
+        # _in_sample alias is published so the deprecation is
+        # explicit in the schema; the unsuffixed key is preserved for
+        # backward compat per S3 contract safety (additive only).
+        #
+        # Surfaced 2026-05-11 from the false-positive retrain alert
+        # (rolling Pearson -0.10 vs reference 0.4634 → -22% ic_ratio →
+        # HIGH-severity degradation flag). Consumer-side fix:
+        # alpha-engine-backtester PR #181.
         "meta_model_ic": round(meta_model._val_ic, 6),
+        "meta_model_in_sample_ic": round(meta_model._val_ic, 6),
+        "meta_model_oos_ic": (
+            round(float(horizon_ics[f"{cfg.FORWARD_DAYS}d"]["spearman"]), 6)
+            if (
+                f"{cfg.FORWARD_DAYS}d" in horizon_ics
+                and np.isfinite(horizon_ics[f"{cfg.FORWARD_DAYS}d"]["spearman"])
+            )
+            else None
+        ),
         "meta_coefficients": meta_model._coefficients,
         "meta_importance": meta_model._importance,
         "horizon_diagnostic": {
