@@ -916,11 +916,33 @@ def run(ctx: PipelineContext) -> None:
     market_regime = ctx.signals_data.get("market_regime", "") if ctx.signals_data else ""
     veto_thresh = get_veto_threshold(ctx.bucket, market_regime=market_regime)
 
+    # Veto fires only when the model is BOTH bearish AND confident.
+    # The confidence floor restores the 3-class veto semantic on binary
+    # output: with ``p_flat = 0`` (PR #N+inference/run_inference.py:676),
+    # every prediction is forced into UP or DOWN even when the underlying
+    # alpha estimate is near zero. Without the confidence gate, low-
+    # confidence DOWN predictions (which a 3-class model would have left
+    # in the FLAT mass) fire ``gbm_veto`` and over-block research's ENTER
+    # candidates. 2026-05-11 incident: 15 of 30 vetos fired with mean
+    # DOWN confidence 0.749; 8 of 28 research ENTERs blocked via predictor.
+    #
+    # The threshold is regime-adapted via ``get_veto_threshold`` (bull +0.05,
+    # bear -0.10, …), sourced from ``config/predictor_params.json``'s
+    # ``veto_confidence`` field with ``cfg.MIN_CONFIDENCE`` (0.65) fallback.
+    # Prior to this change the ``veto_thresh`` value was computed but only
+    # consumed for the ``n_high_confidence`` metric — dead code w.r.t. the
+    # actual veto decision.
     n_preds = len(ctx.predictions)
     for p in ctx.predictions:
         cr = p.get("combined_rank")
         alpha = p.get("predicted_alpha", 0) or 0
-        p["gbm_veto"] = (alpha < 0 and cr is not None and cr > n_preds / 2)
+        confidence = p.get("prediction_confidence", 0) or 0
+        p["gbm_veto"] = (
+            alpha < 0
+            and cr is not None
+            and cr > n_preds / 2
+            and confidence >= veto_thresh
+        )
 
     # ── Write predictions ────────────────────────────────────────────────────
     write_predictions(ctx.predictions, ctx.date_str, ctx.bucket, metrics,
