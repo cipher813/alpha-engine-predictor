@@ -269,11 +269,11 @@ class TestDefensivePaths:
         assert abs(sum(loadings.values()) - 1.0) < 1e-3
 
 
-class TestStanceLiteralLocalVocabulary:
-    """The local StanceLiteral re-declaration must match the lib's
-    closed set."""
+class TestStanceVocabularyContract:
+    """The StanceLiteral imported from alpha-engine-lib must keep the
+    4-element closed set the predictor's heuristic was calibrated on."""
 
-    def test_local_vocabulary_matches_arc_taxonomy(self):
+    def test_lib_vocabulary_matches_arc_taxonomy(self):
         import typing
         args = typing.get_args(StanceLiteral)
         assert args == ("momentum", "value", "quality", "catalyst")

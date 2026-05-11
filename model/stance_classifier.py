@@ -35,21 +35,11 @@ weekly from then.
 from __future__ import annotations
 
 import math
-from typing import Any, Literal
+from typing import Any
 
 import numpy as np
 
-# StanceLiteral lives in alpha-engine-lib v0.9.0+ (predictor pin to be
-# bumped after lib v0.9.1 ships with StanceLoadings). Local
-# re-declaration here lets this PR ship without blocking on the lib
-# pin-bump dance; after the pin update, swap to:
-#
-#     from alpha_engine_lib.agent_schemas import StanceLiteral
-#
-# Test ``test_local_vocabulary_matches_arc_taxonomy`` pins the local
-# vocabulary to the canonical 4-element set.
-StanceLiteral = Literal["momentum", "value", "quality", "catalyst"]
-STANCE_NAMES: tuple[str, ...] = ("momentum", "value", "quality", "catalyst")
+from alpha_engine_lib.agent_schemas import STANCE_NAMES, StanceLiteral
 
 # Cold-start scale parameters. Each parameter sets the "width" of the
 # corresponding smooth function so a feature value at the half-point
