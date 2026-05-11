@@ -210,24 +210,37 @@ echo "  Published version: ${VERSION}"
 # ── Step 7: Canary against the new version (NOT live) ────────────────────────
 # Invoke the version directly so a broken image cannot reach the live alias.
 # If the canary fails, live keeps pointing at the prior good version.
+#
+# `aws lambda invoke` writes two streams:
+#   - the response *payload* to the file positional arg ($CANARY_OUT)
+#   - the invoke API *metadata* JSON (StatusCode / FunctionError / ExecutedVersion)
+#     to stdout
+# Unhandled Lambda exceptions set FunctionError="Unhandled" on the *metadata*
+# stream — NOT on the payload. The 2026-05-11 v138 ImportError surfaced as
+# `statusCode=0, FunctionError=` (empty) because the prior implementation
+# parsed FunctionError from the payload file and discarded stdout.
 echo ""
 echo "==> Running canary invocation against :${VERSION} (dry_run=true)..."
 CANARY_OUT=$(mktemp)
-aws lambda invoke \
+CANARY_META=$(aws lambda invoke \
   --function-name "${LAMBDA_FUNCTION}:${VERSION}" \
   --payload '{"dry_run": true}' \
   --cli-binary-format raw-in-base64-out \
   --cli-read-timeout 300 \
   --region "${AWS_REGION}" \
-  "$CANARY_OUT" > /dev/null
+  "$CANARY_OUT")
 
+CANARY_FUNC_ERR=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('FunctionError',''))" "$CANARY_META" 2>/dev/null || echo "")
 CANARY_STATUS=$(python3 -c "import json; d=json.load(open('$CANARY_OUT')); print(d.get('statusCode', 0))" 2>/dev/null || echo "0")
-CANARY_ERR=$(python3 -c "import json; d=json.load(open('$CANARY_OUT')); print(d.get('FunctionError',''))" 2>/dev/null || echo "")
+CANARY_ERR_MSG=$(python3 -c "import json; d=json.load(open('$CANARY_OUT')); print(d.get('errorMessage','') or d.get('body',''))" 2>/dev/null || echo "")
 rm -f "$CANARY_OUT"
 
-if [ "$CANARY_STATUS" != "200" ] || [ -n "$CANARY_ERR" ]; then
+if [ -n "$CANARY_FUNC_ERR" ] || [ "$CANARY_STATUS" != "200" ]; then
   echo ""
-  echo "ERROR: Canary failed (statusCode=$CANARY_STATUS, FunctionError=$CANARY_ERR) — refusing to promote :${VERSION} to live."
+  echo "ERROR: Canary failed — refusing to promote :${VERSION} to live."
+  echo "       FunctionError : ${CANARY_FUNC_ERR:-<none>}"
+  echo "       statusCode    : ${CANARY_STATUS}"
+  echo "       payload       : ${CANARY_ERR_MSG:-<empty>}"
   echo "       Live alias is unchanged. Investigate logs for function:${LAMBDA_FUNCTION} version ${VERSION}."
   exit 1
 fi
