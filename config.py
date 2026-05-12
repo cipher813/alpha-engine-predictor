@@ -437,6 +437,7 @@ MACRO_NORM_WINDOW = 252
 # S3 keys for meta-model weights
 META_WEIGHTS_PREFIX = "predictor/weights/meta/"
 META_MANIFEST_KEY = "predictor/weights/meta/manifest.json"
+META_FEATURE_LIST_KEY = "predictor/weights/meta/feature_list.json"
 
 # ── Feature engineering parameters ───────────────────────────────────────────
 FEATURE_CFG: dict = _cfg["features"]

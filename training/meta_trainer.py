@@ -476,6 +476,7 @@ def run_meta_training(
     from model.regime_predictor import RegimePredictor
     from model.research_calibrator import ResearchCalibrator
     from model.meta_model import MetaModel, META_FEATURES, MACRO_FEATURE_META_MAP
+    from model.research_gbm import RESEARCH_GBM_FEATURES
 
     start_ts = datetime.now(timezone.utc)
 
@@ -2385,6 +2386,36 @@ def run_meta_training(
                 ContentType="application/json",
             )
             log.info("Manifest written to s3://%s/%s", bucket, cfg.META_MANIFEST_KEY)
+
+            # feature_list.json — inference-universe disclosure (ROADMAP P2,
+            # added 2026-05-05; closed 2026-05-12). Single source of truth
+            # for the dashboard's Feature Store inventory page to render the
+            # production-vs-research delta (features in ArcticDB but not yet
+            # wired into inference) without parsing LightGBM .txt files.
+            # The momentum L1 is a deterministic baseline (see
+            # ``model.momentum_scorer``); its consumed-feature set is the
+            # 4-input formula, not the full ``cfg.MOMENTUM_FEATURES``
+            # subscription list.
+            feature_list = {
+                "trained_at": date_str,
+                "version": "v3.0-meta",
+                "l2_features": list(META_FEATURES),
+                "l1_features": {
+                    "momentum": ["momentum_5d", "momentum_20d",
+                                 "price_vs_ma50", "rsi_14"],
+                    "volatility": list(cfg.VOLATILITY_FEATURES),
+                    "research_calibrator": list(RESEARCH_GBM_FEATURES),
+                },
+            }
+            s3_up.put_object(
+                Bucket=bucket, Key=cfg.META_FEATURE_LIST_KEY,
+                Body=json.dumps(feature_list, indent=2).encode(),
+                ContentType="application/json",
+            )
+            log.info(
+                "Feature list written to s3://%s/%s",
+                bucket, cfg.META_FEATURE_LIST_KEY,
+            )
 
             # Track 4-of-N of audit Phase 1 horizon battery (2026-05-07):
             # persist OOS meta-rows to S3 so the standalone analysis module
