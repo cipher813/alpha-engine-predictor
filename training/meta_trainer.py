@@ -217,6 +217,67 @@ def _bootstrap_ic_ci_by_date(
     return lo, hi
 
 
+def _emit_research_join_coverage_metrics(
+    kept: int,
+    dropped_no_snapshot: int,
+    dropped_ticker_missing: int,
+) -> None:
+    """Emit CloudWatch gauges for the research-signal join's kept/dropped
+    row counts so the drop rate doesn't silently shift.
+
+    Per the ROADMAP L1465 investigation (closed 2026-05-12): dropping
+    rows where the ticker isn't in the snapshot's ``universe`` is
+    DELIBERATE — research only ranks the tracked-population universe
+    (~25 tickers), so non-population rows have no real research signal.
+    Filling with neutral defaults would reintroduce the pre-2026-04-28
+    meta-model collapse (Ridge zeros coefficients on constant-fed
+    features). See ``feedback_no_silent_fails`` in the memory store.
+
+    The gauges exist so a future regression — research universe
+    expansion/contraction, snapshot schema drift, lookup misalignment
+    — surfaces as a drop-rate shift instead of silently shrinking the
+    L2 fit corpus.
+
+    Metrics (namespace ``AlphaEngine/Predictor``):
+
+    - ``research_join_kept_count``: L2 training corpus size
+    - ``research_join_dropped_no_snapshot_count``: cold-start (test_date
+      predates first signals.json) — corpus-depth, not coverage
+    - ``research_join_dropped_ticker_missing_count``: deliberate drops
+    - ``research_join_kept_ratio``: kept / (kept + dropped_ticker_missing),
+      only meaningful within "we had a snapshot for the date"
+
+    Best-effort: CloudWatch errors WARN but never fail training. Counts
+    are already in the inline log so a failed emit leaves a paper trail.
+    """
+    denom = kept + dropped_ticker_missing
+    kept_ratio = (kept / denom) if denom > 0 else 0.0
+    try:
+        import boto3
+        cw = boto3.client("cloudwatch")
+        cw.put_metric_data(
+            Namespace="AlphaEngine/Predictor",
+            MetricData=[
+                {"MetricName": "research_join_kept_count",
+                 "Value": float(kept), "Unit": "Count"},
+                {"MetricName": "research_join_dropped_no_snapshot_count",
+                 "Value": float(dropped_no_snapshot), "Unit": "Count"},
+                {"MetricName": "research_join_dropped_ticker_missing_count",
+                 "Value": float(dropped_ticker_missing), "Unit": "Count"},
+                {"MetricName": "research_join_kept_ratio",
+                 "Value": float(kept_ratio), "Unit": "None"},
+            ],
+        )
+    except Exception as exc:  # noqa: BLE001 — observability, never block training
+        log.warning(
+            "CloudWatch research_join_* metric emit failed: %s. "
+            "Counts still surface via the inline 'Research-signal join: ...' "
+            "log; investigate the EC2 training-role IAM grant if this fires "
+            "every Saturday.",
+            exc,
+        )
+
+
 def _load_momentum_params_from_s3(bucket: str) -> dict | None:
     """Read momentum GBM params from S3 if present.
 
@@ -1223,6 +1284,13 @@ def run_meta_training(
         n_rows_dropped_no_signals_snapshot,
         n_rows_dropped_ticker_missing,
         n_rows_total,
+    )
+    # Closes ROADMAP L1465: CW gauges so the drop rate doesn't silently
+    # shift on a future research universe / snapshot-schema change.
+    _emit_research_join_coverage_metrics(
+        kept=n_rows_with_real_signals,
+        dropped_no_snapshot=n_rows_dropped_no_signals_snapshot,
+        dropped_ticker_missing=n_rows_dropped_ticker_missing,
     )
     if n_rows_with_real_signals == 0:
         raise RuntimeError(
