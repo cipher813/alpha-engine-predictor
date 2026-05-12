@@ -20,6 +20,15 @@ training:
   scheduler_patience: 5            # ReduceLROnPlateau patience
   min_lr: 1.0e-6                   # minimum learning rate
   grad_clip_norm: 1.0              # gradient clipping max norm
+  # ROADMAP L1581 diagnostic — drop pre-cutoff rows from the meta-trainer's
+  # data load. Null (default) keeps all available history. Set to e.g.
+  # "2020-03-31" to replay the pre-ArcticDB-unification training-sample range
+  # — the 2026-04-15 unification (predictor PR #27) extended the corpus back
+  # to 2019-04 and meta IC dropped 0.052 → 0.033 in the same smoke test;
+  # the hypothesis is that pre-2020 folds pull Ridge coefficients toward
+  # less-predictive averages. Diagnostic-only — promote to a permanent
+  # filter only after a Sat retrain confirms the recovery.
+  train_start_date: null           # null = all history; "YYYY-MM-DD" to clamp
 
 # ── Label thresholds ──────────────────────────────────────────────────────────
 labeling:

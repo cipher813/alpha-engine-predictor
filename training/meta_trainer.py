@@ -654,6 +654,19 @@ def run_meta_training(
             reject_empty_labeled.append(ticker)
             continue
 
+        # ROADMAP L1581 diagnostic — optional pre-cutoff drop. Applied to
+        # ``labeled`` only; ``raw_df`` (and therefore the multi-horizon
+        # shift(-N) sidecars below) keeps full history so forward labels
+        # near the filter boundary aren't distorted by an artificial
+        # front-of-window. Default ``TRAIN_START_DATE`` is None which is
+        # a no-op.
+        if cfg.TRAIN_START_DATE is not None:
+            _cutoff_ts = pd.Timestamp(cfg.TRAIN_START_DATE)
+            labeled = labeled.loc[labeled.index >= _cutoff_ts]
+            if labeled.empty:
+                reject_empty_labeled.append(ticker)
+                continue
+
         # v3.1 diagnostic (ROADMAP Predictor P2): compute multi-horizon
         # forward sector-neutral alpha alongside the 5d training label.
         # Used ONLY to evaluate the trained meta-model's IC across
@@ -2215,6 +2228,15 @@ def run_meta_training(
                 # field instead of literal "5d" / "21d" strings.
                 "forward_days": int(cfg.FORWARD_DAYS),
                 "label_domain": "canonical_log",  # vs "arithmetic_legacy" pre Track A PR 5/6
+                # ROADMAP L1581 diagnostic — the effective pre-cutoff
+                # clamp applied to the per-ticker labeled DataFrame.
+                # ``null`` when full history was used. Persisted so a
+                # clamp-vs-no-clamp comparison across Sat retrains is
+                # auditable from the manifest alone.
+                "train_start_date": (
+                    str(cfg.TRAIN_START_DATE)
+                    if cfg.TRAIN_START_DATE is not None else None
+                ),
                 "promoted": promoted,
                 "models": {
                     "momentum": {

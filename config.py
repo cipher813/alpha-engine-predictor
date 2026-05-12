@@ -169,6 +169,13 @@ SCHEDULER_FACTOR = _train_cfg["scheduler_factor"]
 SCHEDULER_PATIENCE = _train_cfg["scheduler_patience"]
 MIN_LR = float(_train_cfg["min_lr"])
 GRAD_CLIP_NORM = _train_cfg["grad_clip_norm"]
+# ROADMAP L1581 — optional cutoff for the meta-trainer's data load.
+# None (default) keeps all available history; an ISO date string
+# ("YYYY-MM-DD") drops rows dated before that boundary. Diagnostic-only:
+# set in alpha-engine-config for a single Sat retrain to compare meta IC
+# against the no-clamp run, then revert. See ROADMAP entry for the
+# 2020-03-31 vs ArcticDB-full-history hypothesis.
+TRAIN_START_DATE: str | None = _train_cfg.get("train_start_date")
 
 # ── Label thresholds ─────────────────────────────────────────────────────────
 _label_cfg = _cfg["labeling"]
