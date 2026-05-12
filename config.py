@@ -13,6 +13,8 @@ from pathlib import Path
 
 import yaml
 
+from alpha_engine_lib.secrets import get_secret
+
 # ── Load predictor config YAML ────────────────────────────────────────────────
 _CONFIG_DIR = Path(__file__).parent / "config"
 
@@ -466,9 +468,9 @@ FUNDAMENTAL_FEATURES = [
 
 # ── AWS / Email ──────────────────────────────────────────────────────────────
 AWS_REGION       = os.environ.get("AWS_REGION", "us-east-1")
-EMAIL_SENDER     = os.environ.get("EMAIL_SENDER", "")
+EMAIL_SENDER     = get_secret("EMAIL_SENDER", required=False, default="") or ""
 EMAIL_RECIPIENTS = [
     r.strip()
-    for r in os.environ.get("EMAIL_RECIPIENTS", "").split(",")
+    for r in (get_secret("EMAIL_RECIPIENTS", required=False, default="") or "").split(",")
     if r.strip()
 ]
