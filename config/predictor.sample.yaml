@@ -1,3 +1,19 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# DESCRIPTIVE / DOCUMENTATION ONLY
+#
+# Production reads the live config from alpha-engine-config/predictor/predictor.yaml
+# at runtime (bundled into the Predictor Inference Lambda via deploy.sh,
+# synced to the training spot instance via spot_train.sh). Edits to this
+# .sample file affect ONLY:
+#   1. New-environment bootstrap (copies this template to predictor.yaml), and
+#   2. Public-repo schema documentation for the predictor's config surface.
+#
+# Edits here have ZERO effect on the live system. To change a runtime value
+# or hyperparameter, the change MUST land in alpha-engine-config (separate
+# private repo). The backtester also auto-writes the veto threshold to S3 —
+# see s3://alpha-engine-research/config/predictor_params.json.
+# ─────────────────────────────────────────────────────────────────────────────
+
 # Predictor configuration — model hyperparameters, production gates, and training params.
 # Copy to predictor.yaml and customise all values below.
 # These are intentionally naive defaults — tune them to your own data.
