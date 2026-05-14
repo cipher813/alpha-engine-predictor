@@ -53,6 +53,12 @@ COPY model/ model/
 COPY inference/ inference/
 COPY training/ training/
 COPY store/ store/
+# Regime substrate (v3) — standalone submodule independent of model/.
+# Same image serves both inference Lambda (CMD=inference.handler.handler)
+# and the regime-substrate Lambda (per-function CMD override =
+# regime.handler.lambda_handler), mirroring the shared-image pattern
+# alpha-engine-research uses for eval-judge + rationale-clustering.
+COPY regime/ regime/
 
 # flow-doctor.yaml at LAMBDA_TASK_ROOT is loaded by setup_logging() at
 # module-top of inference/handler.py. The path resolves via:

@@ -24,6 +24,14 @@ set -euo pipefail
 # ── Configuration ──────────────────────────────────────────────────────────────
 ECR_REPO="alpha-engine-predictor"
 LAMBDA_FUNCTION="alpha-engine-predictor-inference"
+# Second Lambda sharing the same image, with a per-function CMD override
+# (set at Lambda creation time via --image-config Command=[...]) pointing
+# at regime.handler.lambda_handler. The Saturday SF RegimeSubstrate state
+# (alpha-engine-config) invokes this function. Mirrors the shared-image
+# pattern alpha-engine-research uses for eval-judge + rationale-clustering.
+# Skipped gracefully if the function does not yet exist (one-time create
+# is a manual operator step — see setup-regime-lambda.sh).
+REGIME_LAMBDA_FUNCTION="alpha-engine-predictor-regime-substrate"
 IMAGE_TAG="latest"
 DRY_RUN=false
 
@@ -260,10 +268,103 @@ aws lambda create-alias \
   --region "${AWS_REGION}"
 
 echo ""
-echo "==> Deploy complete!"
+echo "==> Deploy complete (inference Lambda)"
 echo "    Function : ${LAMBDA_FUNCTION}"
 echo "    Version  : ${VERSION}"
 echo "    Alias    : live → ${VERSION}"
 echo "    Image    : ${ECR_IMAGE}"
+echo ""
+
+# ── Step 9: Update regime substrate Lambda (same image, different CMD) ────────
+# The regime substrate Lambda shares the predictor ECR image but is invoked
+# with regime.handler.lambda_handler as the CMD (set once at Lambda creation
+# time, persists across update-function-code calls). Update its image to the
+# same version + canary + promote alias, mirroring the inference flow.
+#
+# Skip gracefully if the function does not exist yet — the one-time
+# operator create step (setup-regime-lambda.sh) may not have run yet on
+# fresh environments. Subsequent deploys will pick it up automatically.
+echo "==> Checking for regime substrate Lambda: ${REGIME_LAMBDA_FUNCTION}"
+if aws lambda get-function \
+     --function-name "${REGIME_LAMBDA_FUNCTION}" \
+     --region "${AWS_REGION}" \
+     --query "Configuration.FunctionName" \
+     --output text >/dev/null 2>&1; then
+  echo "  Found — updating..."
+
+  aws lambda update-function-code \
+    --function-name "${REGIME_LAMBDA_FUNCTION}" \
+    --image-uri "${ECR_IMAGE}" \
+    --region "${AWS_REGION}" \
+    --output json \
+    | python3 -c "import sys,json; d=json.load(sys.stdin); print('  FunctionArn:', d.get('FunctionArn','?')); print('  LastModified:', d.get('LastModified','?'))"
+
+  if [ -n "${LAMBDA_ENV_JSON:-}" ]; then
+    aws lambda wait function-updated --function-name "${REGIME_LAMBDA_FUNCTION}" --region "${AWS_REGION}" 2>/dev/null || sleep 5
+    aws lambda update-function-configuration \
+      --function-name "${REGIME_LAMBDA_FUNCTION}" \
+      --environment "$LAMBDA_ENV_JSON" \
+      --region "${AWS_REGION}" > /dev/null
+  fi
+
+  aws lambda wait function-updated \
+    --function-name "${REGIME_LAMBDA_FUNCTION}" \
+    --region "${AWS_REGION}"
+
+  REGIME_VERSION=$(aws lambda publish-version \
+    --function-name "${REGIME_LAMBDA_FUNCTION}" \
+    --query "Version" --output text \
+    --region "${AWS_REGION}")
+  echo "  Published regime version: ${REGIME_VERSION}"
+
+  echo "==> Running regime canary against :${REGIME_VERSION} (action=dry_run)..."
+  REGIME_CANARY_OUT=$(mktemp)
+  REGIME_CANARY_META=$(aws lambda invoke \
+    --function-name "${REGIME_LAMBDA_FUNCTION}:${REGIME_VERSION}" \
+    --payload '{"action": "dry_run"}' \
+    --cli-binary-format raw-in-base64-out \
+    --cli-read-timeout 300 \
+    --region "${AWS_REGION}" \
+    "$REGIME_CANARY_OUT")
+
+  REGIME_FUNC_ERR=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('FunctionError',''))" "$REGIME_CANARY_META" 2>/dev/null || echo "")
+  REGIME_STATUS=$(python3 -c "import json; d=json.load(open('$REGIME_CANARY_OUT')); print(d.get('statusCode', 0))" 2>/dev/null || echo "0")
+  REGIME_ERR_MSG=$(python3 -c "import json; d=json.load(open('$REGIME_CANARY_OUT')); print(d.get('errorMessage','') or d.get('body',''))" 2>/dev/null || echo "")
+  rm -f "$REGIME_CANARY_OUT"
+
+  if [ -n "$REGIME_FUNC_ERR" ] || [ "$REGIME_STATUS" != "200" ]; then
+    echo ""
+    echo "ERROR: Regime canary failed — refusing to promote :${REGIME_VERSION} to live."
+    echo "       FunctionError : ${REGIME_FUNC_ERR:-<none>}"
+    echo "       statusCode    : ${REGIME_STATUS}"
+    echo "       payload       : ${REGIME_ERR_MSG:-<empty>}"
+    echo "       Inference Lambda was already promoted; rollback regime separately if needed."
+    exit 1
+  fi
+  echo "  Regime canary passed (status=$REGIME_STATUS)"
+
+  aws lambda update-alias \
+    --function-name "${REGIME_LAMBDA_FUNCTION}" \
+    --name live \
+    --function-version "${REGIME_VERSION}" \
+    --region "${AWS_REGION}" 2>/dev/null || \
+  aws lambda create-alias \
+    --function-name "${REGIME_LAMBDA_FUNCTION}" \
+    --name live \
+    --function-version "${REGIME_VERSION}" \
+    --region "${AWS_REGION}"
+
+  echo ""
+  echo "==> Deploy complete (regime Lambda)"
+  echo "    Function : ${REGIME_LAMBDA_FUNCTION}"
+  echo "    Version  : ${REGIME_VERSION}"
+  echo "    Alias    : live → ${REGIME_VERSION}"
+  echo "    Image    : ${ECR_IMAGE}"
+else
+  echo "  NOT FOUND — skipping. Create the function once via:"
+  echo "    bash infrastructure/setup-regime-lambda.sh"
+  echo "  Subsequent deploys will update it automatically."
+fi
+
 echo ""
 echo "Rollback: bash infrastructure/rollback.sh"

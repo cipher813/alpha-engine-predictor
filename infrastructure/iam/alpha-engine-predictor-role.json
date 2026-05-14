@@ -22,7 +22,10 @@
         "logs:CreateLogStream",
         "logs:PutLogEvents"
       ],
-      "Resource": "arn:aws:logs:us-east-1:711398986525:log-group:/aws/lambda/alpha-engine-predictor-inference:*"
+      "Resource": [
+        "arn:aws:logs:us-east-1:711398986525:log-group:/aws/lambda/alpha-engine-predictor-inference:*",
+        "arn:aws:logs:us-east-1:711398986525:log-group:/aws/lambda/alpha-engine-predictor-regime-substrate:*"
+      ]
     },
     {
       "Sid": "DeployDriftProbe",
