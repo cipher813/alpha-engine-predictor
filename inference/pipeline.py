@@ -92,6 +92,13 @@ class PipelineContext:
     # ── GBM feature columns (set by run_inference) ───────────────────────────
     gbm_feature_cols: list = field(default_factory=list)
 
+    # ── Regime substrate (set by run_inference, consumed by write_output) ────
+    # Single market-wide composite intensity_z computed in run_inference's
+    # regime_features_df step. Stamped on ctx so write_output's veto path
+    # (Stage D' Wire 4) can apply a regime-conditional confidence threshold
+    # without re-running the feature panel.
+    regime_intensity_z: Optional[float] = None
+
     def near_timeout(self) -> bool:
         """Check if we're nearing the Lambda soft timeout."""
         elapsed = _time.monotonic() - self.start_ts

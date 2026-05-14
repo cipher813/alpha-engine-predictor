@@ -322,6 +322,15 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
                 # consumed by the L2 Ridge via META_FEATURES[regime_intensity_z].
                 for src_name, meta_name in REGIME_DERIVED_FEATURE_META_MAP.items():
                     macro_row_for_meta[meta_name] = float(latest_regime.get(src_name, 0.0))
+                # Stage D' Wire 4: stamp the intensity_z on the pipeline
+                # context so the veto threshold (write_output.get_veto_threshold)
+                # can apply a regime-conditional adjustment without re-running
+                # the feature panel.
+                if "intensity_z" in latest_regime.index:
+                    try:
+                        ctx.regime_intensity_z = float(latest_regime["intensity_z"])
+                    except (TypeError, ValueError):
+                        ctx.regime_intensity_z = None
                 log.info(
                     "Macro features: spy_20d_ret=%.3f spy_20d_vol=%.3f vix_lvl=%.2f "
                     "vix_slope=%.3f yc_slope=%.3f breadth=%.2f",

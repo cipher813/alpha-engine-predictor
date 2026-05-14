@@ -76,7 +76,46 @@ def _load_predictor_params_from_s3(s3_bucket: str) -> dict | None:
     return None
 
 
-def get_veto_threshold(s3_bucket: str, market_regime: str = "") -> float:
+def regime_conditional_veto_adjustment(
+    intensity_z: float | None,
+    *,
+    scale: float = 0.10,
+    cap: float = 0.20,
+) -> float:
+    """Stage D' Wire 4 — continuous regime adjustment to the veto threshold.
+
+    Maps the predictor regime substrate's composite intensity_z to an
+    additive adjustment on the base veto confidence threshold:
+      * Risk-off (intensity_z < 0): NEGATIVE adjustment → LOWER threshold
+        → more aggressive vetoing (protects capital in stress).
+      * Risk-on (intensity_z > 0): POSITIVE adjustment → HIGHER threshold
+        → more permissive (avoids missing opportunities in tailwind).
+
+    Direction matches the discrete bear/neutral/bull adjustment table
+    in ``get_veto_threshold`` — Wire 4 is the continuous version of the
+    same signal.
+
+    Math: ``intensity_z * scale`` clamped to ``[-cap, +cap]``. Defaults
+    (scale=0.10, cap=0.20) give:
+      * z=-2 → -0.20 (matches the discrete ``bear`` adjustment)
+      * z=+2 → +0.20 (twice the discrete ``bull`` adjustment, since the
+        continuous gate doesn't need to be conservative on the upside —
+        a strong risk-on reading is a stronger signal than a one-word
+        macro classification).
+      * z=±0 (neutral) → 0.00 (no adjustment).
+      * None (substrate unavail) → 0.00 (legacy behavior preserved).
+    """
+    if intensity_z is None:
+        return 0.0
+    raw = float(intensity_z) * float(scale)
+    return max(-float(cap), min(float(cap), raw))
+
+
+def get_veto_threshold(
+    s3_bucket: str,
+    market_regime: str = "",
+    regime_intensity_z: float | None = None,
+) -> float:
     """
     Return the active veto confidence threshold, adjusted by market regime.
 
@@ -89,11 +128,22 @@ def get_veto_threshold(s3_bucket: str, market_regime: str = "") -> float:
     via the linear map ``new = (old - 0.5) * 2``. Regime adjustments doubled
     to preserve the same relative pull on the new [0, 1] axis.
 
-    Regime adjustments (applied to the base threshold from S3 or config):
+    Discrete regime adjustments (applied to the base threshold from S3 or
+    config) when Stage D' Wire 4 is OFF:
       bear:    -0.20  (e.g., 0.30 → 0.10 — veto more aggressively)
       caution: -0.10  (e.g., 0.30 → 0.20)
       neutral:  0.00  (no adjustment)
       bullish: +0.10  (e.g., 0.30 → 0.40 — allow more entries)
+
+    Continuous regime adjustment (Stage D' Wire 4, regime-v3-260514):
+      When ``regime_veto_enabled=True`` in S3 predictor_params AND
+      ``regime_intensity_z`` is non-None, the continuous adjustment
+      replaces the discrete one (both encode the same regime signal —
+      one numeric, one categorical). The continuous adjustment is
+      ``intensity_z * scale`` clamped to ``[-cap, +cap]``, defaults
+      scale=0.10 cap=0.20. Direction matches the discrete table.
+
+      Default ``regime_veto_enabled=False`` ships Wire 4 dormant.
     """
     params = _load_predictor_params_from_s3(s3_bucket)
     if params and "veto_confidence" in params:
@@ -101,7 +151,29 @@ def get_veto_threshold(s3_bucket: str, market_regime: str = "") -> float:
     else:
         base = cfg.MIN_CONFIDENCE
 
-    # Regime-adaptive adjustment
+    # Wire 4 path: continuous regime adjustment via intensity_z. Replaces
+    # (does NOT layer on top of) the discrete adjustment when enabled.
+    wire4_enabled = bool(params and params.get("regime_veto_enabled", False))
+    if wire4_enabled and regime_intensity_z is not None:
+        scale = float(
+            params.get("regime_veto_scale", 0.10) if params else 0.10
+        )
+        cap = float(
+            params.get("regime_veto_cap", 0.20) if params else 0.20
+        )
+        adjustment = regime_conditional_veto_adjustment(
+            regime_intensity_z, scale=scale, cap=cap,
+        )
+        adjusted = max(0.0, min(0.80, base + adjustment))
+        if adjustment != 0.0:
+            log.info(
+                "Veto threshold regime-adjusted (Wire 4 continuous): "
+                "base=%.2f %+.3f (intensity_z=%.3f) → %.3f",
+                base, adjustment, regime_intensity_z, adjusted,
+            )
+        return adjusted
+
+    # Legacy path: discrete adjustment by qualitative regime string.
     regime = market_regime.lower().strip() if market_regime else ""
     regime_adjustments = {
         "bear": -0.20,
@@ -921,7 +993,15 @@ def run(ctx: PipelineContext) -> None:
 
     # ── Veto logic ───────────────────────────────────────────────────────────
     market_regime = ctx.signals_data.get("market_regime", "") if ctx.signals_data else ""
-    veto_thresh = get_veto_threshold(ctx.bucket, market_regime=market_regime)
+    # Stage D' Wire 4: pass intensity_z (stamped on ctx by run_inference
+    # when the regime feature panel was built). None when the panel
+    # couldn't be built — falls back to the discrete adjustment via
+    # ``market_regime``.
+    veto_thresh = get_veto_threshold(
+        ctx.bucket,
+        market_regime=market_regime,
+        regime_intensity_z=getattr(ctx, "regime_intensity_z", None),
+    )
 
     # Veto fires only when the model is BOTH bearish AND confident.
     # The confidence floor restores the 3-class veto semantic on binary
