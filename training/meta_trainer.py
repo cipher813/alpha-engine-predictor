@@ -2096,6 +2096,29 @@ def run_meta_training(
         and output_dist_gate_passed
         and stratified_gate_passed
     )
+    # Promotion-blocker reason string. Resolved from the SAME gate booleans
+    # the live `promoted` formula above uses, so it can never disagree with
+    # the actual outcome. Persisted into training_summary so downstream
+    # diagnostics ("why didn't this run promote?") don't have to re-run
+    # training to figure out which gate fired — the original heuristic in
+    # train_handler._build_failure_reason scanned walk_forward for negative
+    # medians and routinely blamed momentum even when the real blocker was
+    # output_dist or stratified, causing the 2026-05-13 incident (ROADMAP
+    # L1668) where the email said "walk-forward failed" but the actual
+    # cause was output_dist_gate_passed=False under
+    # output_distribution_gate_blocking=true.
+    _blockers: list[str] = []
+    if not meta_ic_passed:
+        _blockers.append("meta_ic")
+    if not subsample_gate_passed:
+        _blockers.append("subsample")
+    if not output_dist_gate_passed:
+        _blockers.append("output_dist")
+    if not stratified_gate_passed:
+        _blockers.append("stratified")
+    promoted_blocker_reason: str | None = (
+        None if promoted else ("+".join(_blockers) if _blockers else "unknown")
+    )
     _stratified_status = (
         "n/a" if stratified_result is None
         else ("PASS" if stratified_result.passed else "FAIL")
@@ -2659,6 +2682,30 @@ def run_meta_training(
             # it dropped OOS Spearman from 0.166 → 0.126. The component
             # stays in META_FEATURES; only the gate criterion is updated.
             "passes_wf": vol_median_ic > 0,
+        },
+        # Promotion-gate diagnostic block. Mirrors the live `promoted`
+        # formula one-to-one (meta_ic AND subsample AND output_dist AND
+        # stratified). Each gate's resolved boolean is the value actually
+        # AND'd into `promoted`; the raw `_result_passed` and `_blocking`
+        # fields preserve the upstream observation + its blocking-mode
+        # context so an OBSERVE-ONLY failure (result.passed=False,
+        # blocking=False → gate_passed=True) is distinguishable from a
+        # blocking failure (result.passed=False, blocking=True →
+        # gate_passed=False). `promoted_blocker_reason` is the +-joined
+        # list of gates that failed (None when promoted=True). See
+        # ROADMAP L1668 for the diagnostic gap this closes.
+        "promotion_gate_detail": {
+            "meta_ic_passed": bool(meta_ic_passed),
+            "meta_ic_threshold": round(float(_meta_ic_gate), 6),
+            "subsample_gate_passed": bool(subsample_gate_passed),
+            "output_dist_result_passed": bool(output_dist_result.passed),
+            "output_dist_blocking": bool(output_dist_blocking),
+            "output_dist_gate_passed": bool(output_dist_gate_passed),
+            "stratified_result_passed": (
+                bool(stratified_result.passed) if stratified_result is not None else None
+            ),
+            "stratified_gate_passed": bool(stratified_gate_passed),
+            "promoted_blocker_reason": promoted_blocker_reason,
         },
         "short_history_subsample": {
             # Momentum subsample gate retired 2026-05-09 — its L1 component

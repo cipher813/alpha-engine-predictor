@@ -330,24 +330,60 @@ def send_training_email(result: dict, date_str: str) -> bool:
     # the walk-forward validation on the momentum base model. The email
     # said "IC gate failed" when the IC gate actually passed.
     def _build_failure_reason() -> str:
+        # Prefer the authoritative gate-resolution block (added 2026-05-14
+        # to close ROADMAP L1668). `promotion_gate_detail.promoted_blocker_reason`
+        # is computed off the SAME boolean values the live `promoted` formula
+        # uses, so the email's failure-reason can never disagree with the
+        # actual blocker. Falls back to the legacy walk_forward scan only
+        # for older training_summary readers (pre-2026-05-14 archive runs).
+        gate_detail = result.get("promotion_gate_detail") or {}
+        blocker = gate_detail.get("promoted_blocker_reason")
+        if blocker:
+            # Decorate each named gate with the most informative scalar so
+            # the email reader doesn't have to S3-grep training_summary for
+            # context. The blocker string is +-joined when multiple gates
+            # fired (e.g. "meta_ic+output_dist").
+            parts: list[str] = []
+            for name in blocker.split("+"):
+                if name == "meta_ic":
+                    meta_ic_val = result.get("meta_model_ic")
+                    threshold = gate_detail.get("meta_ic_threshold")
+                    if meta_ic_val is not None and threshold is not None:
+                        parts.append(
+                            f"meta IC {meta_ic_val:+.4f} < gate {threshold:+.4f}"
+                        )
+                    else:
+                        parts.append("meta IC gate")
+                elif name == "subsample":
+                    sh = result.get("short_history_subsample") or {}
+                    vol_sh = (sh.get("volatility") or {})
+                    cic = vol_sh.get("component_ic")
+                    bic = vol_sh.get("baseline_ic")
+                    if cic is not None and bic is not None:
+                        parts.append(
+                            f"volatility subsample (component {cic:+.4f} ≤ baseline {bic:+.4f})"
+                        )
+                    else:
+                        parts.append("volatility subsample gate")
+                elif name == "output_dist":
+                    parts.append("output-distribution gate (calibrator shape)")
+                elif name == "stratified":
+                    parts.append("stratified per-regime gate")
+                else:
+                    parts.append(name)
+            return "promotion blocked: " + "; ".join(parts)
+        # Legacy fallback path for pre-2026-05-14 archive runs that lack
+        # the gate_detail block. Same heuristic as before — accurate only
+        # when walk_forward has a negative volatility median.
         wf = result.get("walk_forward") or {}
         if not wf:
             return "IC gate failed"  # fallback — no wf info available
         vol = wf.get("volatility_median_ic")
         reasons: list[str] = []
-        # Momentum dropped from WF gate 2026-05-13 — its standalone IC at 21d
-        # is ~0 but the Ridge stack extracts interaction value, so its
-        # negative median IC is no longer a "failure reason" for promotion
-        # (the L1 stays in META_FEATURES; only the gate criterion is
-        # updated). The mom_median_ic field is still populated in the
-        # training_summary for observability; it just doesn't blame.
         if vol is not None and vol <= 0:
             reasons.append(f"volatility median IC {vol:+.4f}")
         if reasons:
             return "walk-forward failed: " + ", ".join(reasons)
-        # wf section present but no negative medians — must be the
-        # in-sample IC gate or one of the subsample / output-distribution /
-        # stratified-per-regime gates.
         return "IC gate failed"
 
     promo_label = (
