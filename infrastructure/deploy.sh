@@ -32,13 +32,26 @@ LAMBDA_FUNCTION="alpha-engine-predictor-inference"
 # Skipped gracefully if the function does not yet exist (one-time create
 # is a manual operator step — see setup-regime-lambda.sh).
 REGIME_LAMBDA_FUNCTION="alpha-engine-predictor-regime-substrate"
+REGIME_LAMBDA_CMD='regime.handler.lambda_handler'
+REGIME_LAMBDA_MEMORY=1024
+REGIME_LAMBDA_TIMEOUT=300
 # Third Lambda sharing the same image: the T1 retrospective HMM smoothing
-# eval (regime-v3-260514.md §5.3.3). CMD override at creation time points
-# at regime.retrospective_eval_handler.lambda_handler. Saturday SF
+# eval (regime-v3-260514.md §5.3.3). CMD override points at
+# regime.retrospective_eval_handler.lambda_handler. Saturday SF
 # RegimeRetrospectiveEval state (alpha-engine-config) invokes this
-# function. Skipped gracefully if not yet created — one-time operator
-# step via setup-regime-retrospective-eval-lambda.sh.
+# function. Auto-created on first deploy when not yet present (see
+# Step 10 below); break-glass operator step via
+# setup-regime-retrospective-eval-lambda.sh still works.
 REGIME_EVAL_LAMBDA_FUNCTION="alpha-engine-predictor-regime-retrospective-eval"
+REGIME_EVAL_LAMBDA_CMD='regime.retrospective_eval_handler.lambda_handler'
+REGIME_EVAL_LAMBDA_MEMORY=2048
+REGIME_EVAL_LAMBDA_TIMEOUT=600
+# Lambda execution role for both regime Lambdas (and inference). Used by
+# the auto-create paths in Steps 9 + 10. The deploy IAM role
+# (github-actions-lambda-deploy) is granted iam:PassRole on
+# arn:aws:iam::*:role/alpha-engine-* with PassedToService=lambda.amazonaws.com
+# per alpha-engine-data/infrastructure/iam/github-actions-lambda-deploy.json.
+LAMBDA_EXECUTION_ROLE_NAME="alpha-engine-predictor-role"
 IMAGE_TAG="latest"
 DRY_RUN=false
 
@@ -282,22 +295,42 @@ echo "    Alias    : live → ${VERSION}"
 echo "    Image    : ${ECR_IMAGE}"
 echo ""
 
-# ── Step 9: Update regime substrate Lambda (same image, different CMD) ────────
+# ── Step 9: Update (or auto-create) regime substrate Lambda ───────────────────
 # The regime substrate Lambda shares the predictor ECR image but is invoked
-# with regime.handler.lambda_handler as the CMD (set once at Lambda creation
-# time, persists across update-function-code calls). Update its image to the
-# same version + canary + promote alias, mirroring the inference flow.
+# with regime.handler.lambda_handler as the CMD override (set at Lambda
+# creation time via --image-config Command=[...], persists across
+# update-function-code calls).
 #
-# Skip gracefully if the function does not exist yet — the one-time
-# operator create step (setup-regime-lambda.sh) may not have run yet on
-# fresh environments. Subsequent deploys will pick it up automatically.
+# Auto-create on first deploy when not yet present (deploy IAM was extended
+# 2026-05-14 with CreateFunction + CreateAlias + PassRole). Break-glass
+# operator step setup-regime-lambda.sh kept for manual provisioning.
+LAMBDA_EXECUTION_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/${LAMBDA_EXECUTION_ROLE_NAME}"
+
 echo "==> Checking for regime substrate Lambda: ${REGIME_LAMBDA_FUNCTION}"
-if aws lambda get-function \
-     --function-name "${REGIME_LAMBDA_FUNCTION}" \
-     --region "${AWS_REGION}" \
-     --query "Configuration.FunctionName" \
-     --output text >/dev/null 2>&1; then
-  echo "  Found — updating..."
+if ! aws lambda get-function \
+       --function-name "${REGIME_LAMBDA_FUNCTION}" \
+       --region "${AWS_REGION}" \
+       --query "Configuration.FunctionName" \
+       --output text >/dev/null 2>&1; then
+  echo "  NOT FOUND — auto-creating with CMD=${REGIME_LAMBDA_CMD}..."
+  aws lambda create-function \
+    --function-name "${REGIME_LAMBDA_FUNCTION}" \
+    --package-type Image \
+    --code "ImageUri=${ECR_IMAGE}" \
+    --role "${LAMBDA_EXECUTION_ROLE_ARN}" \
+    --image-config "Command=[\"${REGIME_LAMBDA_CMD}\"]" \
+    --memory-size "${REGIME_LAMBDA_MEMORY}" \
+    --timeout "${REGIME_LAMBDA_TIMEOUT}" \
+    --region "${AWS_REGION}" \
+    --output json \
+    | python3 -c "import sys,json; d=json.load(sys.stdin); print('  FunctionArn:', d.get('FunctionArn','?')); print('  State:', d.get('State','?'))"
+  aws lambda wait function-active --function-name "${REGIME_LAMBDA_FUNCTION}" --region "${AWS_REGION}"
+fi
+
+# Now the function exists either way — fall through to update + canary +
+# promote (idempotent on a freshly-created function: update-function-code
+# just no-ops if the image-uri already matches).
+echo "  Found (or freshly created) — updating..."
 
   aws lambda update-function-code \
     --function-name "${REGIME_LAMBDA_FUNCTION}" \
@@ -367,26 +400,35 @@ if aws lambda get-function \
   echo "    Version  : ${REGIME_VERSION}"
   echo "    Alias    : live → ${REGIME_VERSION}"
   echo "    Image    : ${ECR_IMAGE}"
-else
-  echo "  NOT FOUND — skipping. Create the function once via:"
-  echo "    bash infrastructure/setup-regime-lambda.sh"
-  echo "  Subsequent deploys will update it automatically."
-fi
 
 echo ""
 
-# ── Step 10: Update the regime retrospective eval Lambda image ────────────────
-#
+# ── Step 10: Update (or auto-create) regime retrospective eval Lambda ─────────
 # Same shared-image pattern as Step 9 — third Lambda function backed by the
 # same ECR image with regime.retrospective_eval_handler.lambda_handler as
-# the CMD override. Skip gracefully if not yet created.
+# the CMD override. Auto-create on first deploy when not yet present.
 echo "==> Checking for regime retrospective eval Lambda: ${REGIME_EVAL_LAMBDA_FUNCTION}"
-if aws lambda get-function \
-     --function-name "${REGIME_EVAL_LAMBDA_FUNCTION}" \
-     --region "${AWS_REGION}" \
-     --query "Configuration.FunctionName" \
-     --output text >/dev/null 2>&1; then
-  echo "  Found — updating..."
+if ! aws lambda get-function \
+       --function-name "${REGIME_EVAL_LAMBDA_FUNCTION}" \
+       --region "${AWS_REGION}" \
+       --query "Configuration.FunctionName" \
+       --output text >/dev/null 2>&1; then
+  echo "  NOT FOUND — auto-creating with CMD=${REGIME_EVAL_LAMBDA_CMD}..."
+  aws lambda create-function \
+    --function-name "${REGIME_EVAL_LAMBDA_FUNCTION}" \
+    --package-type Image \
+    --code "ImageUri=${ECR_IMAGE}" \
+    --role "${LAMBDA_EXECUTION_ROLE_ARN}" \
+    --image-config "Command=[\"${REGIME_EVAL_LAMBDA_CMD}\"]" \
+    --memory-size "${REGIME_EVAL_LAMBDA_MEMORY}" \
+    --timeout "${REGIME_EVAL_LAMBDA_TIMEOUT}" \
+    --region "${AWS_REGION}" \
+    --output json \
+    | python3 -c "import sys,json; d=json.load(sys.stdin); print('  FunctionArn:', d.get('FunctionArn','?')); print('  State:', d.get('State','?'))"
+  aws lambda wait function-active --function-name "${REGIME_EVAL_LAMBDA_FUNCTION}" --region "${AWS_REGION}"
+fi
+
+echo "  Found (or freshly created) — updating..."
 
   aws lambda update-function-code \
     --function-name "${REGIME_EVAL_LAMBDA_FUNCTION}" \
@@ -456,11 +498,6 @@ if aws lambda get-function \
   echo "    Version  : ${REGIME_EVAL_VERSION}"
   echo "    Alias    : live → ${REGIME_EVAL_VERSION}"
   echo "    Image    : ${ECR_IMAGE}"
-else
-  echo "  NOT FOUND — skipping. Create the function once via:"
-  echo "    bash infrastructure/setup-regime-retrospective-eval-lambda.sh"
-  echo "  Subsequent deploys will update it automatically."
-fi
 
 echo ""
 echo "Rollback: bash infrastructure/rollback.sh"

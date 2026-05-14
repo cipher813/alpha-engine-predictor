@@ -142,3 +142,42 @@ def test_iam_role_grants_logs_to_regime_eval_lambda_log_group() -> None:
         "IAM role's CloudWatchLogs statement must grant access to the "
         "T1 retrospective eval Lambda's log group"
     )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# deploy.sh auto-create fall-through (2026-05-14 evening). Catches a
+# refactor that re-introduces "NOT FOUND — skipping" instead of
+# auto-creating. The setup-regime-*.sh scripts are now break-glass-only.
+# ─────────────────────────────────────────────────────────────────────
+
+
+def test_deploy_sh_auto_creates_regime_substrate_when_missing() -> None:
+    """Step 9 must call ``aws lambda create-function`` on the NOT FOUND
+    branch — not just print a "skipping" message."""
+    deploy = (REPO_ROOT / "infrastructure" / "deploy.sh").read_text()
+    assert "NOT FOUND — auto-creating with CMD=${REGIME_LAMBDA_CMD}" in deploy
+    assert "aws lambda create-function" in deploy
+    # Both Lambdas must reference the execution role for PassRole
+    assert "LAMBDA_EXECUTION_ROLE_ARN" in deploy
+
+
+def test_deploy_sh_auto_creates_regime_eval_when_missing() -> None:
+    """Step 10 must call ``aws lambda create-function`` on the
+    NOT FOUND branch (T1 retrospective eval Lambda)."""
+    deploy = (REPO_ROOT / "infrastructure" / "deploy.sh").read_text()
+    assert "NOT FOUND — auto-creating with CMD=${REGIME_EVAL_LAMBDA_CMD}" in deploy
+    # The same Step-10 block references the eval-specific CMD + memory + timeout
+    assert "REGIME_EVAL_LAMBDA_CMD" in deploy
+    assert "REGIME_EVAL_LAMBDA_MEMORY" in deploy
+    assert "REGIME_EVAL_LAMBDA_TIMEOUT" in deploy
+
+
+def test_deploy_sh_no_longer_directs_operator_to_setup_scripts() -> None:
+    """Post auto-create patch, deploy.sh should not direct operators
+    to run the setup scripts as a required step. The scripts remain
+    in the repo for break-glass; deploy.sh's failure path should
+    surface the actual AWS error, not punt to a manual workflow."""
+    deploy = (REPO_ROOT / "infrastructure" / "deploy.sh").read_text()
+    # The substantive anti-pattern is the "NOT FOUND — skipping. Create the
+    # function once via:" stanza — pin that exact wording is gone.
+    assert "NOT FOUND — skipping. Create the function once via:" not in deploy
