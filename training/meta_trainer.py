@@ -2505,6 +2505,21 @@ def run_meta_training(
         # Tier 1 regime model ships with its own promotion gate + metrics.
         "research_calibrator_n": prod_calibrator._n_samples,
         "research_calibrator_metrics": prod_calibrator.metrics(),
+        # ResearchGBMScorer is the canonical source for
+        # research_calibrator_prob META_FEATURE (Phase 3 PR 4/5 cutover
+        # 2026-05-09). val_ic is the honest held-out 20%-OOS measurement;
+        # train_ic is paired so a widening train_ic/val_ic gap
+        # (> ~2× ratio is the typical overfitting signal) surfaces
+        # without manifest spelunking. None when the GBM wasn't fit
+        # (n_finite < 100 finite-label rows in oos_meta_rows).
+        "research_gbm_val_ic": (
+            round(prod_research_gbm._val_ic, 6)
+            if prod_research_gbm is not None else None
+        ),
+        "research_gbm_train_ic": (
+            round(research_gbm_train_ic, 6)
+            if research_gbm_train_ic is not None else None
+        ),
         # ── Meta-model IC fields ────────────────────────────────────────
         # `meta_model_ic` + `meta_model_in_sample_ic` both hold the L2
         # Ridge's IN-SAMPLE Pearson fit — `np.corrcoef(model.predict(X), y)`
@@ -2620,7 +2635,15 @@ def run_meta_training(
             "volatility_median_ic": round(vol_median_ic, 6),
             "n_folds": len(folds),
             "folds": fold_results,
-            "passes_wf": mom_median_ic > 0 and vol_median_ic > 0,
+            # Momentum dropped from the WF promotion gate 2026-05-13. Per
+            # scripts/momentum_ic_study_21d.py + the post-retire spot run
+            # delta (~/Development/alpha-engine-docs/private/
+            # momentum_l1_retirement-260513.md), momentum's standalone IC
+            # at the canonical 21d horizon is ~0 but its Ridge-stack
+            # interaction value carries measurable OOS signal — removing
+            # it dropped OOS Spearman from 0.166 → 0.126. The component
+            # stays in META_FEATURES; only the gate criterion is updated.
+            "passes_wf": vol_median_ic > 0,
         },
         "short_history_subsample": {
             # Momentum subsample gate retired 2026-05-09 — its L1 component

@@ -137,12 +137,93 @@ def _build_ic_table_html(result, is_meta, ic_color, ic_label, promoted_mode,
     rows = '<table style="border-collapse:collapse; width:100%; margin-bottom:12px;">'
 
     if is_meta:
-        meta_ic = result.get("meta_model_ic", test_ic)
-        mom_ic = result.get("momentum_test_ic", mse_ic)
-        vol_ic = result.get("volatility_test_ic", 0)
-        rows += _row("Meta-Model IC", f'{meta_ic:.4f}', bg=True)
-        rows += _row("Momentum IC", f'{mom_ic:.4f}')
-        rows += _row("Volatility IC", f'{vol_ic:.4f}', bg=True)
+        # ── Headline ICs are OOS (held-out) per 2026-05-13 email facelift ──
+        # Pre-facelift the email led with the L2 Ridge's IN-SAMPLE Pearson
+        # (e.g. 0.4634) — `np.corrcoef(model.predict(X), y)` over the same
+        # pooled-OOF rows the Ridge just fit on. PR #133 added the honest
+        # OOS field; this rewrite makes it the headline. The in-sample
+        # value rides underneath as a secondary line for context.
+        #
+        # Meta-Model OOS IC sources:
+        #   1. meta_model_oos_ic (top-level, populated PR #133 onward)
+        #   2. horizon_diagnostic.curve.21d.spearman (fallback)
+        #   3. None — no OOS measurement, fall back to in-sample with a
+        #      "(in-sample — no OOS reference)" caveat.
+        hd = result.get("horizon_diagnostic") or {}
+        curve = hd.get("curve") or {}
+        h21 = curve.get("21d") or {}
+        meta_oos_ic = result.get("meta_model_oos_ic")
+        if meta_oos_ic is None:
+            meta_oos_ic = h21.get("spearman")
+        meta_in_sample = result.get("meta_model_in_sample_ic") or result.get(
+            "meta_model_ic", test_ic
+        )
+        meta_oos_ci_lo = h21.get("spearman_ci_lo")
+        meta_oos_ci_hi = h21.get("spearman_ci_hi")
+
+        if meta_oos_ic is not None:
+            ci_str = (
+                f' [95% CI {meta_oos_ci_lo:+.4f}, {meta_oos_ci_hi:+.4f}]'
+                if meta_oos_ci_lo is not None and meta_oos_ci_hi is not None
+                else ""
+            )
+            rows += _row("Meta-Model OOS IC (Spearman 21d)",
+                         f'{meta_oos_ic:+.4f}{ci_str}', bg=True)
+            rows += _row("Meta-Model in-sample IC (reference)",
+                         f'{meta_in_sample:+.4f}')
+        else:
+            rows += _row("Meta-Model IC (in-sample — no OOS reference)",
+                         f'{meta_in_sample:+.4f}', bg=True)
+
+        # Volatility OOS IC: walk-forward median across 16 held-out folds
+        # is the honest OOS measurement. Falls back to held-out test_ic
+        # if walk_forward isn't populated (legacy summaries).
+        wf = result.get("walk_forward") or {}
+        vol_oos_median = wf.get("volatility_median_ic")
+        if vol_oos_median is not None:
+            rows += _row("Volatility OOS IC (WF median, 16 folds)",
+                         f'{vol_oos_median:+.4f}', bg=False)
+        else:
+            vol_ic = result.get("volatility_test_ic", 0)
+            rows += _row("Volatility IC (held-out)", f'{vol_ic:+.4f}', bg=False)
+
+        # Research GBM OOS IC — exposed at top level per the 2026-05-13
+        # email facelift. ResearchGBMScorer is the canonical source for
+        # research_calibrator_prob META_FEATURE (Phase 3 PR 4/5 cutover
+        # 2026-05-09). val_ic is the held-out 20%-OOS measurement; the
+        # train_ic appears parenthetically so a widening train/val gap
+        # (~2× ratio is the typical overfitting signal) surfaces inline.
+        res_val = result.get("research_gbm_val_ic")
+        res_train = result.get("research_gbm_train_ic")
+        res_n = result.get("research_calibrator_n", 0)
+        if res_val is not None:
+            train_suffix = (
+                f' (train_ic {res_train:+.4f})'
+                if res_train is not None else ""
+            )
+            rows += _row("Research OOS IC (GBM val, held-out 20%)",
+                         f'{res_val:+.4f}{train_suffix}', bg=True)
+        else:
+            # Bucket-lookup fallback (no GBM fit this cycle). Surface the
+            # calibrator hit-rate instead of an IC.
+            res_metrics = result.get("research_calibrator_metrics") or {}
+            res_hr = res_metrics.get("overall_hit_rate")
+            if res_hr is not None:
+                rows += _row("Research signal (bucket lookup)",
+                             f'hit_rate={res_hr:.4f} (n={res_n})', bg=True)
+
+        # Momentum L1 is the deterministic weighted-blend baseline — there's
+        # no GBM fit IC. The WF median IC is observability-only post the
+        # 2026-05-13 gate change (per IC study, momentum standalone IC at
+        # 21d ≈ 0 but contributes Ridge-stack interaction value). Surface
+        # it dimmed so operators can spot regression without it being read
+        # as a headline.
+        mom_wf = wf.get("momentum_median_ic")
+        if mom_wf is not None:
+            rows += _row("Momentum WF median IC (observability)",
+                         f'<span style="color:#888;">{mom_wf:+.4f} '
+                         f'(deterministic baseline; not gating)</span>',
+                         bg=False)
         # Regime classifier removed from the critical path 2026-04-16 (Tier 0
         # model retired; raw macro features now feed the ridge directly).
         # Tier 1 regime model will re-introduce regime rows here when it
@@ -252,17 +333,21 @@ def send_training_email(result: dict, date_str: str) -> bool:
         wf = result.get("walk_forward") or {}
         if not wf:
             return "IC gate failed"  # fallback — no wf info available
-        mom = wf.get("momentum_median_ic")
         vol = wf.get("volatility_median_ic")
         reasons: list[str] = []
-        if mom is not None and mom <= 0:
-            reasons.append(f"momentum median IC {mom:+.4f}")
+        # Momentum dropped from WF gate 2026-05-13 — its standalone IC at 21d
+        # is ~0 but the Ridge stack extracts interaction value, so its
+        # negative median IC is no longer a "failure reason" for promotion
+        # (the L1 stays in META_FEATURES; only the gate criterion is
+        # updated). The mom_median_ic field is still populated in the
+        # training_summary for observability; it just doesn't blame.
         if vol is not None and vol <= 0:
             reasons.append(f"volatility median IC {vol:+.4f}")
         if reasons:
             return "walk-forward failed: " + ", ".join(reasons)
         # wf section present but no negative medians — must be the
-        # in-sample IC gate that failed
+        # in-sample IC gate or one of the subsample / output-distribution /
+        # stratified-per-regime gates.
         return "IC gate failed"
 
     promo_label = (
@@ -280,9 +365,26 @@ def send_training_email(result: dict, date_str: str) -> bool:
     cal_metrics  = result.get("calibration")
     mh_data      = result.get("multi_horizon")
 
+    # Subject IC: prefer OOS Spearman over in-sample Ridge fit. PR #133's
+    # meta_model_oos_ic field is the honest measurement; fall back to the
+    # horizon_diagnostic curve at the active forward horizon, then to
+    # in-sample as a last resort (with explicit "(in-sample)" suffix so
+    # the deprecation is visible in subject-line search results).
+    if is_meta:
+        _subj_oos = result.get("meta_model_oos_ic")
+        if _subj_oos is None:
+            _subj_oos = (
+                (result.get("horizon_diagnostic") or {}).get("curve") or {}
+            ).get("21d", {}).get("spearman")
+        if _subj_oos is not None:
+            _subj_ic_text = f"Meta OOS IC {_subj_oos:+.4f}"
+        else:
+            _subj_ic_text = f"Meta IC {test_ic:+.4f} (in-sample)"
+    else:
+        _subj_ic_text = f"IC {test_ic:.4f}"
     subject = (
         f"Alpha Engine Training | {date_str} | "
-        f"{'Meta IC' if is_meta else 'IC'} {test_ic:.4f} {status_str} | "
+        f"{_subj_ic_text} {status_str} | "
         f"{'Promoted (' + promoted_mode + ')' if promoted else 'Not promoted'}"
     )
 
@@ -327,12 +429,26 @@ def send_training_email(result: dict, date_str: str) -> bool:
                 f'</tr>'
                 for i, f in enumerate(wf_data["folds"])
             )
+            # Walk-forward header — vol gate result + momentum observability.
+            # Per the 2026-05-13 gate change, only vol gates promotion;
+            # momentum WF median is informational (the L1 stays in the
+            # Ridge for interaction value but is not gated).
+            mom_fmt = (
+                f'{mom_median:+.4f}'
+                if isinstance(mom_median, (int, float)) else str(mom_median)
+            )
+            vol_fmt = (
+                f'{vol_median:+.4f}'
+                if isinstance(vol_median, (int, float)) else str(vol_median)
+            )
             wf_html = (
                 f'<h3 style="margin-top:16px; margin-bottom:4px;">Walk-Forward Validation '
                 f'({len(wf_data["folds"])} folds)</h3>'
-                f'<p style="font-size:12px; margin:2px 0;">Momentum median IC: <b>{mom_median}</b> '
-                f'&nbsp;|&nbsp; Volatility median IC: <b>{vol_median}</b> '
-                f'&nbsp;|&nbsp; Status: <b style="color:{wf_color};">{wf_label}</b></p>'
+                f'<p style="font-size:12px; margin:2px 0;">'
+                f'Volatility median IC: <b>{vol_fmt}</b> '
+                f'&nbsp;|&nbsp; Status: <b style="color:{wf_color};">{wf_label}</b>'
+                f'<br><span style="color:#888;">Momentum median IC (observability, '
+                f'not gating): {mom_fmt}</span></p>'
                 f'<table style="border-collapse:collapse; width:100%; font-size:11px;">'
                 f'<tr style="background:#e0e0e0;">'
                 f'<th style="padding:3px 6px;">Fold</th>'
@@ -344,11 +460,11 @@ def send_training_email(result: dict, date_str: str) -> bool:
             )
             wf_plain = (
                 f"\n--- Walk-Forward ({len(wf_data['folds'])} folds) ---"
-                f"\nMomentum median IC: {mom_median}  |  Volatility median IC: {vol_median}"
-                f"\nStatus: {wf_label}\n"
+                f"\nVolatility median IC: {vol_fmt}  |  Status: {wf_label}"
+                f"\nMomentum median IC (observability, not gating): {mom_fmt}\n"
                 + "\n".join(
                     f"  Fold {f['fold']}: [{f['test_start']} → {f['test_end']}] "
-                    f"mom={f.get('mom_ic', 0):.4f}  vol={f.get('vol_ic', 0):.4f}"
+                    f"mom={f.get('mom_ic', 0):+.4f}  vol={f.get('vol_ic', 0):+.4f}"
                     for f in wf_data["folds"]
                 ) + "\n"
             )
@@ -547,8 +663,13 @@ def send_training_email(result: dict, date_str: str) -> bool:
         # cfg.WF_MEDIAN_IC_GATE + WF_MIN_FOLDS_POSITIVE. Describe
         # whichever one actually gates this run.
         + (
-            f'IC gate: ≥{cfg.MIN_IC:.2f} meta IC to promote &nbsp;|&nbsp; '
-            f'Walk-forward: momentum &amp; volatility median IC both &gt; 0</p>'
+            # 2026-05-13 facelift: walk-forward gate dropped momentum check.
+            # Momentum's standalone IC at 21d ≈ 0 (per IC study) but the
+            # Ridge stack extracts interaction value, so the L1 stays in
+            # META_FEATURES while the gate only requires vol median > 0.
+            # Subject + headline ICs are OOS (Spearman 21d) per PR #133.
+            f'IC gate: ≥{cfg.MIN_IC:.2f} in-sample meta IC to promote &nbsp;|&nbsp; '
+            f'Walk-forward: volatility median IC &gt; 0 (momentum observability-only)</p>'
             if is_meta else
             f'IC gate: ≥{cfg.MIN_IC:.2f} to promote &nbsp;|&nbsp; '
             f'Walk-forward: median IC ≥{cfg.WF_MEDIAN_IC_GATE:.2f}, '
@@ -558,16 +679,74 @@ def send_training_email(result: dict, date_str: str) -> bool:
     )
 
     if is_meta:
-        meta_ic = result.get("meta_model_ic", test_ic)
-        mom_ic = result.get("momentum_test_ic", mse_ic)
-        vol_ic_val = result.get("volatility_test_ic", 0)
+        # ── Plain-text body: mirror the HTML facelift (OOS-headline) ──
+        _hd = result.get("horizon_diagnostic") or {}
+        _curve = _hd.get("curve") or {}
+        _h21 = _curve.get("21d") or {}
+        _meta_oos = (
+            result.get("meta_model_oos_ic")
+            or _h21.get("spearman")
+        )
+        _meta_in_sample = (
+            result.get("meta_model_in_sample_ic")
+            or result.get("meta_model_ic", test_ic)
+        )
+        _ci_lo = _h21.get("spearman_ci_lo")
+        _ci_hi = _h21.get("spearman_ci_hi")
+        _ci_text = (
+            f" [95% CI {_ci_lo:+.4f}, {_ci_hi:+.4f}]"
+            if _ci_lo is not None and _ci_hi is not None else ""
+        )
+        _meta_oos_line = (
+            f"Meta-Model OOS IC (Spearman 21d): {_meta_oos:+.4f}{_ci_text} — {ic_label}"
+            if _meta_oos is not None else
+            f"Meta-Model IC (in-sample, no OOS reference): {_meta_in_sample:+.4f} — {ic_label}"
+        )
+
+        _wf = result.get("walk_forward") or {}
+        _vol_oos_median = _wf.get("volatility_median_ic")
+        _vol_oos_line = (
+            f"Volatility OOS IC (WF median, 16 folds): {_vol_oos_median:+.4f}"
+            if _vol_oos_median is not None
+            else f"Volatility IC (held-out): {result.get('volatility_test_ic', 0):+.4f}"
+        )
+
+        _res_val = result.get("research_gbm_val_ic")
+        _res_train = result.get("research_gbm_train_ic")
+        if _res_val is not None:
+            _train_suffix = (
+                f" (train_ic {_res_train:+.4f})" if _res_train is not None else ""
+            )
+            _research_line = (
+                f"Research OOS IC (GBM val, held-out 20%): "
+                f"{_res_val:+.4f}{_train_suffix}"
+            )
+        else:
+            _res_metrics = result.get("research_calibrator_metrics") or {}
+            _res_hr = _res_metrics.get("overall_hit_rate")
+            _res_n = result.get("research_calibrator_n", 0)
+            _research_line = (
+                f"Research signal (bucket lookup): hit_rate={_res_hr:.4f} (n={_res_n})"
+                if _res_hr is not None else "Research signal: n/a"
+            )
+
+        _mom_wf_median = _wf.get("momentum_median_ic")
+        _mom_line = (
+            f"Momentum WF median IC (observability, not gating): "
+            f"{_mom_wf_median:+.4f}"
+            if _mom_wf_median is not None else
+            "Momentum: deterministic baseline (no GBM fit IC)"
+        )
+
         plain_body = (
             f"Alpha Engine Training — {date_str}\n"
             f"Model: {version}  Samples: {n_train:,}  Elapsed: {elapsed_s:.0f}s\n"
-            f"\nMeta-Model IC:      {meta_ic:.4f} — {ic_label}"
-            f"\nMomentum IC:        {mom_ic:.4f}"
-            f"\nVolatility IC:      {vol_ic_val:.4f}"
-            f"\nPromotion:          {promo_label}\n"
+            f"\n{_meta_oos_line}"
+            f"\nMeta-Model in-sample IC (reference): {_meta_in_sample:+.4f}"
+            f"\n{_vol_oos_line}"
+            f"\n{_research_line}"
+            f"\n{_mom_line}"
+            f"\nPromotion: {promo_label}\n"
             f"{wf_plain}"
         )
         coefs = result.get("meta_coefficients", {})
