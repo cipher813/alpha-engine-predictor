@@ -252,17 +252,21 @@ def send_training_email(result: dict, date_str: str) -> bool:
         wf = result.get("walk_forward") or {}
         if not wf:
             return "IC gate failed"  # fallback — no wf info available
-        mom = wf.get("momentum_median_ic")
         vol = wf.get("volatility_median_ic")
         reasons: list[str] = []
-        if mom is not None and mom <= 0:
-            reasons.append(f"momentum median IC {mom:+.4f}")
+        # Momentum dropped from WF gate 2026-05-13 — its standalone IC at 21d
+        # is ~0 but the Ridge stack extracts interaction value, so its
+        # negative median IC is no longer a "failure reason" for promotion
+        # (the L1 stays in META_FEATURES; only the gate criterion is
+        # updated). The mom_median_ic field is still populated in the
+        # training_summary for observability; it just doesn't blame.
         if vol is not None and vol <= 0:
             reasons.append(f"volatility median IC {vol:+.4f}")
         if reasons:
             return "walk-forward failed: " + ", ".join(reasons)
         # wf section present but no negative medians — must be the
-        # in-sample IC gate that failed
+        # in-sample IC gate or one of the subsample / output-distribution /
+        # stratified-per-regime gates.
         return "IC gate failed"
 
     promo_label = (

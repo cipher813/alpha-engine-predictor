@@ -2620,7 +2620,15 @@ def run_meta_training(
             "volatility_median_ic": round(vol_median_ic, 6),
             "n_folds": len(folds),
             "folds": fold_results,
-            "passes_wf": mom_median_ic > 0 and vol_median_ic > 0,
+            # Momentum dropped from the WF promotion gate 2026-05-13. Per
+            # scripts/momentum_ic_study_21d.py + the post-retire spot run
+            # delta (~/Development/alpha-engine-docs/private/
+            # momentum_l1_retirement-260513.md), momentum's standalone IC
+            # at the canonical 21d horizon is ~0 but its Ridge-stack
+            # interaction value carries measurable OOS signal — removing
+            # it dropped OOS Spearman from 0.166 → 0.126. The component
+            # stays in META_FEATURES; only the gate criterion is updated.
+            "passes_wf": vol_median_ic > 0,
         },
         "short_history_subsample": {
             # Momentum subsample gate retired 2026-05-09 — its L1 component
