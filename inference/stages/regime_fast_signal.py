@@ -132,6 +132,12 @@ def run(ctx: PipelineContext) -> None:
             tunables=FastSignalTunables(),
         )
 
+        # Stamp the discrete latch on ctx so write_output's F2 veto
+        # clamp reads it in-process (no extra S3 read, no T-1 staleness).
+        # Set regardless of warmup — the artifact already encodes
+        # forced_bear=False during warmup, so this is consistent.
+        ctx.regime_forced_bear = bool(art["forced_bear"])
+
         # ── Persist online state + forensic artifact + latest sidecar ────
         _s3_put_json(s3, ctx.bucket, STATE_KEY, json.dumps(dump_state(new_state)))
         _s3_put_json(

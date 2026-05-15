@@ -115,6 +115,7 @@ def get_veto_threshold(
     s3_bucket: str,
     market_regime: str = "",
     regime_intensity_z: float | None = None,
+    forced_bear: bool = False,
 ) -> float:
     """
     Return the active veto confidence threshold, adjusted by market regime.
@@ -144,12 +145,28 @@ def get_veto_threshold(
       scale=0.10 cap=0.20. Direction matches the discrete table.
 
       Default ``regime_veto_enabled=False`` ships Wire 4 dormant.
+
+    Forced-bear clamp (regime-fast-signal-260515.md Stage F2):
+      When ``regime_forced_bear_enabled=True`` in S3 predictor_params AND
+      ``forced_bear=True`` (the daily BOCPD circuit-breaker latched), the
+      threshold is clamped to its **bear floor** — the most-aggressive
+      veto the continuous gate allows (``base - cap``) — taking the
+      max-protection of {whatever Wire 4 / discrete produced, bear
+      floor}. This is the predictor-side mirror of the executor's
+      forced-bear posture; both gating surfaces flip together so a
+      confirmed break is not half-honored.
+
+      Default ``regime_forced_bear_enabled=False``: the clamp is dormant
+      but, when ``forced_bear=True``, the counterfactual is logged
+      (parallel-observe) so the F2 gate has data during the gated window.
     """
     params = _load_predictor_params_from_s3(s3_bucket)
     if params and "veto_confidence" in params:
         base = float(params["veto_confidence"])
     else:
         base = cfg.MIN_CONFIDENCE
+
+    cap = float(params.get("regime_veto_cap", 0.20) if params else 0.20)
 
     # Wire 4 path: continuous regime adjustment via intensity_z. Replaces
     # (does NOT layer on top of) the discrete adjustment when enabled.
@@ -158,41 +175,59 @@ def get_veto_threshold(
         scale = float(
             params.get("regime_veto_scale", 0.10) if params else 0.10
         )
-        cap = float(
-            params.get("regime_veto_cap", 0.20) if params else 0.20
-        )
         adjustment = regime_conditional_veto_adjustment(
             regime_intensity_z, scale=scale, cap=cap,
         )
-        adjusted = max(0.0, min(0.80, base + adjustment))
+        threshold = max(0.0, min(0.80, base + adjustment))
         if adjustment != 0.0:
             log.info(
                 "Veto threshold regime-adjusted (Wire 4 continuous): "
                 "base=%.2f %+.3f (intensity_z=%.3f) → %.3f",
-                base, adjustment, regime_intensity_z, adjusted,
+                base, adjustment, regime_intensity_z, threshold,
             )
-        return adjusted
+    else:
+        # Legacy path: discrete adjustment by qualitative regime string.
+        regime = market_regime.lower().strip() if market_regime else ""
+        regime_adjustments = {
+            "bear": -0.20,
+            "bearish": -0.20,
+            "caution": -0.10,
+            "neutral": 0.0,
+            "bull": 0.10,
+            "bullish": 0.10,
+        }
+        adjustment = regime_adjustments.get(regime, 0.0)
+        threshold = max(0.0, min(0.80, base + adjustment))
+        if adjustment != 0.0:
+            log.info(
+                "Veto threshold regime-adjusted: base=%.2f %+.2f (%s) → %.2f",
+                base, adjustment, regime, threshold,
+            )
 
-    # Legacy path: discrete adjustment by qualitative regime string.
-    regime = market_regime.lower().strip() if market_regime else ""
-    regime_adjustments = {
-        "bear": -0.20,
-        "bearish": -0.20,
-        "caution": -0.10,
-        "neutral": 0.0,
-        "bull": 0.10,
-        "bullish": 0.10,
-    }
-    adjustment = regime_adjustments.get(regime, 0.0)
-    adjusted = max(0.0, min(0.80, base + adjustment))
-
-    if adjustment != 0.0:
+    # ── F2 forced-bear max-protection clamp ──────────────────────────────
+    if forced_bear:
+        bear_floor = max(0.0, min(0.80, base - cap))
+        clamped = min(threshold, bear_floor)  # lower = more aggressive veto
+        clamp_enabled = bool(
+            params and params.get("regime_forced_bear_enabled", False)
+        )
+        if clamp_enabled:
+            if clamped < threshold:
+                log.warning(
+                    "Veto threshold FORCED-BEAR clamp: %.3f → %.3f "
+                    "(bear_floor=base-cap=%.2f-%.2f)",
+                    threshold, clamped, base, cap,
+                )
+            return clamped
+        # Parallel-observe: flag off, behavior unchanged, log the
+        # counterfactual so the F2 gate can measure the would-be effect.
         log.info(
-            "Veto threshold regime-adjusted: base=%.2f %+.2f (%s) → %.2f",
-            base, adjustment, regime, adjusted,
+            "regime_forced_bear OBSERVE (flag off): forced_bear=True, "
+            "veto would clamp %.3f → %.3f (bear_floor=%.3f)",
+            threshold, clamped, bear_floor,
         )
 
-    return adjusted
+    return threshold
 
 
 # ── Output writing (migrated from daily_predict.py) ──────────────────────────
@@ -1001,6 +1036,7 @@ def run(ctx: PipelineContext) -> None:
         ctx.bucket,
         market_regime=market_regime,
         regime_intensity_z=getattr(ctx, "regime_intensity_z", None),
+        forced_bear=getattr(ctx, "regime_forced_bear", False),
     )
 
     # Veto fires only when the model is BOTH bearish AND confident.

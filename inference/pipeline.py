@@ -99,6 +99,13 @@ class PipelineContext:
     # without re-running the feature panel.
     regime_intensity_z: Optional[float] = None
 
+    # ── Regime fast signal (set by regime_fast_signal stage, F2) ─────────────
+    # Discrete forced-bear latch from the daily BOCPD circuit-breaker
+    # (regime-fast-signal-260515.md). Consumed in-process by write_output's
+    # veto clamp. Defaults False so a skipped/failed fast-signal stage
+    # degrades the veto to its legacy (Wire 4 / discrete) behavior.
+    regime_forced_bear: bool = False
+
     def near_timeout(self) -> bool:
         """Check if we're nearing the Lambda soft timeout."""
         elapsed = _time.monotonic() - self.start_ts
@@ -138,12 +145,16 @@ STAGES = [
     ("load_prices",    "inference.stages.load_prices",    True),
     ("fetch_alt_data", "inference.stages.fetch_alt_data", False),
     ("run_inference",  "inference.stages.run_inference",  True),
-    ("write_output",   "inference.stages.write_output",   False),
-    # Observe-only (regime-fast-signal-260515.md Stage F1). Runs LAST so
-    # predictions + the morning email are already out before this
-    # independent fast-signal tail step; non-critical so a failure here
-    # never affects predictions.
+    # regime-fast-signal-260515.md. Runs AFTER run_inference (which
+    # stamps ctx.regime_intensity_z) and BEFORE write_output so the
+    # F2 veto clamp can read ctx.regime_forced_bear in-process — no
+    # extra S3 read, no T-1 staleness. F1 originally placed this LAST
+    # (observe-only didn't care about order); F2's in-process veto
+    # consumption requires it upstream of write_output. Non-critical:
+    # a failure here defaults ctx.regime_forced_bear=False and never
+    # affects predictions.
     ("regime_fast_signal", "inference.stages.regime_fast_signal", False),
+    ("write_output",   "inference.stages.write_output",   False),
 ]
 
 

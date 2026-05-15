@@ -175,6 +175,47 @@ def test_idempotent_same_trading_day():
     assert len(s2.bocpd.runlength_probs) == rl_after_first
 
 
+def test_stage_stamps_ctx_and_writes(monkeypatch):
+    """F2: the stage must stamp ctx.regime_forced_bear (consumed by
+    write_output's veto clamp) and persist state + artifact + latest."""
+    import inference.stages.regime_fast_signal as st
+    from inference.pipeline import PipelineContext
+
+    class _NoSuchKey(Exception):
+        pass
+
+    puts: dict[str, str] = {}
+
+    class _FakeS3:
+        class exceptions:
+            NoSuchKey = _NoSuchKey
+
+        def get_object(self, Bucket, Key):  # noqa: N803
+            raise _NoSuchKey()  # cold start
+
+        def put_object(self, **kw):
+            pass
+
+    fake_boto3 = type("B", (), {"client": staticmethod(lambda svc: _FakeS3())})
+    monkeypatch.setitem(__import__("sys").modules, "boto3", fake_boto3)
+    monkeypatch.setattr(st, "_s3_put_json",
+                         lambda s3, b, k, body: puts.__setitem__(k, body))
+    monkeypatch.setattr(st, "_emit_metrics", lambda art: None)
+
+    ctx = PipelineContext(date_str="2026-05-15", dry_run=False, local=False,
+                          bucket="alpha-engine-research")
+    ctx.regime_intensity_z = -2.5
+    assert ctx.regime_forced_bear is False  # default
+
+    st.run(ctx)
+
+    # cold start ⇒ warmup ⇒ forced_bear suppressed (False), but the ctx
+    # field is explicitly stamped from the artifact, and all 3 keys written.
+    assert ctx.regime_forced_bear is False
+    assert st.STATE_KEY in puts
+    assert any("fast_signal" in k for k in puts)
+
+
 def test_new_trading_day_advances():
     tun = FastSignalTunables(min_runlength_for_change=3)
     det = BOCPDDetector.for_daily()

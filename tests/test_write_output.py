@@ -83,6 +83,66 @@ class TestGetVetoThresholdExtended:
         assert result == pytest.approx(0.30)
 
 
+class TestForcedBearClamp:
+    """Stage F2 — forced-bear veto clamp (regime-fast-signal-260515.md)."""
+
+    def setup_method(self):
+        wo._predictor_params_cache = None
+        wo._predictor_params_loaded = False
+
+    _ON = {"veto_confidence": 0.30, "regime_forced_bear_enabled": True}
+    _OFF = {"veto_confidence": 0.30, "regime_forced_bear_enabled": False}
+
+    @patch.object(wo, "_load_predictor_params_from_s3")
+    def test_clamp_on_forces_bear_floor(self, m):
+        m.return_value = self._ON
+        # neutral regime → unclamped 0.30; clamp → base-cap = 0.30-0.20 = 0.10
+        assert get_veto_threshold("b", "neutral", forced_bear=True) == pytest.approx(0.10)
+
+    @patch.object(wo, "_load_predictor_params_from_s3")
+    def test_clamp_off_is_parallel_observe_noop(self, m):
+        m.return_value = self._OFF
+        # flag off: behavior unchanged even though forced_bear=True
+        assert get_veto_threshold("b", "neutral", forced_bear=True) == pytest.approx(0.30)
+
+    @patch.object(wo, "_load_predictor_params_from_s3")
+    def test_no_clamp_when_not_forced_bear(self, m):
+        m.return_value = self._ON
+        assert get_veto_threshold("b", "neutral", forced_bear=False) == pytest.approx(0.30)
+
+    @patch.object(wo, "_load_predictor_params_from_s3")
+    def test_forced_bear_overrides_risk_on_wire4(self, m):
+        # Wire 4 ON + strong risk-ON intensity_z would raise the threshold
+        # to 0.50 (more permissive). Forced-bear must still win — the
+        # max-protection property.
+        m.return_value = {
+            "veto_confidence": 0.30, "regime_veto_enabled": True,
+            "regime_forced_bear_enabled": True,
+        }
+        permissive = get_veto_threshold("b", regime_intensity_z=2.0)
+        assert permissive == pytest.approx(0.50)  # sanity: risk-on raises it
+        m.return_value = {
+            "veto_confidence": 0.30, "regime_veto_enabled": True,
+            "regime_forced_bear_enabled": True,
+        }
+        wo._predictor_params_cache = None
+        wo._predictor_params_loaded = False
+        clamped = get_veto_threshold("b", regime_intensity_z=2.0, forced_bear=True)
+        assert clamped == pytest.approx(0.10)  # bear floor wins
+
+    @patch.object(wo, "_load_predictor_params_from_s3")
+    def test_clamp_never_unprotects(self, m):
+        # Wire 4 risk-OFF already more aggressive than the bear floor →
+        # min() keeps the more-protective value (never raises threshold).
+        m.return_value = {
+            "veto_confidence": 0.30, "regime_veto_enabled": True,
+            "regime_veto_cap": 0.30, "regime_forced_bear_enabled": True,
+        }
+        # intensity_z=-2 → adj -0.30 → threshold 0.00; bear_floor = 0.30-0.30 = 0.00
+        out = get_veto_threshold("b", regime_intensity_z=-2.0, forced_bear=True)
+        assert out == pytest.approx(0.0)
+
+
 class TestMergePredictions:
     """Supplemental-scoring merge: new + existing → union, re-ranked."""
 
