@@ -139,6 +139,11 @@ STAGES = [
     ("fetch_alt_data", "inference.stages.fetch_alt_data", False),
     ("run_inference",  "inference.stages.run_inference",  True),
     ("write_output",   "inference.stages.write_output",   False),
+    # Observe-only (regime-fast-signal-260515.md Stage F1). Runs LAST so
+    # predictions + the morning email are already out before this
+    # independent fast-signal tail step; non-critical so a failure here
+    # never affects predictions.
+    ("regime_fast_signal", "inference.stages.regime_fast_signal", False),
 ]
 
 

@@ -179,6 +179,73 @@ def fetch_macro_feature_history(
     return features
 
 
+def fetch_macro_feature_history_daily(
+    *,
+    s3_client: Any,
+    bucket: str = DEFAULT_S3_BUCKET,
+    prefix: str = DEFAULT_PRICE_CACHE_PREFIX,
+    lookback_days: int | None = None,
+    as_of: pd.Timestamp | None = None,
+) -> pd.DataFrame:
+    """Daily-cadence sibling of ``fetch_macro_feature_history``.
+
+    The weekly fetcher already builds a daily frame internally and then
+    downsamples (``resample("W-FRI")``). The daily fast signal (Stage F1
+    of regime-fast-signal-260515.md) needs the *pre-downsample* series
+    to recalibrate the daily BOCPD hazard on a 10y backfill, so this
+    function returns the same five features on the daily grid:
+
+    - ``spy_20d_return`` uses a **20-trading-day** window
+      (``pct_change(20)``) — the daily analog of the weekly fetcher's
+      ``pct_change(periods=4)`` (~4 weeks).
+    - the FRED-sourced levels/spreads are taken on the daily index
+      directly (no resample).
+
+    The live weekly substrate path is untouched — this is an additive,
+    backfill/eval-only reader. ``market_breadth`` is filled NaN
+    identically to the weekly fetcher (composite handles missing
+    features gracefully).
+    """
+    close_series: dict[str, pd.Series] = {}
+    for ticker in SOURCE_TICKERS:
+        s = _read_parquet_close(ticker, s3_client=s3_client, bucket=bucket, prefix=prefix)
+        if not s.empty and as_of is not None:
+            s = s.loc[:as_of]
+        close_series[ticker] = s
+
+    non_empty = {t: s for t, s in close_series.items() if not s.empty}
+    if not non_empty:
+        return pd.DataFrame(columns=list(_REGIME_FEATURE_LIST))
+    daily = pd.concat(non_empty, axis=1).sort_index()
+    for ticker in SOURCE_TICKERS:
+        if ticker not in daily.columns:
+            daily[ticker] = np.nan
+    if daily.empty:
+        return pd.DataFrame(columns=list(_REGIME_FEATURE_LIST))
+    daily = daily.ffill()
+
+    features = pd.DataFrame(index=daily.index)
+    spy = daily["SPY"]
+    features["spy_20d_return"] = spy.pct_change(periods=20, fill_method=None)
+    features["vix_level"] = daily["VIX"]
+    features["vix_term_slope"] = daily["VIX3M"] - daily["VIX"]
+    features["hy_oas_bps"] = daily["HYOAS"] * 100.0
+    features["yield_curve_slope"] = daily["TNX"] - daily["TWO"]
+    features["market_breadth"] = np.nan
+
+    features = features.dropna(subset=["spy_20d_return"])
+    if lookback_days is not None and len(features) > lookback_days:
+        features = features.tail(lookback_days).copy()
+
+    logger.info(
+        "[regime_features] assembled DAILY history: %d rows %s → %s",
+        len(features),
+        features.index.min().date() if len(features) else None,
+        features.index.max().date() if len(features) else None,
+    )
+    return features
+
+
 def current_features_from_history(
     history: pd.DataFrame,
     extra: Mapping[str, float] | None = None,

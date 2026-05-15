@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from inference.pipeline import PipelineContext, PipelineAbort, run_pipeline
+from inference.pipeline import STAGES, PipelineContext, PipelineAbort, run_pipeline
 
 
 class TestPipelineContext:
@@ -50,7 +50,9 @@ class TestRunPipeline:
         ctx = PipelineContext(date_str="2026-04-08", start_ts=time.monotonic())
         run_pipeline(ctx)
 
-        assert mock_import.call_count == 6
+        # Pinned to the registered stage list so adding/removing a stage
+        # updates this in one place (was a bare `== 6`).
+        assert mock_import.call_count == len(STAGES)
 
     @patch("importlib.import_module")
     def test_critical_failure_raises(self, mock_import):
@@ -78,7 +80,7 @@ class TestRunPipeline:
         ctx = PipelineContext(date_str="2026-04-08", start_ts=time.monotonic())
         run_pipeline(ctx)
 
-        assert call_count["n"] == 6
+        assert call_count["n"] == len(STAGES)
 
     @patch("importlib.import_module")
     def test_pipeline_abort_stops_cleanly(self, mock_import):
