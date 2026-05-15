@@ -29,6 +29,32 @@ from dataclasses import dataclass
 import numpy as np
 
 
+# ── Cadence-specific priors ──────────────────────────────────────────────
+# The weekly substrate handler (regime/handler.py) uses the WEEKLY prior:
+# hazard = 1/100 ≈ a regime change every ~100 *weeks*, and a change is
+# declared when mass collapses onto run lengths < 4 *weeks*.
+#
+# The daily fast-signal stage (regime-fast-signal-260515.md Stage F1)
+# observes the same composite intensity_z scalar at DAILY cadence, so the
+# prior must be re-expressed in trading days or the detector over-fires
+# by ~5× (the run-length grid advances 5× faster). These constants exist
+# so the daily path NEVER reuses the weekly defaults by accident, and so
+# the chosen values are explicit + sweepable in the F1 backfill.
+#
+# DAILY_HAZARD = 1/500 ≈ a regime change every ~500 trading days (~2y),
+# matching the historical mean regime length (NBER cycles / VIX-regime
+# stretches). DAILY_MIN_RUNLENGTH_FOR_CHANGE = 10 ≈ two trading weeks,
+# the daily analog of the weekly detector's 4-week window. Both are
+# starting points; F1's backfill recalibrates them against retrospective
+# smoothed-HMM bear stretches before any executor consumes the signal.
+WEEKLY_HAZARD: float = 1.0 / 100.0
+DAILY_HAZARD: float = 1.0 / 500.0
+DAILY_MIN_RUNLENGTH_FOR_CHANGE: int = 10
+# A daily detector should track ~2y of run-length grid before tail
+# collapse (vs the weekly detector's 520 ≈ 10y). 504 ≈ 2 trading years.
+DAILY_MAX_RUNLENGTH_HORIZON: int = 504
+
+
 @dataclass
 class BOCPDState:
     """Sufficient statistics for the run-length posterior + Gaussian
@@ -88,6 +114,25 @@ class BOCPDDetector:
         self.alpha_0 = alpha_0
         self.beta_0 = beta_0
         self.max_runlength_horizon = max_runlength_horizon
+
+    @classmethod
+    def for_daily(cls, **overrides: float) -> "BOCPDDetector":
+        """Construct a detector with the DAILY prior (Stage F1).
+
+        Re-expresses the hazard + run-length grid in trading days so the
+        daily fast-signal stage does not silently inherit the weekly
+        defaults. Keyword overrides (e.g. ``hazard=`` from a swept
+        backfill value) take precedence over the daily defaults.
+
+        The weekly substrate path keeps using the bare ``__init__``
+        defaults — this classmethod is the ONLY daily entry point.
+        """
+        kwargs: dict[str, float] = {
+            "hazard": DAILY_HAZARD,
+            "max_runlength_horizon": DAILY_MAX_RUNLENGTH_HORIZON,
+        }
+        kwargs.update(overrides)
+        return cls(**kwargs)  # type: ignore[arg-type]
 
     def initial_state(self) -> BOCPDState:
         """Return the prior state — no observations yet, run length 0
