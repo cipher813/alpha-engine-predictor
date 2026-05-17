@@ -44,7 +44,9 @@ def download_from_arctic(
 ) -> int:
     """
     Read all universe + macro symbols from ArcticDB and write as parquets
-    to local_dir, matching the format download_price_cache() produces.
+    to local_dir, matching the legacy per-ticker OHLCV parquet format
+    (the now-removed S3 download_price_cache() fallback produced the same
+    shape; ArcticDB is canonical since PR #6).
 
     The key difference: ArcticDB DataFrames include pre-computed feature
     columns alongside OHLCV. build_regression_arrays() in dataset.py

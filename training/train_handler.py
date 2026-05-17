@@ -4,25 +4,30 @@ training/train_handler.py — Weekly GBM retraining pipeline for Lambda.
 Called by inference/handler.py when event["action"] == "train".
 
 Pipeline:
-  1. Download per-ticker OHLCV Parquet files + sector_map.json from S3.
-  1b. Refresh any stale parquets with recent yfinance data and upload back to S3.
+  1. Load the universe (OHLCV + pre-computed feature columns) from the
+     ArcticDB universe library. ArcticDB is the single, canonical source of
+     training data — the legacy S3-parquet / yfinance-refresh fallback was
+     removed by PR #6 (training cutover 2026-04-16). No data is fetched over
+     yfinance and no parquets are written back to S3 by this handler.
   2. Build regression arrays (29 features) and apply 70/15/15 time-based split
      with purge gaps of FORWARD_DAYS between train/val and val/test.
   3. Train GBMScorer with Optuna-tuned params from config.GBM_TUNED_PARAMS
      (n_estimators=2000, early_stopping=50).
   4. Evaluate on test set: IC, IC IR, positive-period rate.
   5. Upload dated backup unconditionally; promote to gbm_latest.txt only if IC gate passes.
-  5b. Write slim 2-year price cache to predictor/price_cache_slim/ so the daily
-      inference Lambda can skip the 2y yfinance fetch and read from S3 instead.
+  5b. Write slim 2-year price cache to predictor/price_cache_slim/ for the
+      daily inference Lambda's price reads.
   6. Send training summary email with results.
 
 S3 layout:
-  predictor/price_cache/*.parquet       — adjusted OHLCV price history per ticker (10y,
-                                          auto_adjust=True; rewritten weekly by this handler)
-  predictor/price_cache/sector_map.json — ticker → sector ETF symbol
   predictor/weights/gbm_latest.txt      — (output) active inference weights
   predictor/weights/gbm_{date}.txt      — (output) dated backup
 
+  predictor/price_cache/*.parquet       — LEGACY 10y per-ticker OHLCV parquets.
+                                          No longer read or written by training —
+                                          ArcticDB is canonical since PR #6
+                                          (2026-04-16). Retained on S3 only as a
+                                          historical fallback artifact; orphaned.
   predictor/daily_closes/{date}.parquet — Backward-split-adjusted OHLCV snapshot per
                                           trading day.  Written by DataPhase1 in
                                           alpha-engine-data/collectors/daily_closes.py
@@ -34,9 +39,8 @@ S3 layout:
                                           These parquets are now orphaned — candidates
                                           for removal in Phase 7e.
   predictor/price_cache_slim/*.parquet  — 2-year slice of each ticker (written by
-                                          write_slim_cache() after each weekly training run).
-                                          The inference Lambda downloads this (~9 MB) instead
-                                          of re-fetching 2y from yfinance each morning.
+                                          write_slim_cache() after each weekly training run)
+                                          for the daily inference Lambda's price reads.
 
 Lambda environment variables (same as predictor email):
   EMAIL_SENDER / EMAIL_RECIPIENTS / GMAIL_APP_PASSWORD / AWS_REGION
@@ -83,41 +87,6 @@ import numpy as np
 log = logging.getLogger(__name__)
 
 
-# ── S3 data download ───────────────────────────────────────────────────────────
-
-def download_price_cache(bucket: str, prefix: str, local_dir: Path) -> int:
-    """
-    Download all objects under S3 prefix (Parquets + sector_map.json) to local_dir.
-    Returns number of files downloaded.
-
-    DEAD CODE — flagged 2026-04-14 (PR #6).
-
-    This was the S3-parquet fallback path used by ``main()`` when ArcticDB
-    was unavailable. PR #6 removed that fallback — ArcticDB is now the
-    single source of training data. Zero callers remain after this PR;
-    ``store/arctic_reader.py`` docstring still references the signature
-    but doesn't invoke it.
-
-    Slated for deletion in a follow-up cleanup PR once PR #6's training
-    cutover has soaked for 2+ Saturday runs against live ArcticDB.
-    """
-    import boto3
-    s3 = boto3.client("s3")
-    local_dir.mkdir(parents=True, exist_ok=True)
-
-    paginator = s3.get_paginator("list_objects_v2")
-    n = 0
-    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-        for obj in page.get("Contents", []):
-            key = obj["Key"]
-            filename = key[len(prefix):]   # strip prefix, keep filename
-            if not filename or filename.endswith("/"):
-                continue
-            local_path = local_dir / filename
-            s3.download_file(bucket, key, str(local_path))
-            n += 1
-
-    log.info("Downloaded %d files from s3://%s/%s → %s", n, bucket, prefix, local_dir)
 # ── Training email ─────────────────────────────────────────────────────────────
 
 def _build_ic_table_html(result, is_meta, ic_color, ic_label, promoted_mode,
@@ -871,13 +840,12 @@ def main(
     """
     Entry point called from inference/handler.py for the "train" action.
 
-    1.  Download price cache from S3 to /tmp.
-    1b. Refresh any stale parquets with recent yfinance data → upload back to S3.
-    2.  Run GBM training pipeline on the now-current local cache.
-    2b. Write a 2-year slim cache to S3 (predictor/price_cache_slim/).
-        The inference Lambda uses this slim cache + daily_closes delta instead
-        of fetching 2 years from yfinance every morning, reducing daily yfinance
-        API calls by ~125×.
+    1.  Load the universe (OHLCV + features) from the ArcticDB universe
+        library to /tmp. ArcticDB is canonical since PR #6 (2026-04-16);
+        there is no yfinance fetch and no S3-parquet refresh/upload.
+    2.  Run GBM training pipeline on the loaded cache.
+    2b. Write a 2-year slim cache to S3 (predictor/price_cache_slim/)
+        for the daily inference Lambda's price reads.
     3.  Send training summary email.
 
     Returns the result dict from run_meta_training().
