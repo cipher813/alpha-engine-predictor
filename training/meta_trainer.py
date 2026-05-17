@@ -1783,43 +1783,54 @@ def run_meta_training(
                 key=lambda kv: abs(kv[1]["spearman"]) if np.isfinite(kv[1]["spearman"]) else -1)
     log.info("Peak IC horizon: %s (Spearman=%+.4f)", _peak[0], _peak[1]["spearman"])
 
-    # ── Step 7b: Fit isotonic calibrator on meta OOS predictions ─────────────
+    # ── Step 7b: Fit direction calibrator on meta OOS predictions ────────────
     # ROADMAP P1: collapse FLAT, use calibrated P(UP) as confidence.
     #
-    # Input to isotonic: continuous meta-model output on the pooled OOS
-    # rows. These predictions are OOS with respect to the Layer-1 base
-    # models (momentum/volatility/regime were held out by fold) but are
+    # Input: continuous meta-model output on the pooled OOS rows. These
+    # predictions are OOS with respect to the Layer-1 base models
+    # (momentum/volatility/regime were held out by fold) but are
     # in-sample for the meta ridge itself, which was just fit on meta_X.
     # Pure nested CV would be cleaner; the pragmatic tradeoff is that
     # ridge has low capacity (8 coefficients) and overfits minimally, so
     # in-sample meta predictions are a reasonable calibration substrate.
     #
     # Output: P(actual_fwd > 0 | meta prediction). Binary target from
-    # sign(meta_y). This is the canonical isotonic use case — no sigmoid
-    # wrapper needed; isotonic produces a monotonic calibration curve
-    # directly from continuous input to calibrated probability.
+    # sign(meta_y), continuous input → calibrated probability (no sigmoid
+    # wrapper needed for either method).
+    #
+    # Method is config-driven via cfg.CALIBRATION_METHOD (predictor.yaml
+    # ``calibration.method``) — "platt" (L2-regularised logistic, the
+    # tail-robust default) or "isotonic". ROADMAP L1873: the 2026-05-09
+    # 75%+ DOWN-veto inversion was isotonic-tail overconfidence; "platt"
+    # is the prescribed tail-robust fix. This call site previously
+    # hardcoded "isotonic", silently ignoring the config (the knob was
+    # dead — parsed at config.py but never read), so the committed
+    # ``platt`` default never took effect. Honour the config here.
     #
     # Hard-fail per feedback_hard_fail_until_stable: a broken calibrator
     # silently degrades inference quality. Catch it here rather than
     # letting the inference path log a WARNING and fall back to heuristic.
     from model.calibrator import PlattCalibrator
+    cal_method = cfg.CALIBRATION_METHOD
     oos_meta_preds = meta_model.predict(meta_X).ravel()
     oos_up_labels = (meta_y > 0).astype(np.int32)
     log.info(
-        "Fitting isotonic calibrator: n=%d  up_rate=%.3f  pred_std=%.6f",
-        len(oos_meta_preds), float(oos_up_labels.mean()), float(np.std(oos_meta_preds)),
+        "Fitting %s direction calibrator: n=%d  up_rate=%.3f  pred_std=%.6f",
+        cal_method, len(oos_meta_preds), float(oos_up_labels.mean()),
+        float(np.std(oos_meta_preds)),
     )
-    calibrator = PlattCalibrator(method="isotonic")
+    calibrator = PlattCalibrator(method=cal_method)
     calibrator.fit(oos_meta_preds, oos_up_labels, label_clip=float(cfg.LABEL_CLIP))
     if not calibrator.is_fitted:
         raise RuntimeError(
-            f"Isotonic calibrator did not fit (n={len(oos_meta_preds)} samples, "
-            f"min required 100). Training must produce a calibrator — see "
-            f"model/calibrator.py for the sample threshold."
+            f"{cal_method} direction calibrator did not fit "
+            f"(n={len(oos_meta_preds)} samples, min required 100). Training "
+            f"must produce a calibrator — see model/calibrator.py for the "
+            f"sample threshold."
         )
     log.info(
-        "Isotonic calibrator: ECE_before=%.4f  ECE_after=%.4f  (%.1f%% reduction)",
-        calibrator._ece_before, calibrator._ece_after,
+        "%s direction calibrator: ECE_before=%.4f  ECE_after=%.4f  (%.1f%% reduction)",
+        cal_method, calibrator._ece_before, calibrator._ece_after,
         (1 - calibrator._ece_after / max(calibrator._ece_before, 1e-8)) * 100,
     )
 
