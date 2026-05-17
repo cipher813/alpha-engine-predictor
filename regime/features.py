@@ -50,10 +50,13 @@ DEFAULT_S3_BUCKET: str = "alpha-engine-research"
 DEFAULT_PRICE_CACHE_PREFIX: str = "predictor/price_cache/"
 
 
-# Source tickers expected as ``{prefix}{ticker}.parquet`` keys. Mirror
-# data/bootstrap_fetcher.py's _CARET_SYMBOLS convention — stored without
-# the yfinance leading caret. FRED-sourced symbols (HYOAS, TWO) come
-# from collectors/fred_history.py per the Stage 2.5b cutover.
+# Source tickers expected as ``{prefix}{ticker}.parquet`` keys. Index
+# symbols (VIX, VIX3M, TNX) require a leading caret in yfinance (^VIX,
+# ^VIX3M, ^TNX) but the alpha-engine-data price collector
+# (collectors/prices.py) stores them caret-stripped (VIX.parquet, ...).
+# Keep these names caret-free to match that storage convention.
+# FRED-sourced symbols (HYOAS, TWO) come from collectors/fred_history.py
+# per the Stage 2.5b cutover.
 SOURCE_TICKERS: tuple[str, ...] = ("SPY", "VIX", "VIX3M", "TNX", "TWO", "HYOAS")
 
 

@@ -185,7 +185,8 @@ def test_current_features_raises_on_empty_history() -> None:
 
 def test_source_tickers_match_data_side_convention() -> None:
     """Source ticker names must NOT include the yfinance caret prefix —
-    pins the contract that aligns with data/bootstrap_fetcher's
-    _CARET_SYMBOLS storage convention."""
+    pins the contract that aligns with the alpha-engine-data price
+    collector (collectors/prices.py) caret-stripped parquet storage
+    convention."""
     for ticker in SOURCE_TICKERS:
         assert not ticker.startswith("^"), f"{ticker} should not have ^ prefix"

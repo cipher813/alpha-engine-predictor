@@ -459,5 +459,9 @@ def run(ctx: PipelineContext) -> None:
     else:
         log.warning(
             "data/cache/sector_map.json not found — sector_vs_spy_5d will be 0. "
-            "Run bootstrap_fetcher.py to generate it."
+            "The 10y price cache + sector reference data are produced by the "
+            "alpha-engine-data weekly collector (collectors/prices.py, "
+            "Saturday SF DataPhase1 — full-replace 10y refresh to "
+            "s3://alpha-engine-research/predictor/price_cache/). "
+            "Verify that collector ran and re-sync data/cache from S3."
         )
