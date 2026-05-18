@@ -51,7 +51,7 @@ Stacked meta-ensemble that predicts **21-day log-domain market-relative alpha** 
 | Price universe (training) | `s3://alpha-engine-research/arcticdb/universe/` |
 | Price slim cache (inference) | `s3://alpha-engine-research/arcticdb/universe_slim/` |
 | Daily closes delta | `s3://alpha-engine-research/staging/daily_closes/{date}.parquet` |
-| Engineered feature store | `s3://alpha-engine-research/predictor/feature_store/{date}/` |
+| Engineered feature store | `s3://alpha-engine-research/features/{date}/` |
 | Veto threshold + auto-tuned params | `s3://alpha-engine-research/config/predictor_params.json` |
 
 ### Writes
