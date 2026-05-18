@@ -16,6 +16,11 @@
 #   ./infrastructure/spot_train.sh                  # smoke (dry_run) then full
 #   ./infrastructure/spot_train.sh --full-only       # full training only (Saturday SF)
 #   ./infrastructure/spot_train.sh --smoke-only      # smoke only, then terminate
+#   ./infrastructure/spot_train.sh --preflight-only  # boot + import/lib-pin +
+#                                                    # ArcticDB connectivity probe,
+#                                                    # then exit 0 — NO training,
+#                                                    # NO promotion, ZERO S3/config
+#                                                    # writes (Friday shell_run dry path)
 #   ./infrastructure/spot_train.sh --instance-type c5.2xlarge  # override type
 #
 # Prerequisites:
@@ -30,6 +35,9 @@
 #   2. Wait for the SSM agent to register (no SSH)
 #   3. Stage config/predictor.yaml to S3; spot bootstraps + fetches it
 #   4. Run smoke (dry_run=True), then full training (dry_run=False)
+#      — OR, under --preflight-only, run the import/lib-pin + read-only
+#        ArcticDB connectivity probe and exit 0 (no training, no promotion,
+#        no S3/config writes; Friday shell_run dry path)
 #   5. Terminate the spot instance + clean the S3 staging prefix
 #
 # Rollback: `git revert` this commit restores the SSH/SCP script. Port 22
@@ -68,11 +76,12 @@ IAM_PROFILE="alpha-engine-executor-profile"
 REPO_URL="https://github.com/cipher813/alpha-engine-predictor.git"  # public repo, no auth
 
 # Parse flags
-MODE="both"  # both | full-only | smoke-only
+MODE="both"  # both | full-only | smoke-only | preflight-only
 while [ $# -gt 0 ]; do
   case "$1" in
     --full-only) MODE="full-only" ;;
     --smoke-only) MODE="smoke-only" ;;
+    --preflight-only) MODE="preflight-only" ;;
     --instance-type) shift; INSTANCE_TYPE="$1" ;;
   esac
   shift
@@ -277,6 +286,100 @@ echo "Dependencies installed."
 $PIP list --format=columns | grep -iE 'numpy|pandas|lightgbm|scikit-learn|scipy|shap|pyyaml|alpha-engine-lib' || true
 DEPS
 )" 900
+
+# ── Preflight-only (Friday shell_run dry path) ────────────────────────────────
+# Boot + lib-pin/import + read-only ArcticDB/universe-freshness probe, then
+# exit 0. This runs the SAME bootstrap+deps steps the real Saturday run uses
+# (so it catches lib-pin drift, sys.path breakage, image gaps, SSM timeouts,
+# stale ArcticDB) but stops HERE — before the smoke step and before the
+# full-training step.
+#
+# Hard invariant under this mode:
+#   • run_meta_training() is NEVER invoked → NO model training, NO walk-forward.
+#   • The `if not dry_run:` upload/promote block in meta_trainer.py is never
+#     reached → NO weights/meta/* write, NO manifest, NO dated archive.
+#   • train_handler.main()'s training_summary / triple-barrier-gate / email /
+#     health-status writes are never reached (they live after run_meta_training).
+#   • The probe imports the training package + runs TrainingPreflight (env +
+#     S3-bucket *reachability* check — no object writes) + a read-only
+#     ArcticDB `list_symbols()` / latest-index probe. No put_object, no
+#     config write, no external API (yfinance/Anthropic) call.
+# The `exit 0` is a clean dispatcher exit; `trap cleanup EXIT` still fires
+# (terminates the spot, clears the S3 staging prefix — staging cleanup only).
+if [ "$MODE" = "preflight-only" ]; then
+  echo ""
+  echo "═══════════════════════════════════════════════════════════════"
+  echo "  PREFLIGHT-ONLY (no training, no promotion, no writes)"
+  echo "═══════════════════════════════════════════════════════════════"
+  run_ssm "preflight-only" "$(cat <<'PREFLIGHT'
+set -eo pipefail
+export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1
+cd /home/ec2-user/predictor
+command -v python3.12 >/dev/null && PY=python3.12 || PY=python3
+$PY - <<'PYEOF'
+import os, sys
+sys.path.insert(0, '.')
+os.environ.setdefault('S3_BUCKET', os.environ.get('S3_BUCKET', 'alpha-engine-research'))
+bucket = os.environ.get('S3_BUCKET', 'alpha-engine-research')
+
+import logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s  %(levelname)-8s  %(message)s')
+log = logging.getLogger('preflight-only')
+
+# 1. Import the training package (catches sys.path / lib-pin / image gaps).
+#    Importing train_handler transitively imports the lib + training stack
+#    WITHOUT invoking main(), so no training runs.
+log.info('[1/3] Importing training package...')
+import alpha_engine_lib  # lib-pin presence (version asserted by requirements.txt pin)
+from training import train_handler  # noqa: F401  (import-only; main() NOT called)
+from training.preflight import TrainingPreflight
+log.info('       OK — alpha_engine_lib + training.train_handler import clean')
+
+# 2. Reuse the EXISTING training preflight (env vars + S3 bucket
+#    *reachability*; check_s3_bucket is a read/head, no object write).
+log.info('[2/3] Running TrainingPreflight (env + S3 connectivity)...')
+TrainingPreflight(bucket=bucket).run()
+log.info('       OK — env vars present, S3 bucket reachable')
+
+# 3. Read-only ArcticDB connectivity + universe-freshness probe.
+#    list_symbols() + a single read().tail(1) — NO download_from_arctic(),
+#    NO parquet writes, NO training array build. Mirrors the connectivity
+#    the real run depends on without doing any work.
+log.info('[3/3] ArcticDB connectivity + universe-freshness probe...')
+from store.arctic_reader import _get_arctic
+arctic = _get_arctic(bucket)
+universe = arctic.get_library('universe')
+symbols = universe.list_symbols()
+n = len(symbols)
+if n == 0:
+    raise RuntimeError(
+        'ArcticDB universe library is empty/unreachable — '
+        'Saturday DataPhase1 + weekly backfill have not run cleanly.'
+    )
+probe = sorted(symbols)[0]
+df_tail = universe.read(probe).data.tail(1)
+latest = df_tail.index.max() if not df_tail.empty else 'n/a'
+log.info('       OK — universe has %d symbols; %s latest index=%s', n, probe, latest)
+
+print()
+print('=' * 60)
+print('  PREFLIGHT-ONLY RESULT: PASS')
+print('=' * 60)
+print(f'  Imports:        alpha_engine_lib + training stack clean')
+print(f'  TrainingPreflight: PASS (env + S3 reachable)')
+print(f'  ArcticDB:       {n} universe symbols (probe {probe} latest={latest})')
+print(f'  Training:       SKIPPED (no run_meta_training call)')
+print(f'  Promotion:      SKIPPED (no weights/meta write)')
+print(f'  S3/config writes: NONE')
+print('=' * 60)
+PYEOF
+PREFLIGHT
+)" 600
+  echo ""
+  echo "==> Preflight-only mode — PASS. No training, no promotion, no writes."
+  echo "    Exiting 0 BEFORE smoke + full-training steps."
+  exit 0
+fi
 
 # ── Smoke test (dry_run=True) ─────────────────────────────────────────────────
 if [ "$MODE" != "full-only" ]; then
