@@ -278,6 +278,109 @@ def _emit_research_join_coverage_metrics(
         )
 
 
+def _compute_overfit_signal(
+    *,
+    train_ic: float | None,
+    val_ic: float,
+    warn_threshold: float = 3.0,
+) -> tuple[float | None, bool]:
+    """Return (train_val_ic_ratio, overfit_warn_flag).
+
+    ROADMAP L1816 (2026-05-19): the ResearchGBM is sensitive to
+    overfitting at the 21d horizon because the labeled corpus shrinks
+    vs the pre-cutover 5d horizon. Formalize the ``train_ic / val_ic``
+    ratio as a first-class signal so the manifest + CW alarm can
+    monitor regression after the params-reduction shipped in this PR.
+
+    Ratio convention:
+
+    - Computed as ``train_ic / abs(val_ic)`` so a large positive ratio
+      always means "training fit dominates validation fit" regardless
+      of validation sign (negative val_ic is itself a different
+      pathology, but still triggers the warn since |val_ic| → 0
+      blows up the ratio).
+    - Returns ``None`` when ``train_ic`` is missing OR when val_ic's
+      magnitude is below 1e-3 (the ratio's numerator/denominator
+      noise floor) — surfacing "we couldn't measure" as a separate
+      state from "we measured and it's healthy".
+    - Warn flag fires on ratio > ``warn_threshold`` (default 3.0,
+      halfway between the >2× watch level docs cite and the 5.05×
+      we observed on the 21d retrain).
+    """
+    if train_ic is None:
+        return None, False
+    if abs(val_ic) < 1e-3:
+        return None, False
+    ratio = train_ic / abs(val_ic)
+    warn = ratio > warn_threshold
+    return ratio, warn
+
+
+def _emit_research_gbm_overfit_metrics(
+    *,
+    train_ic: float | None,
+    val_ic: float,
+    ratio: float | None,
+    warn: bool,
+) -> None:
+    """Emit ResearchGBM train/val IC + overfit gauges to CloudWatch.
+
+    Mirrors ``_emit_research_join_coverage_metrics`` — best-effort, never
+    blocks training. Counts are already in the inline log so a failed
+    emit leaves a paper trail (same EC2 training-role IAM grant under
+    ``alpha-engine-cloudwatch-metrics``).
+
+    Gauges (namespace ``AlphaEngine/Predictor``):
+
+    - ``research_gbm_train_ic`` — train-split Pearson IC.
+    - ``research_gbm_val_ic`` — early-stop holdout Pearson IC.
+    - ``research_gbm_train_val_ic_ratio`` — ratio for the 2-cycle
+      persistence alarm (alarm on > 3.0 for >= 2 consecutive Saturday
+      datapoints).
+    - ``research_gbm_overfit_warn`` — 0/1 flag, same persistence rule
+      via a Count gauge.
+
+    Returns early without emitting when ``ratio`` is None (insufficient
+    measurement — surfaced via the absence of datapoints rather than a
+    spurious zero).
+    """
+    if ratio is None:
+        return
+    metric_data: list[dict] = []
+    if train_ic is not None:
+        metric_data.append(
+            {"MetricName": "research_gbm_train_ic",
+             "Value": float(train_ic), "Unit": "None"}
+        )
+    metric_data.extend([
+        {"MetricName": "research_gbm_val_ic",
+         "Value": float(val_ic), "Unit": "None"},
+        {"MetricName": "research_gbm_train_val_ic_ratio",
+         "Value": float(ratio), "Unit": "None"},
+        {"MetricName": "research_gbm_overfit_warn",
+         "Value": 1.0 if warn else 0.0, "Unit": "Count"},
+    ])
+    try:
+        import boto3
+        cw = boto3.client("cloudwatch")
+        cw.put_metric_data(
+            Namespace="AlphaEngine/Predictor",
+            MetricData=metric_data,
+        )
+    except Exception as exc:  # noqa: BLE001 — observability, never block training
+        log.warning(
+            "CloudWatch research_gbm_* metric emit failed: %s. "
+            "train_ic=%s val_ic=%.4f ratio=%.4f warn=%s still surface via "
+            "the inline ResearchGBMScorer + overfit-signal log; investigate "
+            "the EC2 training-role IAM grant if this fires every Saturday.",
+            exc,
+            (f"{train_ic:.4f}" if train_ic is not None else "None"),
+            val_ic,
+            ratio,
+            warn,
+        )
+
+
 def _load_momentum_params_from_s3(bucket: str) -> dict | None:
     """Read momentum GBM params from S3 if present.
 
@@ -1356,6 +1459,8 @@ def run_meta_training(
     prod_research_gbm: ResearchGBMScorer | None = None
     research_gbm_metrics: dict | None = None
     research_gbm_train_ic: float | None = None
+    research_gbm_train_val_ic_ratio: float | None = None
+    research_gbm_overfit_warn: bool = False
     try:
         finite_mask = np.array([
             np.isfinite(r.get("actual_fwd_10d", float("nan")))
@@ -1396,6 +1501,42 @@ def run_meta_training(
                 research_gbm_train_ic if research_gbm_train_ic is not None else float("nan"),
                 prod_research_gbm._val_ic,
                 prod_research_gbm._best_iteration,
+            )
+
+            # 2026-05-19 (ROADMAP L1816): formalize the train/val IC ratio
+            # as a first-class manifest field + warn flag + CW gauge.
+            #
+            # Ratio definition: train_ic / val_ic, sign-agnostic via abs
+            # in the denominator. Threshold 3.0 is the half-way between
+            # the "healthy" 2× watch-level the existing docs cite and the
+            # 5.05× we observed on the 21d retrain, so a fresh > 3 cycle
+            # would be unambiguously degraded — operator alerts only on
+            # confirmed regression, not on noisy borderline ratios.
+            (
+                research_gbm_train_val_ic_ratio,
+                research_gbm_overfit_warn,
+            ) = _compute_overfit_signal(
+                train_ic=research_gbm_train_ic,
+                val_ic=float(prod_research_gbm._val_ic),
+                warn_threshold=3.0,
+            )
+            if research_gbm_overfit_warn:
+                log.warning(
+                    "ResearchGBMScorer overfit signal — train_ic=%.4f / "
+                    "val_ic=%.4f → ratio=%.2f (> 3.0). Manifest emits the "
+                    "ratio + warn flag; CloudWatch carries the gauge for "
+                    "the 2-cycle persistence alarm. The Ridge's regularization "
+                    "still absorbs the overfit research scorer today so this "
+                    "is observability, not blocking.",
+                    research_gbm_train_ic or float("nan"),
+                    prod_research_gbm._val_ic,
+                    research_gbm_train_val_ic_ratio or float("nan"),
+                )
+            _emit_research_gbm_overfit_metrics(
+                train_ic=research_gbm_train_ic,
+                val_ic=float(prod_research_gbm._val_ic),
+                ratio=research_gbm_train_val_ic_ratio,
+                warn=research_gbm_overfit_warn,
             )
 
             # Recompute research_calibrator_prob in oos_meta_rows using the
@@ -2326,6 +2467,21 @@ def run_meta_training(
                                 round(research_gbm_train_ic, 6)
                                 if research_gbm_train_ic is not None else None
                             ),
+                            # ROADMAP L1816 (2026-05-19): train/val IC ratio
+                            # + overfit warn surface in the manifest so a
+                            # cycle-over-cycle regression is auditable
+                            # without re-reading the LightGBM booster.
+                            # ``ratio is None`` means "couldn't measure"
+                            # (train_ic absent or |val_ic|<1e-3); ratio
+                            # present with warn=True means "regression
+                            # observed this cycle"; ratio present with
+                            # warn=False is the healthy state.
+                            "train_val_ic_ratio": (
+                                round(research_gbm_train_val_ic_ratio, 6)
+                                if research_gbm_train_val_ic_ratio is not None
+                                else None
+                            ),
+                            "overfit_warn": research_gbm_overfit_warn,
                             **(research_gbm_metrics or {}),
                         }}
                         if prod_research_gbm is not None else {}

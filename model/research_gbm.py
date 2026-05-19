@@ -81,12 +81,32 @@ def _default_params() -> dict:
     label is noisy (binary beat-SPY-at-10d). Keeping leaves and depth
     low protects against overfitting given the typical few-thousand
     training-row count.
+
+    Overfitting tightening (2026-05-19, ROADMAP L1816 P1 — promoted from P2):
+    the 2026-05-09 promote-true retrain at the new 21d horizon showed
+    ``train_ic=0.4328 / val_ic=0.0857 ⇒ ratio 5.05`` on 496 rows. With
+    ``num_leaves=15 / max_depth=4`` the tree count effectively encodes
+    most of the 9-feature training set verbatim — the model memorizes
+    rather than generalizes. The 21d horizon shrinks the fit set vs the
+    pre-cutover 5d horizon (fewer rows have finite ``actual_fwd`` labels)
+    so the same capacity now sees a smaller corpus.
+
+    Reducing to ``num_leaves=8 / max_depth=3`` caps the model class at
+    a strictly smaller hypothesis space (8 ≪ 2^4 = 16 reachable terminal
+    regions; depth 3 caps interaction order at 3 features). The Ridge's
+    regularization currently absorbs the overfit (research_calibrator_prob
+    std-coef +0.05), so this is a forward integrity fix — NOT a
+    bleeding-alpha fix — and the change is bounded-risk against today's
+    bounded effect. Per-fold WF GBM training (the structurally cleaner
+    remediation) stays deferred until ~30 weeks corpus (~2026-06-20)
+    because at 22 weeks the per-fold rows fall below the
+    ``min_child_samples=30`` threshold.
     """
     return {
         "objective": "regression",
         "metric": "mse",
-        "num_leaves": 15,
-        "max_depth": 4,
+        "num_leaves": 8,
+        "max_depth": 3,
         "min_child_samples": 30,
         "learning_rate": 0.05,
         "feature_fraction": 0.9,
@@ -277,7 +297,14 @@ class ResearchGBMScorer:
         return float(self.predict(row)[0])
 
     def metrics(self) -> dict:
-        """Diagnostic metrics for the manifest + email."""
+        """Diagnostic metrics for the manifest + email.
+
+        ``train_ic`` and ``train_val_ic_ratio`` are caller-supplied (the
+        meta-trainer computes ``train_ic`` against the GBM's own training
+        split). The scorer carries ``val_ic`` from its early-stop holdout
+        and nothing else — the ratio is a *cross-split* concept the scorer
+        doesn't own.
+        """
         return {
             "type": "research_gbm_v1",
             "fitted": self._fitted,

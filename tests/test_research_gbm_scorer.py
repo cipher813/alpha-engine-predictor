@@ -44,6 +44,19 @@ class TestConstructorAndContract:
         assert scorer.fitted is False
         assert scorer.feature_names == RESEARCH_GBM_FEATURES
 
+    def test_default_params_overfit_tightening_2026_05_19(self):
+        """ROADMAP L1816 fix: ``num_leaves`` 15→8 + ``max_depth`` 4→3 to cap
+        the LightGBM hypothesis space below the row count of a 21d-horizon
+        training corpus. Pinning the values guards against a future
+        params-revert that would silently reopen the overfit surface.
+        """
+        from model.research_gbm import _default_params
+        p = _default_params()
+        assert p["num_leaves"] == 8
+        assert p["max_depth"] == 3
+        # Other params are not part of this PR's intent — pin only the
+        # two leaves/depth knobs the fix touched.
+
     def test_feature_names_are_canonical_9(self):
         # Audit §8 Phase 3 deliverable: research_composite_score +
         # research_conviction + sector_macro_modifier + 6 macro features
