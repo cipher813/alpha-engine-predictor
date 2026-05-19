@@ -190,3 +190,77 @@ def test_source_tickers_match_data_side_convention() -> None:
     convention."""
     for ticker in SOURCE_TICKERS:
         assert not ticker.startswith("^"), f"{ticker} should not have ^ prefix"
+
+
+# ── Wave-3 reader migration (ROADMAP L1401) ─────────────────────────────────
+
+
+def test_wave3_reader_prefers_new_prefix_over_legacy() -> None:
+    """During the producer write-both soak (alpha-engine-data#270 shipped
+    2026-05-19; ≥1-week soak), both prefixes hold byte-equal copies. The
+    reader MUST consult ``reference/price_cache/`` first so the new home
+    is exercised end-to-end before PR4 deletes legacy."""
+    from regime.features import _PRICE_CACHE_NEW_PREFIX, _read_parquet_close
+
+    s3 = _FakeS3()
+    # Seed the NEW prefix with one Close value, LEGACY with a clearly-
+    # different one. If the reader picked legacy, we'd see 999.
+    new_df = pd.DataFrame(
+        {"Close": [100.0]},
+        index=pd.to_datetime(["2026-05-19"]),
+    )
+    legacy_df = pd.DataFrame(
+        {"Close": [999.0]},
+        index=pd.to_datetime(["2026-05-19"]),
+    )
+    s3.put_parquet("bkt", f"{_PRICE_CACHE_NEW_PREFIX}SPY.parquet", new_df)
+    s3.put_parquet("bkt", f"{DEFAULT_PRICE_CACHE_PREFIX}SPY.parquet", legacy_df)
+
+    s = _read_parquet_close(
+        "SPY", s3_client=s3, bucket="bkt",
+        prefix=DEFAULT_PRICE_CACHE_PREFIX,
+    )
+    assert s.iloc[0] == 100.0, "reader picked legacy when new was present"
+
+
+def test_wave3_reader_falls_back_to_legacy_when_new_missing() -> None:
+    """Early in the soak window the NEW prefix can lag a fresh ticker.
+    The reader must fall back to legacy gracefully."""
+    from regime.features import _read_parquet_close
+
+    s3 = _FakeS3()
+    legacy_df = pd.DataFrame(
+        {"Close": [123.0]},
+        index=pd.to_datetime(["2026-05-19"]),
+    )
+    # Only legacy seeded (no NEW key).
+    s3.put_parquet("bkt", f"{DEFAULT_PRICE_CACHE_PREFIX}SPY.parquet", legacy_df)
+
+    s = _read_parquet_close(
+        "SPY", s3_client=s3, bucket="bkt",
+        prefix=DEFAULT_PRICE_CACHE_PREFIX,
+    )
+    assert s.iloc[0] == 123.0
+
+
+def test_wave3_reader_explicit_custom_prefix_does_not_fall_back() -> None:
+    """Test/config-override callers that pass a non-default prefix opt
+    out of the fallback chain — single-prefix semantics. Mirrors the
+    write-side ``price_cache_write_prefixes`` opt-out."""
+    from regime.features import _read_parquet_close
+
+    s3 = _FakeS3()
+    # Seed only the legacy default — the custom prefix has nothing.
+    s3.put_parquet(
+        "bkt", f"{DEFAULT_PRICE_CACHE_PREFIX}SPY.parquet",
+        pd.DataFrame(
+            {"Close": [100.0]},
+            index=pd.to_datetime(["2026-05-19"]),
+        ),
+    )
+    s = _read_parquet_close(
+        "SPY", s3_client=s3, bucket="bkt",
+        prefix="custom/explicit/",  # NOT the default
+    )
+    # Custom prefix had no SPY.parquet → empty (no fallback to legacy).
+    assert s.empty

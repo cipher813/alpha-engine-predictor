@@ -49,6 +49,20 @@ logger = logging.getLogger(__name__)
 DEFAULT_S3_BUCKET: str = "alpha-engine-research"
 DEFAULT_PRICE_CACHE_PREFIX: str = "predictor/price_cache/"
 
+# Wave-3 reader migration (ROADMAP L1401): producer write-both PR1
+# (alpha-engine-data#270, shipped 2026-05-19) seeded the new
+# ``reference/price_cache/`` prefix. During the ≥1-week soak window
+# (~2026-05-19 → 2026-05-26) every reader should consult the new
+# prefix first and fall back to legacy on miss. ``_read_parquet_close``
+# below iterates this list when the caller uses the legacy default;
+# explicit-prefix callers (tests, custom configs) opt out and get
+# single-prefix semantics. Wave-3 PR4 cutover drops the legacy entry
+# in a one-line edit here.
+_PRICE_CACHE_NEW_PREFIX: str = "reference/price_cache/"
+_PRICE_CACHE_FALLBACK_PREFIXES: tuple[str, ...] = (
+    _PRICE_CACHE_NEW_PREFIX, DEFAULT_PRICE_CACHE_PREFIX,
+)
+
 
 # Source tickers expected as ``{prefix}{ticker}.parquet`` keys. Index
 # symbols (VIX, VIX3M, TNX) require a leading caret in yfinance (^VIX,
@@ -69,14 +83,35 @@ def _read_parquet_close(
 ) -> pd.Series:
     """Read ``{prefix}{ticker}.parquet`` from S3 and return its Close
     column as a Series indexed by date. Returns an empty Series when
-    the key is missing — callers decide whether absence is fatal."""
-    key = f"{prefix}{ticker}.parquet"
-    try:
-        obj = s3_client.get_object(Bucket=bucket, Key=key)
-    except Exception as e:
+    the key is missing — callers decide whether absence is fatal.
+
+    When ``prefix == DEFAULT_PRICE_CACHE_PREFIX`` (the production
+    default), iterates the Wave-3 fallback list (new → legacy). When
+    ``prefix`` is anything else (test/override) we treat it as an
+    explicit single-prefix read.
+    """
+    # Pick the active read order. Default → fallback chain; custom →
+    # single-prefix.
+    if prefix == DEFAULT_PRICE_CACHE_PREFIX:
+        candidate_prefixes: tuple[str, ...] = _PRICE_CACHE_FALLBACK_PREFIXES
+    else:
+        candidate_prefixes = (prefix,)
+
+    obj = None
+    last_key: str | None = None
+    last_exc: Exception | None = None
+    for cand in candidate_prefixes:
+        last_key = f"{cand}{ticker}.parquet"
+        try:
+            obj = s3_client.get_object(Bucket=bucket, Key=last_key)
+            break
+        except Exception as e:
+            last_exc = e
+
+    if obj is None:
         logger.warning(
             "[regime_features] missing %s at s3://%s/%s (%s) — returning empty series",
-            ticker, bucket, key, type(e).__name__,
+            ticker, bucket, last_key, type(last_exc).__name__ if last_exc else "unknown",
         )
         return pd.Series(name=ticker, dtype="float64")
 
