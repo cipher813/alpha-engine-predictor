@@ -31,6 +31,7 @@ from regime.drawdown import (
     load_state,
     most_protective,
     read_eod_pnl_nav,
+    seed_state,
     step,
 )
 
@@ -261,6 +262,129 @@ def test_eod_pnl_too_short_returns_none() -> None:
 
 def test_eod_pnl_empty_returns_none() -> None:
     assert read_eod_pnl_nav(_S3(b""), bucket="b") is None
+
+
+# ── cold-start seed_state ────────────────────────────────────────────────
+
+def test_seed_state_uses_true_trailing_peak_not_today() -> None:
+    # Rallied to 120 then fell to 102 (-15% from the trailing peak). A
+    # naive cold start (peak=today) would report ~0%; seed_state must
+    # use the 120 peak and start in risk_off.
+    idx = pd.date_range("2020-01-01", periods=6, freq="W")
+    spy = pd.Series([100, 110, 120, 115, 108, 102], index=idx)
+    st = seed_state(spy)
+    assert st.spy_peak == 120.0
+    assert st.spy_tier == "risk_off"          # -15% ≥ 10% enter
+    # First real step from the seed reports the true drawdown, not 0.
+    st2, art = step(st, spy_close=102.0, trading_day="d0",
+                     calendar_date="c0", run_id="r")
+    assert art["spy"]["drawdown"] == pytest.approx(102 / 120 - 1.0)
+    assert st2.spy_tier == "risk_off"
+
+
+def test_seed_state_conservative_tier_thresholds() -> None:
+    idx = pd.date_range("2020-01-01", periods=3, freq="W")
+    assert seed_state(pd.Series([100, 100, 97], index=idx)).spy_tier == "risk_on"
+    assert seed_state(pd.Series([100, 100, 94], index=idx)).spy_tier == "caution"
+    assert seed_state(pd.Series([100, 100, 89], index=idx)).spy_tier == "risk_off"
+
+
+def test_seed_state_nav_excess_seeding() -> None:
+    idx = pd.date_range("2020-01-01", periods=3, freq="W")
+    spy = pd.Series([100, 100, 100], index=idx)        # SPY flat at peak
+    nav = pd.Series([100, 100, 93], index=idx)         # book -7% ⇒ excess 7%
+    st = seed_state(spy, nav_history=nav)
+    assert st.nav_peak == 100.0 and st.excess_tier == "alpha_bleed"
+
+
+def test_seed_state_empty_history() -> None:
+    assert seed_state(pd.Series(dtype=float)) == DrawdownState()
+
+
+# ── daily stage: _advance_drawdown (observe-only) ────────────────────────
+
+def test_stage_advances_drawdown_observe_only(monkeypatch) -> None:
+    """The fast-signal stage also advances the drawdown leg: stamps
+    ctx.drawdown_effective_regime + persists state/artifact/sidecar,
+    while leaving predictions + the fast-signal path untouched."""
+    import inference.stages.regime_fast_signal as stg
+    from inference.pipeline import PipelineContext
+
+    class _NoSuchKey(Exception):
+        pass
+
+    puts: dict[str, str] = {}
+
+    class _FakeS3:
+        class exceptions:
+            NoSuchKey = _NoSuchKey
+
+        def get_object(self, Bucket, Key):  # noqa: N803 — cold start both
+            raise _NoSuchKey()
+
+        def put_object(self, **kw):
+            pass
+
+    monkeypatch.setitem(
+        __import__("sys").modules, "boto3",
+        type("B", (), {"client": staticmethod(lambda svc: _FakeS3())}),
+    )
+    monkeypatch.setattr(stg, "_s3_put_json",
+                        lambda s3, b, k, body: puts.__setitem__(k, body))
+    monkeypatch.setattr(stg, "_emit_metrics", lambda art: None)
+
+    ctx = PipelineContext(date_str="2026-05-15", dry_run=False, local=False,
+                          bucket="alpha-engine-research")
+    ctx.regime_intensity_z = -2.5
+    # -16% from the 120 trailing peak ⇒ drawdown leg → risk_off → bear.
+    ctx.macro = {"SPY": pd.Series(
+        [100.0, 110.0, 120.0, 112.0, 105.0, 101.0],
+        index=pd.date_range("2026-04-01", periods=6, freq="W"),
+    )}
+    assert ctx.drawdown_effective_regime is None  # default
+
+    stg.run(ctx)
+
+    assert ctx.drawdown_effective_regime == "bear"        # risk_off escalates
+    assert stg.DRAWDOWN_STATE_KEY in puts
+    assert any("regime/drawdown/" in k for k in puts)      # artifact + latest
+    # Fast-signal path unaffected (cold-start warmup ⇒ forced_bear False).
+    assert ctx.regime_forced_bear is False
+
+
+def test_stage_drawdown_graceful_when_spy_missing(monkeypatch) -> None:
+    """No SPY in ctx.macro ⇒ drawdown leg skips cleanly; fast-signal +
+    predictions unaffected, ctx.drawdown_effective_regime stays None."""
+    import inference.stages.regime_fast_signal as stg
+    from inference.pipeline import PipelineContext
+
+    class _NoSuchKey(Exception):
+        pass
+
+    class _FakeS3:
+        class exceptions:
+            NoSuchKey = _NoSuchKey
+
+        def get_object(self, Bucket, Key):  # noqa: N803
+            raise _NoSuchKey()
+
+        def put_object(self, **kw):
+            pass
+
+    monkeypatch.setitem(
+        __import__("sys").modules, "boto3",
+        type("B", (), {"client": staticmethod(lambda svc: _FakeS3())}),
+    )
+    monkeypatch.setattr(stg, "_s3_put_json", lambda *a, **k: None)
+    monkeypatch.setattr(stg, "_emit_metrics", lambda art: None)
+
+    ctx = PipelineContext(date_str="2026-05-15", bucket="alpha-engine-research")
+    ctx.regime_intensity_z = 0.1
+    ctx.macro = {}  # no SPY
+
+    stg.run(ctx)  # must not raise
+
+    assert ctx.drawdown_effective_regime is None
 
 
 # ── additive substrate hook ──────────────────────────────────────────────
