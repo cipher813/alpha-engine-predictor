@@ -106,6 +106,15 @@ class PipelineContext:
     # degrades the veto to its legacy (Wire 4 / discrete) behavior.
     regime_forced_bear: bool = False
 
+    # ── Drawdown regime leg (set by regime_fast_signal stage; observe-only) ──
+    # Composed effective regime from the deterministic drawdown leg
+    # (regime-drawdown-hysteresis-260518.md). PR 2 = producer/observe
+    # only: NO consumer reads this yet (the executor/predictor-veto
+    # consumer PRs, gated `drawdown_regime_enabled` default-off, will).
+    # Stamped from the drawdown artifact so the consumer PRs read it
+    # in-process, mirroring `regime_forced_bear`.
+    drawdown_effective_regime: Optional[str] = None
+
     def near_timeout(self) -> bool:
         """Check if we're nearing the Lambda soft timeout."""
         elapsed = _time.monotonic() - self.start_ts

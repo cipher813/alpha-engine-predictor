@@ -488,3 +488,62 @@ def read_eod_pnl_nav(
         )
         return None
     return series
+
+
+# ── Cold-start seeding ───────────────────────────────────────────────────
+
+def seed_state(
+    spy_close_history: "pd.Series",
+    *,
+    nav_history: "pd.Series | None" = None,
+    tunables: DrawdownTunables | None = None,
+) -> DrawdownState:
+    """Derive a cold-start state from price/NAV history.
+
+    Why this exists: ``step()`` accumulates the running peak online, so a
+    naive cold start (peak = today's close) would report ~0% drawdown
+    even if the market is mid-crash — silently fabricating a settled
+    'no drawdown' (the exact failure ``feedback_no_silent_fails``
+    warns about). Seeding the **true trailing peak** (history cummax) +
+    a conservative initial tier (the deepest tier the *current* depth
+    warrants, via the ENTER thresholds — pure-level needs no prior-tier
+    history) makes the very first online ``step()`` report the real
+    drawdown.
+
+    Returns a ``DrawdownState`` with ``observations_seen=0`` and
+    ``last_update_trading_day=None`` so the first real ``step()`` advances
+    (not idempotent-skipped).
+    """
+    t = tunables or DrawdownTunables()
+    s = spy_close_history.dropna()
+    if s.empty:
+        return DrawdownState()
+    spy_peak = float(s.cummax().iloc[-1])
+    spy_close = float(s.iloc[-1])
+    spy_dd = spy_close / spy_peak - 1.0 if spy_peak else 0.0
+    spy_mag = -spy_dd
+    if spy_mag >= t.spy_risk_off_enter:
+        spy_tier = "risk_off"
+    elif spy_mag >= t.spy_caution_enter:
+        spy_tier = "caution"
+    else:
+        spy_tier = "risk_on"
+
+    nav_peak: float | None = None
+    excess_tier = "risk_on"
+    if nav_history is not None:
+        nv = nav_history.dropna()
+        if not nv.empty:
+            nav_peak = float(nv.cummax().iloc[-1])
+            nav_close = float(nv.iloc[-1])
+            nav_dd = nav_close / nav_peak - 1.0 if nav_peak else 0.0
+            if max(spy_dd - nav_dd, 0.0) >= t.excess_enter:
+                excess_tier = "alpha_bleed"
+
+    return DrawdownState(
+        spy_tier=spy_tier,
+        excess_tier=excess_tier,
+        spy_peak=spy_peak,
+        nav_peak=nav_peak,
+        observations_seen=0,
+    )
