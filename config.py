@@ -64,7 +64,13 @@ PREDICTIONS_LATEST_KEY = "predictor/predictions/latest.json"
 
 METRICS_KEY = "predictor/metrics/latest.json"
 
-PRICE_CACHE_KEY = "predictor/price_cache/{ticker}.parquet"
+# ``PRICE_CACHE_KEY`` (was ``"predictor/price_cache/{ticker}.parquet"``) was
+# deleted 2026-05-19 — Wave-3 PR3-wave-2 audit found zero references across
+# the predictor tree (`git grep PRICE_CACHE_KEY` returned only this site).
+# The active per-prefix constants live with their readers — see
+# ``regime/features.DEFAULT_PRICE_CACHE_PREFIX`` + the Wave-3 fallback chain
+# added in #181. Keeping a stale module-level constant invites a future
+# `from config import PRICE_CACHE_KEY` that bypasses the read-prefix chain.
 
 # ── Features ──────────────────────────────────────────────────────────────────
 # Must stay in sync with data/feature_engineer.py::compute_features().

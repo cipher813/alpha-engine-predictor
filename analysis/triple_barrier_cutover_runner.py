@@ -134,13 +134,26 @@ def _load_prices_from_s3(
 
     s3 = s3_client or boto3.client("s3")
     prices: dict = {}
+    # Wave-3 reader migration (ROADMAP L1401): try ``reference/price_cache/``
+    # first, fall back to legacy ``predictor/price_cache/`` for the soak
+    # window. Mirrors regime/features._read_parquet_close's chain (PR #181)
+    # without importing from a deployed-Lambda module — analysis tools stay
+    # decoupled from Lambda concerns.
+    price_cache_prefixes: tuple[str, ...] = (
+        "reference/price_cache/", "predictor/price_cache/",
+    )
     for ticker in tickers:
-        key = f"predictor/price_cache/{ticker}.parquet"
-        try:
-            obj = s3.get_object(Bucket=bucket, Key=key)
-            df = pd.read_parquet(BytesIO(obj["Body"].read()))
-        except Exception as e:
-            log.debug("Skipping price load for %s: %s", ticker, e)
+        df = None
+        for prefix in price_cache_prefixes:
+            key = f"{prefix}{ticker}.parquet"
+            try:
+                obj = s3.get_object(Bucket=bucket, Key=key)
+                df = pd.read_parquet(BytesIO(obj["Body"].read()))
+                break
+            except Exception as e:
+                last_exc = e
+        if df is None:
+            log.debug("Skipping price load for %s: %s", ticker, last_exc)
             continue
         if df is None or df.empty or "Close" not in df.columns:
             continue
@@ -161,7 +174,16 @@ def _load_sector_map_from_s3(bucket: str, s3_client=None) -> dict:
     import boto3
 
     s3 = s3_client or boto3.client("s3")
-    for key in ("data/sector_map.json", "predictor/price_cache/sector_map.json"):
+    # sector_map.json now lives at 3 keys post alpha-engine-data #272
+    # (write-both gap fix that landed alongside Wave-3 PR3-wave-1): the
+    # constituents collector writes to data/, predictor/, AND the new
+    # reference/ home. Read order = ``reference/`` first (post-PR4 sole
+    # survivor), then the two legacy keys we've historically tolerated.
+    for key in (
+        "reference/price_cache/sector_map.json",
+        "data/sector_map.json",
+        "predictor/price_cache/sector_map.json",
+    ):
         try:
             obj = s3.get_object(Bucket=bucket, Key=key)
             return json.loads(obj["Body"].read())
