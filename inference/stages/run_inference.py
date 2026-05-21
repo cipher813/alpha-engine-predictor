@@ -615,7 +615,7 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
         ticker_pillar_assessment_for_stance = _extract_pillar_assessment_for_stance(
             research_signals.get(ticker)
         )
-        stance, stance_loadings, catalyst_date = classify_stance(
+        stance, stance_loadings, catalyst_date, stance_source = classify_stance(
             latest,
             pillar_assessment=ticker_pillar_assessment_for_stance,
         )
@@ -863,6 +863,7 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
             # trading days.
             "stance": stance,
             "stance_loadings": stance_loadings,
+            "stance_source": stance_source,
             "catalyst_date": catalyst_date,
             "expected_move": round(expected_move, 6),
             # Stage 1c parallel-observation field: macro-augmented vol

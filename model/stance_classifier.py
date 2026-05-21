@@ -256,8 +256,9 @@ def classify_stance(
     features: Any,
     *,
     pillar_assessment: dict | None = None,
-) -> tuple[StanceLiteral, dict[str, float], str | None]:
-    """Return ``(dominant_stance, loadings_dict, catalyst_date_or_None)``.
+) -> tuple[StanceLiteral, dict[str, float], str | None, str]:
+    """Return ``(dominant_stance, loadings_dict, catalyst_date_or_None,
+    stance_source)``.
 
     ``loadings_dict`` is a dict of 4 floats in [0, 1] summing to 1.0
     (the softmax of raw per-stance scores). It matches the field shape
@@ -273,15 +274,24 @@ def classify_stance(
     executor's catalyst gate computes the hard-exit date from
     ``days_to_earnings`` directly in that case.
 
+    ``stance_source`` is one of ``"pillar"`` | ``"heuristic"`` —
+    per-ticker observability of which code path produced the
+    assignment. Without it the predictions/{date}.json audit trail
+    couldn't differentiate pillar-derived vs heuristic-derived
+    assignments post-Phase-5; closes the observability gap surfaced
+    before merging predictor #183.
+
     Two code paths (Phase 5 of attractiveness-pillars-260520 arc,
     2026-05-21):
-      * ``pillar_assessment`` present + non-empty → derive raw stance
-        scores from the 6 pillar scores + catalyst_horizon_modulation
+      * ``pillar_assessment`` present + has readable scores →
+        ``stance_source="pillar"``, raw stance scores derived from
+        the 6 pillar scores + catalyst_horizon_modulation
         (institutional pillar-decomposed routing — see
         ``_pillar_raw_scores`` for the mapping).
-      * ``pillar_assessment`` absent OR empty → fall back to the
-        feature-based heuristic (``_raw_scores``). This is the path
-        held-position recompute hits + the pre-Phase-4 history hits.
+      * ``pillar_assessment`` absent OR empty OR no readable scores
+        → ``stance_source="heuristic"``, raw scores from the feature
+        heuristic (``_raw_scores``). This is the path held-position
+        recompute hits + the pre-Phase-4 history hits.
 
     Both paths apply the same softmax temperature so loadings shapes
     are comparable across the cutover. The pillar path's acceptance
@@ -292,8 +302,11 @@ def classify_stance(
     Pure function — no I/O, no state. Takes a dict / pandas Series /
     anything with ``.get()``.
     """
+    stance_source = "heuristic"
     raw = _pillar_raw_scores(pillar_assessment) if pillar_assessment else None
-    if raw is None:
+    if raw is not None:
+        stance_source = "pillar"
+    else:
         raw = _raw_scores(features)
 
     # Apply temperature sharpening to amplify the dominant stance
@@ -320,4 +333,4 @@ def classify_stance(
     # tolerance compatibility with StanceLoadings validator (±1e-3).
     loadings = {k: round(v, 6) for k, v in loadings.items()}
 
-    return dominant, loadings, catalyst_date
+    return dominant, loadings, catalyst_date, stance_source

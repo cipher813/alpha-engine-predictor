@@ -33,7 +33,7 @@ class TestClassifyStanceShape:
 
     def test_returns_three_tuple(self):
         result = classify_stance({"momentum_20d": 0.05})
-        assert isinstance(result, tuple) and len(result) == 3
+        assert isinstance(result, tuple) and len(result) == 4
 
     def test_loadings_sum_to_one(self):
         """Softmax → loadings must form a proper probability
@@ -45,7 +45,7 @@ class TestClassifyStanceShape:
             {},  # empty
             {"momentum_20d": float("nan"), "days_to_earnings": 10},
         ]:
-            _, loadings, _ = classify_stance(features)
+            _, loadings, _, _ = classify_stance(features)
             total = sum(loadings.values())
             assert abs(total - 1.0) < 1e-3, (
                 f"loadings sum to {total} for features={features}"
@@ -55,12 +55,12 @@ class TestClassifyStanceShape:
         """Every call returns all 4 stance keys. Pinned so a future
         feature-set refactor that drops a stance branch doesn't make
         downstream consumers crash on KeyError."""
-        _, loadings, _ = classify_stance({"momentum_20d": 0.10})
+        _, loadings, _, _ = classify_stance({"momentum_20d": 0.10})
         assert set(loadings.keys()) == set(STANCE_NAMES)
 
     def test_loadings_each_in_unit_interval(self):
         """Each loading must be in [0, 1] — proper probability."""
-        _, loadings, _ = classify_stance({"momentum_20d": 0.10})
+        _, loadings, _, _ = classify_stance({"momentum_20d": 0.10})
         for stance, loading in loadings.items():
             assert 0.0 <= loading <= 1.0, f"{stance}={loading} out of bounds"
 
@@ -73,7 +73,7 @@ class TestClassifyStanceShape:
             {"days_to_earnings": 10},
             {"realized_vol_20d": 0.10, "debt_to_equity": 0.3},
         ]:
-            dominant, loadings, _ = classify_stance(features)
+            dominant, loadings, _, _ = classify_stance(features)
             argmax_stance = max(loadings, key=lambda k: loadings[k])
             assert dominant == argmax_stance, (
                 f"dominant={dominant} != argmax({loadings})={argmax_stance}"
@@ -81,7 +81,7 @@ class TestClassifyStanceShape:
 
     def test_dominant_is_in_canonical_vocabulary(self):
         """``dominant`` is always one of the 4 StanceLiteral values."""
-        dominant, _, _ = classify_stance({})
+        dominant, _, _, _ = classify_stance({})
         assert dominant in STANCE_NAMES
 
 
@@ -92,7 +92,7 @@ class TestStanceLoadingsBehavior:
     def test_strong_momentum_dominates_loading(self):
         """+20% in 20d AND price > MA50 → momentum is the dominant
         loading by a wide margin."""
-        _, loadings, _ = classify_stance({
+        _, loadings, _, _ = classify_stance({
             "momentum_20d": 0.20,
             "price_vs_ma50": 1.10,
             "realized_vol_20d": 0.20,
@@ -108,7 +108,7 @@ class TestStanceLoadingsBehavior:
     def test_oversold_with_quality_fundamentals_dominates_value(self):
         """-15% in 20d AND low debt AND positive EPS → value is the
         dominant loading."""
-        _, loadings, _ = classify_stance({
+        _, loadings, _, _ = classify_stance({
             "momentum_20d": -0.15,
             "price_vs_ma50": 0.85,
             "debt_to_equity": 0.3,  # low leverage
@@ -122,12 +122,12 @@ class TestStanceLoadingsBehavior:
         """-15% in 20d AND high debt AND negative EPS → value loading
         is dampened by the fundamental_quality factor. Either quality
         wins (default tiebreaker) or value still wins but by less."""
-        _, loadings_distressed, _ = classify_stance({
+        _, loadings_distressed, _, _ = classify_stance({
             "momentum_20d": -0.15,
             "debt_to_equity": 3.5,
             "eps_ttm": -2.0,
         })
-        _, loadings_quality, _ = classify_stance({
+        _, loadings_quality, _, _ = classify_stance({
             "momentum_20d": -0.15,
             "debt_to_equity": 0.3,
             "eps_ttm": 3.0,
@@ -141,7 +141,7 @@ class TestStanceLoadingsBehavior:
     def test_low_vol_low_debt_dominates_quality(self):
         """Low realized vol + low debt + flat momentum → quality is
         the dominant loading."""
-        _, loadings, _ = classify_stance({
+        _, loadings, _, _ = classify_stance({
             "momentum_20d": 0.01,
             "realized_vol_20d": 0.08,
             "debt_to_equity": 0.2,
@@ -153,7 +153,7 @@ class TestStanceLoadingsBehavior:
     def test_upcoming_earnings_dominates_catalyst(self):
         """Earnings 10 days out (peak of catalyst bell curve) →
         catalyst is the dominant loading."""
-        _, loadings, _ = classify_stance({
+        _, loadings, _, _ = classify_stance({
             "momentum_20d": 0.02,
             "days_to_earnings": 10,
         })
@@ -165,7 +165,7 @@ class TestStanceLoadingsBehavior:
         """Earnings 90 days out → catalyst loading near zero (outside
         the bell curve's effective range). Falls through to other
         stances."""
-        _, loadings, _ = classify_stance({
+        _, loadings, _, _ = classify_stance({
             "momentum_20d": 0.02,
             "days_to_earnings": 90,
         })
@@ -180,7 +180,7 @@ class TestStanceLoadingsBehavior:
         """Earnings in the past (negative days) → catalyst loading
         ~zero. Defensive against a feature pipeline that emits
         negative values."""
-        _, loadings, _ = classify_stance({
+        _, loadings, _, _ = classify_stance({
             "momentum_20d": 0.02,
             "days_to_earnings": -3,
         })
@@ -195,7 +195,7 @@ class TestStanceLoadingsBehavior:
         BOTH stances (not 1.0 on one and 0.0 on others). Pinned so a
         future refactor that returns to hard-coded discrete rules
         breaks this test."""
-        _, loadings, _ = classify_stance({
+        _, loadings, _, _ = classify_stance({
             "momentum_20d": 0.12,         # strong momentum
             "price_vs_ma50": 1.08,
             "days_to_earnings": 12,       # near catalyst peak
@@ -209,14 +209,14 @@ class TestCatalystDateField:
     """``catalyst_date`` is the executor's exit-boundary signal."""
 
     def test_catalyst_date_passed_through_when_provided(self):
-        _, _, catalyst_date = classify_stance({
+        _, _, catalyst_date, _ = classify_stance({
             "days_to_earnings": 5,
             "next_earnings_date": "2026-05-16",
         })
         assert catalyst_date == "2026-05-16"
 
     def test_catalyst_date_none_when_field_absent(self):
-        _, _, catalyst_date = classify_stance({
+        _, _, catalyst_date, _ = classify_stance({
             "days_to_earnings": 5,
         })
         assert catalyst_date is None
@@ -224,7 +224,7 @@ class TestCatalystDateField:
     def test_catalyst_date_none_for_non_string_values(self):
         """Defensive: feature pipeline drift could emit a non-string
         value. Coerce to None rather than passing through bad data."""
-        _, _, catalyst_date = classify_stance({
+        _, _, catalyst_date, _ = classify_stance({
             "days_to_earnings": 5,
             "next_earnings_date": 20260516,  # int instead of ISO string
         })
@@ -237,7 +237,7 @@ class TestDefensivePaths:
     def test_empty_features_returns_valid_distribution(self):
         """Empty feature row — classifier returns a valid softmax
         (probably uniform) not a crash."""
-        dominant, loadings, _ = classify_stance({})
+        dominant, loadings, _, _ = classify_stance({})
         assert dominant in STANCE_NAMES
         assert abs(sum(loadings.values()) - 1.0) < 1e-3
 
@@ -245,7 +245,7 @@ class TestDefensivePaths:
         """NaN feature values must not crash the classifier. Treated as
         zero / neutral defaults so the softmax still produces a valid
         distribution."""
-        dominant, loadings, _ = classify_stance({
+        dominant, loadings, _, _ = classify_stance({
             "momentum_20d": float("nan"),
             "price_vs_ma50": float("nan"),
             "days_to_earnings": float("nan"),
@@ -264,7 +264,7 @@ class TestDefensivePaths:
             "eps_ttm": 2.0,
             "realized_vol_20d": 0.20,
         })
-        dominant, loadings, _ = classify_stance(s)
+        dominant, loadings, _, _ = classify_stance(s)
         assert dominant in STANCE_NAMES
         assert abs(sum(loadings.values()) - 1.0) < 1e-3
 
@@ -319,7 +319,7 @@ class TestPillarAwareStanceClassifier:
                                 growth=40, stewardship=40,
                                 defensiveness=40, catalyst=0)
         # Features irrelevant — pillar path takes over
-        stance, loadings, _ = classify_stance({}, pillar_assessment=pa)
+        stance, loadings, _, _ = classify_stance({}, pillar_assessment=pa)
         assert stance == "momentum"
         # Loadings sum to 1.0 within sum-to-one tolerance (lib validator
         # tolerates ±1e-3 — we round to 6 decimals so should be ~exact)
@@ -331,7 +331,7 @@ class TestPillarAwareStanceClassifier:
         pa = _pillar_assessment(quality=40, value=90, momentum=40,
                                 growth=40, stewardship=40,
                                 defensiveness=40, catalyst=0)
-        stance, _, _ = classify_stance({}, pillar_assessment=pa)
+        stance, _, _, _ = classify_stance({}, pillar_assessment=pa)
         assert stance == "value"
 
     def test_quality_cluster_dominates_when_compounder_profile(self):
@@ -344,7 +344,7 @@ class TestPillarAwareStanceClassifier:
         pa = _pillar_assessment(quality=80, value=40, momentum=40,
                                 growth=80, stewardship=80,
                                 defensiveness=80, catalyst=0)
-        stance, loadings, _ = classify_stance({}, pillar_assessment=pa)
+        stance, loadings, _, _ = classify_stance({}, pillar_assessment=pa)
         assert stance == "quality"
         # Quality should be the largest loading by a meaningful margin
         # because mean(80, 80, 80, 80) = 80 vs momentum_pillar = 40
@@ -360,7 +360,7 @@ class TestPillarAwareStanceClassifier:
         pa = _pillar_assessment(quality=50, value=50, momentum=50,
                                 growth=50, stewardship=50,
                                 defensiveness=50, catalyst=20)
-        stance, _, _ = classify_stance({}, pillar_assessment=pa)
+        stance, _, _, _ = classify_stance({}, pillar_assessment=pa)
         assert stance == "catalyst"
 
     def test_negative_catalyst_modulation_does_not_route_to_catalyst(self):
@@ -373,7 +373,7 @@ class TestPillarAwareStanceClassifier:
         pa = _pillar_assessment(quality=80, value=50, momentum=50,
                                 growth=80, stewardship=80,
                                 defensiveness=80, catalyst=-15)
-        stance, _, _ = classify_stance({}, pillar_assessment=pa)
+        stance, _, _, _ = classify_stance({}, pillar_assessment=pa)
         assert stance != "catalyst"
 
     def test_pillar_path_falls_back_to_heuristic_when_pillars_empty(self):
@@ -382,8 +382,8 @@ class TestPillarAwareStanceClassifier:
 
         features = {"momentum_20d": 0.10, "realized_vol_20d": 0.30,
                     "debt_to_equity": 0.5, "eps_ttm": 2.0}
-        stance_a, loadings_a, _ = classify_stance(features, pillar_assessment={})
-        stance_b, loadings_b, _ = classify_stance(features, pillar_assessment=None)
+        stance_a, loadings_a, _, _ = classify_stance(features, pillar_assessment={})
+        stance_b, loadings_b, _, _ = classify_stance(features, pillar_assessment=None)
         # Empty dict and None should both fall back to feature heuristic
         # → same loadings
         assert stance_a == stance_b
@@ -398,8 +398,8 @@ class TestPillarAwareStanceClassifier:
         pa = {"catalyst_horizon_modulation": 5}  # no pillars
         features = {"momentum_20d": 0.10, "realized_vol_20d": 0.30,
                     "debt_to_equity": 0.5, "eps_ttm": 2.0}
-        stance_a, loadings_a, _ = classify_stance(features, pillar_assessment=pa)
-        stance_b, loadings_b, _ = classify_stance(features)
+        stance_a, loadings_a, _, _ = classify_stance(features, pillar_assessment=pa)
+        stance_b, loadings_b, _, _ = classify_stance(features)
         assert stance_a == stance_b
         for k in loadings_a:
             assert abs(loadings_a[k] - loadings_b[k]) < 1e-6
@@ -411,8 +411,39 @@ class TestPillarAwareStanceClassifier:
 
         pa = _pillar_assessment(quality=90)
         features = {"next_earnings_date": "2026-06-15"}
-        _, _, cd = classify_stance(features, pillar_assessment=pa)
+        _, _, cd, _ = classify_stance(features, pillar_assessment=pa)
         assert cd == "2026-06-15"
+
+    def test_stance_source_is_pillar_when_pillar_path_fires(self):
+        """stance_source observability field — when pillar_assessment has
+        readable scores, source is 'pillar'."""
+        from model.stance_classifier import classify_stance
+
+        pa = _pillar_assessment(quality=90)
+        _, _, _, source = classify_stance({}, pillar_assessment=pa)
+        assert source == "pillar"
+
+    def test_stance_source_is_heuristic_when_pillar_absent_or_empty(self):
+        """stance_source observability — when pillar_assessment is None
+        or empty or has no readable scores, source is 'heuristic'."""
+        from model.stance_classifier import classify_stance
+
+        _, _, _, source_none = classify_stance(
+            {"momentum_20d": 0.10}, pillar_assessment=None,
+        )
+        assert source_none == "heuristic"
+
+        _, _, _, source_empty = classify_stance(
+            {"momentum_20d": 0.10}, pillar_assessment={},
+        )
+        assert source_empty == "heuristic"
+
+        # catalyst-only (no pillar scores readable)
+        pa_no_pillars = {"catalyst_horizon_modulation": 5}
+        _, _, _, source_no_pillars = classify_stance(
+            {"momentum_20d": 0.10}, pillar_assessment=pa_no_pillars,
+        )
+        assert source_no_pillars == "heuristic"
 
     def test_pillar_path_loadings_sum_to_one_across_full_input_space(self):
         """Σ loadings == 1.0 must hold for any pillar input combination."""
@@ -431,7 +462,7 @@ class TestPillarAwareStanceClassifier:
             (10, 90, 10, 10, 90, 10, -10),  # value-heavy with neg catalyst
         ]:
             pa = _pillar_assessment(q, v, m, g, st, df, cat)
-            _, loadings, _ = classify_stance({}, pillar_assessment=pa)
+            _, loadings, _, _ = classify_stance({}, pillar_assessment=pa)
             assert abs(sum(loadings.values()) - 1.0) < 1e-3, (
                 f"Σ != 1.0 for pillar input "
                 f"q={q} v={v} m={m} g={g} st={st} df={df} cat={cat}: "
