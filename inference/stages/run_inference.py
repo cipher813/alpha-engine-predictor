@@ -22,6 +22,61 @@ from model.stance_classifier import classify_stance
 log = logging.getLogger(__name__)
 
 
+def _extract_pillar_assessment_for_stance(sig: dict | None) -> dict | None:
+    """Project research signal's ``composite_breakdown.pillar_contributions``
+    into the ``pillar_assessment``-shape dict that
+    ``stance_classifier.classify_stance`` expects when its pillar-aware
+    code path fires.
+
+    Source shape (research signals.json, post-Phase-4-cutover, 2026-05-21):
+        sig["composite_breakdown"] = {
+            "pillar_contributions": [
+                {"pillar": "quality", "qual_component": 80.0, ...},
+                ...
+            ],
+            "catalyst_modulation": int ∈ [-20, +20],
+            ...
+        }
+
+    Target shape (consumed by stance_classifier._pillar_raw_scores):
+        {
+            "quality": {"score": 80.0},
+            "value":   {"score": 65.0},
+            ...
+            "catalyst_horizon_modulation": int,
+        }
+
+    Returns ``None`` when:
+      * sig is None (research signal missing for this ticker — held
+        position, off-population, etc.)
+      * composite_breakdown is absent (pre-Phase-4 history)
+      * pillar_contributions is empty (PILLAR_EMIT was off OR pillar
+        extraction failed; classifier falls back to feature heuristic)
+
+    Phase 5 of attractiveness-pillars-260520 arc.
+    """
+    if not sig:
+        return None
+    breakdown = sig.get("composite_breakdown")
+    if not breakdown:
+        return None
+    contributions = breakdown.get("pillar_contributions") or []
+    if not contributions:
+        return None
+    pillar_dict: dict = {}
+    for c in contributions:
+        pillar = c.get("pillar")
+        qual = c.get("qual_component")
+        if pillar and qual is not None:
+            pillar_dict[pillar] = {"score": qual}
+    if not pillar_dict:
+        return None
+    pillar_dict["catalyst_horizon_modulation"] = (
+        breakdown.get("catalyst_modulation") or 0
+    )
+    return pillar_dict
+
+
 def _safe_get_numeric(latest: pd.Series, key: str, default: float) -> float:
     """Read a numeric feature from a precomputed row, returning ``default``
     if the value is missing or NaN.
@@ -541,17 +596,29 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
         # (institutional factor-model pattern) AND the dominant stance
         # label (simple-consumer routing). 4-element closed taxonomy:
         # momentum / value / quality / catalyst. Stance is DERIVED from
-        # per-ticker features here, not declared by the sector-team
-        # agents. Origin: 2026-05-11 stance taxonomy arc, mid-arc pivot
-        # to predictor-emitted stance + continuous loadings per
-        # alpha-engine-docs/private/stance-taxonomy-arc-260511.md.
+        # per-ticker features OR research-emitted pillar_assessments.
+        # Origin: 2026-05-11 stance taxonomy arc + Phase 5 of
+        # attractiveness-pillars-260520 arc (2026-05-21).
+        #
+        # Pillar path (when research signal carries composite_breakdown
+        # with populated pillar_contributions — post-2026-05-21 Phase 4
+        # cutover): pillar scores map to stance loadings via the
+        # institutional 6-pillar → 4-stance projection (see
+        # _pillar_raw_scores docstring). Heuristic-feature path stays
+        # as fallback for held-position recompute + pre-Phase-4 history.
         #
         # Simple consumers (executor v1, dashboards) read ``stance``
         # and route by single label. Nuanced consumers (backtester
         # per-loading attribution, future weighted-gate executor v2,
         # future ML stance classifier) read ``stance_loadings`` and
         # weight gates / sizing / attribution by each loading.
-        stance, stance_loadings, catalyst_date = classify_stance(latest)
+        ticker_pillar_assessment_for_stance = _extract_pillar_assessment_for_stance(
+            research_signals.get(ticker)
+        )
+        stance, stance_loadings, catalyst_date, stance_source = classify_stance(
+            latest,
+            pillar_assessment=ticker_pillar_assessment_for_stance,
+        )
 
         # Layer 1B: Volatility model. LightGBM handles NaN natively; if
         # predict raises that's a real load/inference fault we want loud,
@@ -796,6 +863,7 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
             # trading days.
             "stance": stance,
             "stance_loadings": stance_loadings,
+            "stance_source": stance_source,
             "catalyst_date": catalyst_date,
             "expected_move": round(expected_move, 6),
             # Stage 1c parallel-observation field: macro-augmented vol
