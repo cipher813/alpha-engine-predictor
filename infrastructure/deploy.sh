@@ -271,10 +271,14 @@ if [ -n "$CANARY_FUNC_ERR" ] || [ "$CANARY_STATUS" != "200" ]; then
   echo "       payload       : ${CANARY_ERR_MSG:-<empty>}"
   echo "       Live alias is unchanged. Investigate logs for function:${LAMBDA_FUNCTION} version ${VERSION}."
   # ROADMAP L221 — independent-channel surveillance per the alpha-engine-data
-  # #274 retrospective. Best-effort; trailing || true never overrides exit 1.
+  # #274 retrospective. ``dedup_key`` collapses an image-wide rebuild that
+  # breaks N Lambdas' canaries within the hour into one alert per
+  # (Lambda, version) — lib v0.24.0 substrate (L221 retrofit 2026-05-22).
+  # Best-effort; trailing || true never overrides exit 1.
   python3 -m alpha_engine_lib.alerts publish \
     --severity error \
     --source "alpha-engine-predictor/infrastructure/deploy.sh" \
+    --dedup-key "canary-fail-${LAMBDA_FUNCTION}-v${VERSION}" \
     --message "Canary failed — refused to promote ${LAMBDA_FUNCTION}:${VERSION} to live. FunctionError='${CANARY_FUNC_ERR:-<none>}' statusCode=${CANARY_STATUS} payload='${CANARY_ERR_MSG:-<empty>}'. Live alias unchanged." \
     || true
   exit 1
@@ -386,13 +390,16 @@ echo "  Found (or freshly created) — updating..."
     echo "       statusCode    : ${REGIME_STATUS}"
     echo "       payload       : ${REGIME_ERR_MSG:-<empty>}"
     echo "       Inference Lambda was already promoted; rollback regime separately if needed."
-    # ROADMAP L221 — independent-channel surveillance. Inference Lambda
-    # is already live at this point so the alert MUST surface: the operator
-    # may need to revert inference too if the regime canary failure
-    # indicates an upstream image issue.
+    # ROADMAP L221 — independent-channel surveillance. ``dedup_key``
+    # collapses an image-wide rebuild that breaks N Lambdas' canaries
+    # within the hour into one alert per (Lambda, version). Inference
+    # Lambda is already live at this point so the alert MUST surface:
+    # the operator may need to revert inference too if the regime
+    # canary failure indicates an upstream image issue.
     python3 -m alpha_engine_lib.alerts publish \
       --severity error \
       --source "alpha-engine-predictor/infrastructure/deploy.sh" \
+      --dedup-key "canary-fail-${REGIME_LAMBDA_FUNCTION}-v${REGIME_VERSION}" \
       --message "Regime canary failed — refused to promote ${REGIME_LAMBDA_FUNCTION}:${REGIME_VERSION} to live. FunctionError='${REGIME_FUNC_ERR:-<none>}' statusCode=${REGIME_STATUS} payload='${REGIME_ERR_MSG:-<empty>}'. NOTE: inference Lambda was already promoted to :${VERSION} — operator may need to rollback inference too if this is an image-wide issue." \
       || true
     exit 1
@@ -493,11 +500,15 @@ echo "  Found (or freshly created) — updating..."
     echo "       statusCode    : ${REGIME_EVAL_STATUS}"
     echo "       payload       : ${REGIME_EVAL_ERR_MSG:-<empty>}"
     echo "       Inference + substrate Lambdas were already promoted; rollback regime-eval separately if needed."
-    # ROADMAP L221 — independent-channel surveillance. Two upstream Lambdas
-    # already promoted; the alert is load-bearing for operator triage.
+    # ROADMAP L221 — independent-channel surveillance. ``dedup_key``
+    # collapses an image-wide rebuild that breaks N Lambdas' canaries
+    # within the hour into one alert per (Lambda, version). Two upstream
+    # Lambdas already promoted; the alert is load-bearing for operator
+    # triage.
     python3 -m alpha_engine_lib.alerts publish \
       --severity error \
       --source "alpha-engine-predictor/infrastructure/deploy.sh" \
+      --dedup-key "canary-fail-${REGIME_EVAL_LAMBDA_FUNCTION}-v${REGIME_EVAL_VERSION}" \
       --message "Regime-eval canary failed — refused to promote ${REGIME_EVAL_LAMBDA_FUNCTION}:${REGIME_EVAL_VERSION} to live. FunctionError='${REGIME_EVAL_FUNC_ERR:-<none>}' statusCode=${REGIME_EVAL_STATUS} payload='${REGIME_EVAL_ERR_MSG:-<empty>}'. NOTE: inference (${LAMBDA_FUNCTION}:${VERSION}) + regime (${REGIME_LAMBDA_FUNCTION}:${REGIME_VERSION}) were already promoted to live — operator may need to rollback all three if this is an image-wide issue." \
       || true
     exit 1
