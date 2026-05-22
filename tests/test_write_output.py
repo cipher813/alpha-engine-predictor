@@ -650,3 +650,84 @@ class TestEmailGating:
         # If we can't determine whether a re-invoke is coming, send the
         # email rather than risk silencing the morning briefing entirely.
         assert mock_send.called
+
+
+# ── L234: morning email surfaces effective optimizer params ──────────────
+
+
+class TestMorningEmailOptimizerParamsBlock:
+    """ROADMAP L234 morning-email side — the predictor email surfaces
+    the live `config/executor_params.json` block alongside the briefing
+    so the operator sees effective min_score_to_enter /
+    max_position_pct / atr_multiplier without tailing executor.log.
+
+    Best-effort + degrades gracefully on missing artifact.
+    """
+
+    def _build(self, *, bucket=None):
+        # Minimal happy-path inputs that exercise _build_predictor_email.
+        predictions = [
+            {"ticker": "A", "predicted_alpha": 0.01, "combined_rank": 1,
+             "predicted_direction": "UP", "prediction_confidence": 0.7,
+             "p_up": 0.65, "p_down": 0.35},
+        ]
+        metrics = {"model_version": "v1", "ic_30d": 0.10, "inference_mode": "meta"}
+        return wo._build_predictor_email(
+            predictions, metrics, "2026-05-22",
+            signals_data=None, veto_threshold=0.6, bucket=bucket,
+        )
+
+    def test_no_bucket_skips_block(self):
+        subject, html, plain = self._build(bucket=None)
+        assert "Effective Optimizer Params" not in html
+        assert "EFFECTIVE OPTIMIZER PARAMS" not in plain
+
+    def test_bucket_supplied_but_artifact_missing_silent(self):
+        with patch.object(wo, "_load_executor_params_for_email", return_value=None):
+            subject, html, plain = self._build(bucket="b")
+        assert "Effective Optimizer Params" not in html
+        assert "EFFECTIVE OPTIMIZER PARAMS" not in plain
+
+    def test_artifact_present_surfaces_block(self):
+        fake_params = {
+            "min_score": 65.0,
+            "max_position_pct": 0.10,
+            "atr_multiplier": 2.5,
+            "profit_take_pct": 0.20,
+            "updated_at": "2026-05-23",
+            "best_sharpe": 1.42,
+            "improvement_pct": 0.08,
+            "n_combos_tested": 200,
+        }
+        with patch.object(wo, "_load_executor_params_for_email", return_value=fake_params):
+            subject, html, plain = self._build(bucket="b")
+        # HTML block markers
+        assert "Effective Optimizer Params" in html
+        assert "min_score_to_enter" in html
+        assert "max_position_pct" in html
+        assert "atr_multiplier" in html
+        assert "2026-05-23" in html  # updated_at metadata
+        assert "1.42" in html         # best_sharpe metadata
+        assert "+8.0%" in html        # improvement_pct metadata
+        # Plain text mirror
+        assert "EFFECTIVE OPTIMIZER PARAMS" in plain
+        assert "min_score_to_enter" in plain
+
+    def test_manual_override_flag_surfaces_warning(self):
+        fake_params = {
+            "min_score": 55.0,
+            "manual_override": True,
+        }
+        with patch.object(wo, "_load_executor_params_for_email", return_value=fake_params):
+            subject, html, _plain = self._build(bucket="b")
+        # Warning class present
+        assert "manual override" in html.lower()
+
+    def test_load_helper_swallows_s3_errors(self):
+        """`_load_executor_params_for_email` must not raise — secondary
+        observability path; primary briefing path must survive S3
+        outage.
+        """
+        with patch("boto3.client", side_effect=RuntimeError("S3 down")):
+            result = wo._load_executor_params_for_email("b")
+        assert result is None

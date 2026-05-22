@@ -479,12 +479,41 @@ def write_predictions(
 
 # ── Predictor email ────────────────────────────────────────────────────────────
 
+def _load_executor_params_for_email(bucket: str) -> dict | None:
+    """Best-effort fetch of `config/executor_params.json` from the shared
+    research bucket — the auto-tuned params the executor reads at
+    cold-start. Used by `_build_predictor_email` to surface effective
+    optimizer params alongside the morning briefing (ROADMAP L234,
+    morning-email side). Returns None on any failure — the email
+    builder degrades gracefully (block is skipped, briefing still
+    sends).
+
+    Cross-module read: both predictor and executor reference the same
+    artifact (`alpha-engine/executor/main.py::_load_executor_params_from_s3`
+    is the consumer; backtester's `executor_optimizer.apply()` is the
+    producer). This loader exists to surface the live state on the
+    morning email, NOT to drive any predictor behaviour.
+    """
+    try:
+        import boto3
+        import json
+        s3 = boto3.client("s3")
+        obj = s3.get_object(Bucket=bucket, Key="config/executor_params.json")
+        data = json.loads(obj["Body"].read())
+        if isinstance(data, dict):
+            return data
+    except Exception as e:  # noqa: BLE001 — secondary observability; primary briefing path unaffected
+        log.debug("L234 executor-params email block: fetch failed (%s) — block skipped", e)
+    return None
+
+
 def _build_predictor_email(
     predictions: list[dict],
     metrics: dict,
     date_str: str,
     signals_data: dict | None = None,
     veto_threshold: float | None = None,
+    bucket: str | None = None,
 ) -> tuple[str, str, str]:
     """
     Build subject, HTML body, and plain-text body for the combined morning briefing.
@@ -492,6 +521,11 @@ def _build_predictor_email(
     When signals_data is supplied (the raw signals.json payload from the research
     pipeline), a research section is prepended containing market regime, buy
     candidates, and sector ratings. The GBM predictions follow as the second half.
+
+    When ``bucket`` is supplied, the email also includes an "Effective
+    optimizer params" block sourced from ``config/executor_params.json``
+    (ROADMAP L234 morning-email side). Best-effort — missing artifact
+    silently skips the block.
 
     Returns
     -------
@@ -755,6 +789,72 @@ def _build_predictor_email(
             f'</div>'
         )
 
+    # ── Effective optimizer params (ROADMAP L234) ──────────────────────────
+    # Surface the auto-tuned executor params alongside the briefing so
+    # the operator sees effective min_score_to_enter / max_position_pct /
+    # atr_multiplier (and the rest) without tailing executor.log. Best-
+    # effort — missing artifact silently skips the block.
+    executor_params_html = ""
+    executor_params_plain = ""
+    if bucket:
+        _ep = _load_executor_params_for_email(bucket)
+        if _ep:
+            _ep_keys_to_surface = [
+                ("min_score", "min_score_to_enter"),
+                ("max_position_pct", "max_position_pct"),
+                ("atr_multiplier", "atr_multiplier"),
+                ("profit_take_pct", "profit_take_pct"),
+                ("time_decay_reduce_days", "time_decay_reduce_days"),
+                ("time_decay_exit_days", "time_decay_exit_days"),
+            ]
+            _surface_rows: list[tuple[str, str]] = []
+            for key, label in _ep_keys_to_surface:
+                if key not in _ep:
+                    continue
+                val = _ep[key]
+                if isinstance(val, float):
+                    display = f"{val:.4f}" if abs(val) < 1 else f"{val:.2f}"
+                else:
+                    display = str(val)
+                _surface_rows.append((label, display))
+            _updated = _ep.get("updated_at", "—")
+            _best_sharpe = _ep.get("best_sharpe")
+            _improvement = _ep.get("improvement_pct")
+            _manual_override = bool(_ep.get("manual_override"))
+            if _surface_rows:
+                _meta_parts = [f"updated <b>{_updated}</b>"]
+                if isinstance(_best_sharpe, (int, float)):
+                    _meta_parts.append(f"best Sharpe <b>{_best_sharpe:.2f}</b>")
+                if isinstance(_improvement, (int, float)):
+                    _meta_parts.append(f"improvement <b>{_improvement:+.1%}</b>")
+                if _manual_override:
+                    _meta_parts.append('<span style="color:#b71c1c; font-weight:bold;">manual override</span>')
+                _ep_rows_html = "".join(
+                    f'<tr><td {TD}>{lbl}</td><td {TD} align="right">{v}</td>'
+                    f'<td {TD} style="color:#888; font-size:11px;">S3 (auto-tuned)</td></tr>'
+                    for lbl, v in _surface_rows
+                )
+                executor_params_html = (
+                    f'<div style="background:#fffbe6; border-left:3px solid #b8860b; padding:12px 16px; margin-bottom:16px;">'
+                    f'<h3 style="margin:0 0 8px 0; font-size:14px; color:#333;">Effective Optimizer Params</h3>'
+                    f'<p style="margin:0 0 8px 0; font-size:11px; color:#555;">'
+                    f'{" &middot; ".join(_meta_parts)}</p>'
+                    f'<table style="border-collapse:collapse; font-size:12px;">'
+                    f'<tr><th {TH}>Param</th><th {TH}>Live value</th><th {TH}>Source</th></tr>'
+                    f'{_ep_rows_html}'
+                    f'</table>'
+                    f'<p style="font-size:10px; color:#888; margin:8px 0 0 0;">'
+                    f'Keys absent here fall through to the executor\'s local risk.yaml.'
+                    f'</p>'
+                    f'</div>'
+                )
+                executor_params_plain = (
+                    "\n--- EFFECTIVE OPTIMIZER PARAMS (auto-tuned) ---\n"
+                    + " | ".join(p.replace("<b>", "").replace("</b>", "").replace('<span style="color:#b71c1c; font-weight:bold;">', "").replace("</span>", "") for p in _meta_parts) + "\n"
+                    + "\n".join(f"  {lbl:30s} {v}" for lbl, v in _surface_rows) + "\n"
+                    + "(Keys absent fall through to risk.yaml.)\n"
+                )
+
     html_body = (
         f'<html><body style="font-family:sans-serif; font-size:13px; color:#222; max-width:700px;">'
         f'<h2 style="margin-bottom:4px;">Alpha Engine Brief — {date_str}</h2>'
@@ -765,6 +865,7 @@ def _build_predictor_email(
         f'Universe: <b>{n_total}</b> tickers &nbsp;|&nbsp;'
         f'Run at <b>{run_time}</b></p>'
         f'{research_html}'
+        f'{executor_params_html}'
         f'<h3 style="font-size:13px; color:#333; margin-bottom:4px;">{"Predictions" if is_meta else "GBM Predictions"}</h3>'
         f'{_html_prediction_table(sorted_preds)}'
         f'{veto_section_html}'
@@ -855,6 +956,7 @@ def _build_predictor_email(
         f"Alpha Engine Brief — {date_str}\n"
         f"Model: {model_version}  IC(val): {ic_str}  Mode: {metrics.get('inference_mode', 'mse')}  Universe: {n_total}  Run: {run_time}\n"
         f"{research_plain}"
+        f"{executor_params_plain}"
         f"\n{'='*60}\n"
         f"{'PREDICTIONS' if is_meta else 'GBM PREDICTIONS'}\n"
         f"{'='*60}\n"
@@ -884,6 +986,7 @@ def send_predictor_email(
     date_str: str,
     signals_data: dict | None = None,
     veto_threshold: float | None = None,
+    bucket: str | None = None,
 ) -> bool:
     """
     Send combined morning briefing email via Gmail SMTP (primary) or SES (fallback).
@@ -891,6 +994,10 @@ def send_predictor_email(
     When signals_data is provided (research pipeline's signals.json payload),
     the email includes a research section (market regime, buy candidates, sector
     ratings) followed by the GBM predictions — one complete morning briefing.
+
+    When ``bucket`` is provided, the email also includes an "Effective
+    optimizer params" block sourced from ``config/executor_params.json``
+    (ROADMAP L234 morning-email side). Best-effort.
 
     Reads from environment / config:
         EMAIL_SENDER        — from-address
@@ -914,6 +1021,7 @@ def send_predictor_email(
         subject, html_body, plain_body = _build_predictor_email(
             predictions, metrics, date_str, signals_data=signals_data,
             veto_threshold=veto_threshold,
+            bucket=bucket,
         )
     except Exception as exc:
         log.warning("Failed to build predictor email body: %s", exc)
@@ -1152,6 +1260,7 @@ def run(ctx: PipelineContext) -> None:
             email_sent = send_predictor_email(
                 ctx.predictions, metrics, ctx.date_str,
                 signals_data=ctx.signals_data, veto_threshold=veto_thresh,
+                bucket=ctx.bucket,
             )
             if not email_sent:
                 log.warning("Predictor email failed to send (Gmail + SES both failed)")
