@@ -58,10 +58,13 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 S3_BUCKET="${S3_BUCKET:-alpha-engine-research}"
 BRANCH="${BRANCH:-main}"
-# c5.large = 2 vCPU / 4 GB RAM. Right-sized 2026-04-28: meta-trainer
-# steady-state is ~1–1.5 GB. Override via ``--instance-type`` if a future
-# feature pushes peak memory past ~3 GB.
-INSTANCE_TYPE="c5.large"
+# Capacity-resilient instance-type fallback set (2026-05-22 incident:
+# spot launches in single-AZ subnet-e07166ec/us-east-1f hit
+# InsufficientInstanceCapacity). All 2 vCPU / 4-8 GB RAM — equivalent
+# for the meta-trainer (steady-state ~1-1.5 GB). Order = preference;
+# the lib CLI tries each in turn until one launches.
+INSTANCE_TYPES="${INSTANCE_TYPES:-c5.large,m5.large,c6i.large,c5a.large}"
+INSTANCE_TYPE=""  # backward-compat: --instance-type X collapses INSTANCE_TYPES to single value
 AMI_ID="ami-0c421724a94bba6d6"  # Amazon Linux 2023 x86_64 (Python 3.12, SSM agent preinstalled)
 # Spot-side watchdog budget: meta-trainer typically completes 40-70 min;
 # include pip install + smoke + full run. 90 min with headroom.
@@ -71,8 +74,15 @@ MAX_RUNTIME_SECONDS="${MAX_RUNTIME_SECONDS:-5400}"
 # the migration's PR 3, after this PR validates against a Saturday SF).
 KEY_NAME="alpha-engine-key"
 SECURITY_GROUP="sg-03cd3c4bd91e610b0"
-SUBNET_ID="subnet-e07166ec"
+# All 6 default-VPC subnets across us-east-1{a..f}. The lib CLI rotates
+# across this list on capacity error. Same VPC + same SG as the data +
+# backtester spots; lockstep with their launchers.
+SUBNETS="${SUBNETS:-subnet-a61ec0fb,subnet-1e58307a,subnet-789d3857,subnet-c670118d,subnet-7cff7c43,subnet-e07166ec}"
 IAM_PROFILE="alpha-engine-executor-profile"
+# Lib CLI path: ae-dashboard is the SSM target for the PredictorTraining
+# state; the dispatcher's .venv has alpha-engine-lib installed (see
+# deploy-on-merge.sh in the dashboard repo).
+LIB_PYTHON="${LIB_PYTHON:-/home/ec2-user/alpha-engine-dashboard/.venv/bin/python}"
 REPO_URL="https://github.com/cipher813/alpha-engine-predictor.git"  # public repo, no auth
 
 # Parse flags
@@ -90,7 +100,11 @@ done
 echo "═══════════════════════════════════════════════════════════════"
 echo "  GBM Spot Training — $(date +%Y-%m-%d)  (SSM transport)"
 echo "═══════════════════════════════════════════════════════════════"
-echo "  Instance type : $INSTANCE_TYPE"
+if [ -n "$INSTANCE_TYPE" ]; then
+  INSTANCE_TYPES="$INSTANCE_TYPE"  # --instance-type X collapses to single value
+fi
+echo "  Instance types: $INSTANCE_TYPES"
+echo "  Subnets       : $SUBNETS"
 echo "  AMI           : $AMI_ID"
 echo "  Region        : $AWS_REGION"
 echo "  Branch        : $BRANCH"
@@ -115,21 +129,27 @@ if ! git diff --quiet HEAD -- config.py config/predictor.sample.yaml training/tr
 fi
 
 # ── Launch spot instance ──────────────────────────────────────────────────────
-echo "==> Requesting spot instance ($INSTANCE_TYPE)..."
-INSTANCE_ID=$(aws ec2 run-instances \
+# Capacity-resilient launch via alpha_engine_lib.ec2_spot (lib v0.26.0+).
+# Rotates (instance_type × subnet) on InsufficientInstanceCapacity etc.
+# Replaces the broken-by-design hardcoded single-subnet + single-instance-type
+# pattern (2026-05-22 incident — Evaluator failed in sibling backtester spot).
+echo "==> Requesting spot instance (lib CLI rotation: types=[$INSTANCE_TYPES], subnets=[$SUBNETS])..."
+INSTANCE_ID=$("$LIB_PYTHON" -m alpha_engine_lib.ec2_spot launch \
+  --types "$INSTANCE_TYPES" \
+  --subnets "$SUBNETS" \
   --image-id "$AMI_ID" \
-  --instance-type "$INSTANCE_TYPE" \
   --key-name "$KEY_NAME" \
-  --security-group-ids "$SECURITY_GROUP" \
-  --subnet-id "$SUBNET_ID" \
-  --iam-instance-profile Name="$IAM_PROFILE" \
-  --instance-market-options '{"MarketType":"spot","SpotOptions":{"SpotInstanceType":"one-time","InstanceInterruptionBehavior":"terminate"}}' \
-  --instance-initiated-shutdown-behavior terminate \
-  --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":30,"VolumeType":"gp3"}}]' \
-  --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=alpha-engine-gbm-train-$(date +%Y%m%d)}]" \
-  --region "$AWS_REGION" \
-  --query 'Instances[0].InstanceId' \
-  --output text)
+  --security-group "$SECURITY_GROUP" \
+  --iam-profile "$IAM_PROFILE" \
+  --name "alpha-engine-gbm-train-$(date +%Y%m%d)" \
+  --region "$AWS_REGION")
+ec2_spot_rc=$?
+if [ "$ec2_spot_rc" -ne 0 ] || [ -z "$INSTANCE_ID" ]; then
+  if [ "$ec2_spot_rc" -eq 64 ]; then
+    echo "ERROR: capacity exhausted across all instance_type × subnet combinations" >&2
+  fi
+  exit "${ec2_spot_rc:-1}"
+fi
 echo "  Instance ID: $INSTANCE_ID"
 
 RUN_ID="$(date +%Y%m%dT%H%M%SZ)-${INSTANCE_ID}"
