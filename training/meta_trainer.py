@@ -2342,6 +2342,51 @@ def run_meta_training(
         log.warning(
             "Stratified per-regime gate computation failed (non-blocking): %s", e,
         )
+
+    # Per-regime label up-rate — the empirical fraction of OOS rows
+    # whose REALIZED canonical alpha is positive, sliced by regime.
+    # Surfaced 2026-05-24 to answer "is the calibrator's bull-regime
+    # direction-skew of 88% a defect (over-predicting UP) or a correct
+    # match to reality (bull regimes have ~88% empirical up-rate)?"
+    # Without this slice, the stratified-per-regime gate's 85% threshold
+    # cannot be evaluated as too-strict-or-too-loose; with it, future
+    # cycles can decide whether the gate threshold should be regime-aware.
+    # The 5/24 cycle's bull-regime gate failure (n_up=227/256 calibrator
+    # predictions) is the surfacing case. Independent of the calibrator —
+    # this is a property of the labels + regime classifier alone.
+    labels_up_rate_by_regime: dict[str, dict] = {}
+    try:
+        meta_y_positive = (meta_y > 0).astype(int)
+        for regime in ("bull", "neutral", "bear"):
+            r_mask = np.array([rr == regime for rr in row_regimes])
+            n_regime = int(r_mask.sum())
+            if n_regime > 0:
+                n_up = int(meta_y_positive[r_mask].sum())
+                labels_up_rate_by_regime[regime] = {
+                    "n": n_regime,
+                    "n_up": n_up,
+                    "n_down": n_regime - n_up,
+                    "labels_up_rate": round(n_up / n_regime, 4),
+                }
+            else:
+                labels_up_rate_by_regime[regime] = {
+                    "n": 0, "n_up": 0, "n_down": 0,
+                    "labels_up_rate": None,
+                }
+        log.info(
+            "Per-regime label up-rate (empirical realized): "
+            "bull=%.3f (n=%d) neutral=%.3f (n=%d) bear=%.3f (n=%d)",
+            labels_up_rate_by_regime["bull"].get("labels_up_rate") or 0,
+            labels_up_rate_by_regime["bull"]["n"],
+            labels_up_rate_by_regime["neutral"].get("labels_up_rate") or 0,
+            labels_up_rate_by_regime["neutral"]["n"],
+            labels_up_rate_by_regime["bear"].get("labels_up_rate") or 0,
+            labels_up_rate_by_regime["bear"]["n"],
+        )
+    except Exception as e:
+        log.warning(
+            "Per-regime label up-rate computation failed (non-blocking): %s", e,
+        )
     stratified_gate_passed = (
         stratified_result.passed if (stratified_result is not None and output_dist_blocking)
         else True
@@ -2571,6 +2616,17 @@ def run_meta_training(
                 "date": date_str,
                 "version": "v3.0-meta",
                 "peak_rss_mb": peak_rss_mb,
+                # Per-regime empirical up-rate of REALIZED canonical alpha
+                # (independent of calibrator) — observability for the
+                # stratified-per-regime gate threshold calibration. See
+                # the in-trainer block above for the full rationale; in
+                # short: if the calibrator's per-regime direction_skew
+                # matches this empirical up-rate, the calibrator is
+                # tracking reality and the 85% gate threshold is too
+                # strict for that regime. Surfacing this manifest field
+                # is the prerequisite for any future regime-aware-
+                # threshold redesign.
+                "labels_up_rate_by_regime": labels_up_rate_by_regime,
                 # Horizon-of-record + label-domain top-level metadata (added
                 # 2026-05-09 post Track A PR 5/6 cutover) so downstream
                 # consumers — dashboard, backtester analytics, evaluator —
