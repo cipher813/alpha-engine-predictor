@@ -63,26 +63,26 @@ def _safe_last_date(idx: "pd.Index") -> "pd.Timestamp | None":
 
 
 def _verify_arctic_fresh(macro_lib, date_str: str) -> None:
-    """Assert ArcticDB's SPY close series has a row for the most recent
-    trading day whose session has actually closed.
+    """Assert ArcticDB's SPY close series carries the most recent NYSE
+    session that has actually closed as of wall-clock now.
 
-    Uses ``last_closed_trading_day()`` so the check is symmetric across
-    pre-open and post-close contexts:
+    Uses ``alpha_engine_lib.trading_calendar.last_closed_trading_day()`` —
+    the same primitive the system-wide ``alpha_engine_lib.dates.{trading_days_stale,
+    is_fresh_in_trading_days}`` chokepoint helpers delegate to. The
+    comparison ``last_date >= expected_min`` is exactly the
+    ``max_stale=0`` case of those helpers; spelled inline here so the
+    test suite's existing ``trading_calendar.datetime`` freeze pattern
+    applies uniformly to both consumers (this site + the dates helpers).
+    Symmetric across pre-open and post-close contexts:
 
       - Morning SF (pre-open) → expects yesterday's close in SPY
       - Manual post-close rerun → expects today's close in SPY
-      - Weekend / holiday rerun → expects the prior trading day's close
+      - Weekend / holiday rerun → expects the prior trading-day close
 
-    Stricter-than-equal checks caused the 2026-04-20 Monday abort: the
-    old ``expected = pd.Timestamp(date_str).normalize()`` compared SPY's
-    last_date against today's calendar date, so a 6:05 AM run with
-    SPY@Fri was flagged stale even though Fri IS the latest closed-
-    session data any consumer can have pre-open on Monday.
-
-    ``date_str`` is retained in the parameter signature for caller
-    compatibility and error messaging but is NOT used to compute the
-    freshness threshold — wall-clock time is what determines whether
-    today's session has closed yet.
+    Calendar-day arithmetic was the 2026-04-20 Monday abort + 2026-05-24
+    Sunday SF recovery block — both resolved by trading-day semantics.
+    ``date_str`` is retained for error messaging but is NOT used to
+    compute the freshness threshold.
 
     Raises PipelineAbort on stale/missing SPY.
     """

@@ -263,7 +263,13 @@ REFRESH_BATCH_SIZE = _data_cfg["refresh_batch_size"]
 BOOTSTRAP_PERIOD = _data_cfg["bootstrap_period"]
 INFERENCE_PERIOD = _data_cfg["inference_period"]
 DAILY_CLOSES_PERIOD = _data_cfg["daily_closes_period"]
-STALENESS_THRESHOLD_DAYS = _data_cfg["staleness_threshold_days"]
+# STALENESS_THRESHOLD_DAYS retired 2026-05-24 — the knob was parsed but
+# never read in the predictor (audit during the trading-day freshness
+# arc). Freshness in the predictor is enforced by `_verify_arctic_fresh`
+# in `inference/stages/load_prices.py`, which uses
+# `alpha_engine_lib.dates.is_fresh_in_trading_days(max_stale=0)` — no
+# calendar-day knob to tune. The yaml key remains in `predictor.yaml`
+# for backwards-compat with other config readers but is unused here.
 SLIM_CACHE_LOOKBACK_DAYS = _data_cfg["slim_cache_lookback_days"]
 INFERENCE_BATCH_SIZE = _data_cfg["inference_batch_size"]
 MIN_ROWS_FOR_FEATURES = _data_cfg["min_rows_for_features"]
