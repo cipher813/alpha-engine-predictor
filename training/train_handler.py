@@ -87,6 +87,68 @@ import numpy as np
 log = logging.getLogger(__name__)
 
 
+_SUBSAMPLE_NOISE_FLOOR_PCT = 30.0
+
+
+def _annotate_subsample_noise_floor(result: dict, s3, bucket: str) -> None:
+    """Annotate `result["short_history_subsample"][*]` with `n_pct_change_vs_prior`
+    and WARN-log on >|`_SUBSAMPLE_NOISE_FLOOR_PCT`| swing.
+
+    Closes 5/23-SF P0 sweep (L980 noise-floor WARN). Reads the prior cycle's
+    `training_summary_latest.json` from S3 BEFORE the current cycle's write
+    overwrites it, computes the per-component subsample-`n` percent change,
+    and surfaces a WARN when the swing is large enough that a per-week
+    margin comparison is no longer apples-to-apples (the 5/24 incident:
+    `train_start_date` clamp shrunk vol subsample n 821→263 = -68%,
+    ratcheting baseline IC +0.057 while no underlying capability changed).
+
+    Best-effort: any failure (no prior, parse error, S3 hiccup) logs DEBUG
+    and returns without raising. The current-cycle write proceeds normally.
+    """
+    try:
+        sh = result.get("short_history_subsample") or {}
+        if not sh:
+            return
+
+        try:
+            prior_obj = s3.get_object(
+                Bucket=bucket,
+                Key="predictor/metrics/training_summary_latest.json",
+            )
+            prior = json.loads(prior_obj["Body"].read())
+        except Exception as e:
+            log.debug("subsample noise-floor: no prior summary (%s); skipping", e)
+            return
+
+        prior_sh = prior.get("short_history_subsample") or {}
+        for component, current in sh.items():
+            if not isinstance(current, dict):
+                continue
+            current_n = current.get("n")
+            prior_component = prior_sh.get(component) or {}
+            prior_n = prior_component.get("n")
+            if current_n is None or prior_n is None:
+                continue
+            if not isinstance(current_n, (int, float)) or not isinstance(
+                prior_n, (int, float)
+            ) or prior_n == 0:
+                continue
+            pct_change = float((current_n - prior_n) / prior_n * 100.0)
+            current["n_pct_change_vs_prior"] = round(pct_change, 2)
+            current["prior_n"] = int(prior_n)
+            if abs(pct_change) > _SUBSAMPLE_NOISE_FLOOR_PCT:
+                log.warning(
+                    "subsample noise-floor: %s.n changed by %+.1f%% vs prior cycle "
+                    "(prior=%d, current=%d). Per-week margin comparison on this "
+                    "component is no longer apples-to-apples — baseline IC may have "
+                    "ratcheted mechanically rather than from a real capability shift. "
+                    "See ROADMAP L980 / 5/24 train_start_date clamp incident.",
+                    component, pct_change, int(prior_n), int(current_n),
+                )
+    except Exception as e:
+        log.debug("subsample noise-floor annotation failed (non-blocking): %s", e)
+
+
 # ── Training email ─────────────────────────────────────────────────────────────
 
 
@@ -955,6 +1017,10 @@ def main(
         try:
             import boto3 as _b3_sum
             _s3_sum = _b3_sum.client("s3")
+            # Annotate subsample-noise-floor BEFORE the write — reads the
+            # PRIOR cycle's latest.json so the percent-change reference is
+            # genuinely prior-cycle rather than this-cycle.
+            _annotate_subsample_noise_floor(result, _s3_sum, bucket)
             _sum_body = json.dumps(result, indent=2, default=str).encode()
             _s3_sum.put_object(
                 Bucket=bucket,
