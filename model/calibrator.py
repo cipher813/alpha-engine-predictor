@@ -38,12 +38,17 @@ class PlattCalibrator:
         self._n_samples = 0
         self._ece_before = None  # ECE of linear calibration (baseline)
         self._ece_after = None   # ECE of fitted calibrator
+        self._class_weight = None  # set in fit() under method='platt'
+        self._C = None             # set in fit() under method='platt'
 
     def fit(
         self,
         raw_alphas: np.ndarray,
         actual_up: np.ndarray,
         label_clip: float = 0.15,
+        *,
+        class_weight: str | dict | None = None,
+        C: float = 1.0,
     ) -> "PlattCalibrator":
         """
         Fit calibrator on walk-forward OOS predictions.
@@ -53,6 +58,16 @@ class PlattCalibrator:
         raw_alphas : array of raw continuous alpha predictions (clipped to [-label_clip, label_clip])
         actual_up  : binary array, 1 if forward_return_5d > 0 else 0
         label_clip : max absolute alpha used for clipping (default 0.15)
+        class_weight : passed through to ``sklearn.linear_model.LogisticRegression``
+            when ``method='platt'``. Use ``'balanced'`` so the intercept doesn't
+            anchor on an imbalanced marginal UP-rate (the 2026-05-23 failure
+            class: OOS rows 100% bear+neutral → Platt's intercept pushed
+            negative → 95% DOWN-skew across the synthetic alpha sweep).
+            Ignored under ``method='isotonic'`` (isotonic is per-quantile
+            non-parametric — no global intercept to rebalance).
+        C : inverse L2 regularisation strength for the Platt logistic. Higher
+            C = less shrinkage. Ignored under isotonic. Default 1.0 preserves
+            historical behavior.
         """
         raw_alphas = np.asarray(raw_alphas, dtype=np.float64).ravel()
         actual_up = np.asarray(actual_up, dtype=np.int32).ravel()
@@ -70,6 +85,8 @@ class PlattCalibrator:
             return self
 
         self._n_samples = len(raw_alphas)
+        self._class_weight = class_weight if self.method == "platt" else None
+        self._C = C if self.method == "platt" else None
 
         # Compute baseline ECE (linear calibration)
         linear_p_up = np.clip(0.5 + raw_alphas / (2.0 * label_clip), 0.0, 1.0)
@@ -77,7 +94,10 @@ class PlattCalibrator:
 
         if self.method == "platt":
             from sklearn.linear_model import LogisticRegression
-            self._model = LogisticRegression(C=1.0, solver="lbfgs", max_iter=1000)
+            self._model = LogisticRegression(
+                C=C, class_weight=class_weight,
+                solver="lbfgs", max_iter=1000,
+            )
             self._model.fit(raw_alphas.reshape(-1, 1), actual_up)
         else:
             from sklearn.isotonic import IsotonicRegression
@@ -161,6 +181,8 @@ class PlattCalibrator:
             "n_samples": self._n_samples,
             "ece_before": round(self._ece_before, 6) if self._ece_before is not None else None,
             "ece_after": round(self._ece_after, 6) if self._ece_after is not None else None,
+            "class_weight": self._class_weight,
+            "C": self._C,
         }
 
     def save(self, path: str | Path) -> None:
@@ -204,6 +226,8 @@ class PlattCalibrator:
         cal._n_samples = meta.get("n_samples", 0)
         cal._ece_before = meta.get("ece_before")
         cal._ece_after = meta.get("ece_after")
+        cal._class_weight = meta.get("class_weight")
+        cal._C = meta.get("C")
         log.info("Calibrator loaded from %s (method=%s, n=%d)", path, method, cal._n_samples)
         return cal
 

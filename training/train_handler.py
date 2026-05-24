@@ -89,6 +89,48 @@ log = logging.getLogger(__name__)
 
 # ── Training email ─────────────────────────────────────────────────────────────
 
+
+def _build_shadow_calibration_html(sm: dict | None) -> str:
+    """Render the Shadow Calibrator observability row.
+
+    Returns the empty string when no shadow calibrator was fit (shadow
+    disabled via ``calibration.shadow_method: null`` OR the shadow fit
+    failed — both surface as ``fitted: False`` in the dict). Mirrors the
+    Confidence Calibration row's style; adds shadow-specific knobs
+    (``class_weight``, ``C``) and gate-pass fingerprints so the operator
+    can tell at a glance whether shadow is ready to promote → live.
+    """
+    if not sm or not sm.get("fitted"):
+        return ""
+
+    def _gate(passed_key: str, failed_key: str) -> str:
+        passed = sm.get(passed_key)
+        label = "PASS" if passed else ("FAIL" if passed is False else "n/a")
+        failed_check = sm.get(failed_key)
+        suffix = f" ({failed_check})" if failed_check else ""
+        return f"<b>{label}{suffix}</b>"
+
+    ece_before = sm["ece_before"]
+    ece_after = sm["ece_after"]
+    return (
+        '<h3 style="margin-top:16px; margin-bottom:4px;">'
+        'Shadow Calibrator (observability)</h3>'
+        '<p style="font-size:12px;">'
+        f'Method: <b>{sm["method"]}</b> &nbsp;|&nbsp; '
+        f'class_weight: <b>{sm.get("class_weight")}</b> &nbsp;|&nbsp; '
+        f'C: <b>{sm.get("C")}</b> &nbsp;|&nbsp; '
+        f'Samples: <b>{sm["n_samples"]:,}</b> &nbsp;|&nbsp; '
+        f'ECE: <b>{ece_before:.4f} → {ece_after:.4f}</b> &nbsp;|&nbsp; '
+        'output_dist: '
+        + _gate("output_distribution_gate_passed",
+                "output_distribution_gate_failed_check")
+        + ' &nbsp;|&nbsp; stratified: '
+        + _gate("stratified_per_regime_passed",
+                "stratified_per_regime_failed_check")
+        + '</p>'
+    )
+
+
 def _build_ic_table_html(result, is_meta, ic_color, ic_label, promoted_mode,
                          promo_color, promo_label, val_ic, mse_ic, test_ic,
                          rank_ic, ensemble_ic, ensemble_on, ic_ir, ic_pos):
@@ -641,6 +683,11 @@ def send_training_email(result: dict, date_str: str) -> bool:
             f'({(1 - cal_metrics["ece_after"] / max(cal_metrics["ece_before"], 1e-8)) * 100:.0f}% reduction)</p>'
             if cal_metrics and cal_metrics.get("fitted") else ""
         )
+        # Shadow calibrator row — observability only. Surfaces shadow's
+        # method, ECE, gate-pass fingerprint so operators can decide when
+        # shadow is safe to promote → live (flip calibration.method in
+        # predictor.yaml). Empty when shadow disabled.
+        + _build_shadow_calibration_html(result.get("shadow_calibration"))
         + (
             f'<h3 style="margin-top:16px; margin-bottom:4px;">Multi-Horizon Models</h3>'
             f'<table style="border-collapse:collapse; font-size:11px;">'

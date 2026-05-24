@@ -188,6 +188,97 @@ class TestPlattCalibrator:
             assert "T" in sidecar["deployed_at"]
             assert sidecar["method"] == "isotonic"
 
+    def test_platt_class_weight_balanced_rebalances_intercept_under_imbalance(self):
+        """Regression for 2026-05-23 Platt-collapse.
+
+        Imbalanced training set (30% UP) with unbalanced Platt anchors the
+        intercept negative — across a positive-alpha range, p_up < 0.5 for
+        nearly every input → direction-skew gate fails. ``class_weight=
+        "balanced"`` reweights the loss so the intercept doesn't favour the
+        majority class; mean p_up across the same sweep moves toward 0.5.
+        """
+        from model.calibrator import PlattCalibrator
+        np.random.seed(7)
+        n = 1000
+        alpha = np.clip(np.random.randn(n) * 0.05, -0.15, 0.15)
+        # Force a 30% UP-rate that's NOT monotone in alpha — same alpha
+        # distribution, deliberately skewed labels (the 2026-05-23 pattern
+        # where the OOS window was 100% bear+neutral regime → low marginal
+        # UP-rate independent of alpha quantile).
+        actual_up = np.zeros(n, dtype=np.int32)
+        actual_up[np.random.choice(n, size=300, replace=False)] = 1
+
+        cal_unbalanced = PlattCalibrator(method="platt")
+        cal_unbalanced.fit(alpha, actual_up)
+        cal_balanced = PlattCalibrator(method="platt")
+        cal_balanced.fit(alpha, actual_up, class_weight="balanced")
+
+        sweep = np.linspace(-0.05, 0.05, 25)
+        p_up_unbalanced = cal_unbalanced.predict_proba(sweep)
+        p_up_balanced = cal_balanced.predict_proba(sweep)
+
+        # Unbalanced Platt anchors below 0.5 across the sweep (the exact
+        # failure mode from the 5/23 manifest).
+        assert p_up_unbalanced.mean() < 0.45, (
+            f"Unbalanced Platt should anchor below 0.5 under 30% UP-rate, "
+            f"got mean p_up={p_up_unbalanced.mean():.3f}"
+        )
+        # Balanced Platt brings the mean materially closer to 0.5.
+        assert p_up_balanced.mean() > p_up_unbalanced.mean() + 0.10, (
+            f"Balanced Platt should lift mean p_up vs unbalanced by ≥0.10, "
+            f"got balanced={p_up_balanced.mean():.3f} vs "
+            f"unbalanced={p_up_unbalanced.mean():.3f}"
+        )
+
+    def test_isotonic_ignores_class_weight_param_silently(self):
+        """class_weight is a Platt-only knob — passing it under isotonic
+        must not raise (since shadow can switch methods between cycles
+        without operator config gymnastics) and must not change the
+        isotonic fit (per-quantile non-parametric, no global intercept)."""
+        from model.calibrator import PlattCalibrator
+        np.random.seed(11)
+        n = 500
+        alpha = np.clip(np.random.randn(n) * 0.05, -0.15, 0.15)
+        actual_up = (alpha + np.random.randn(n) * 0.02 > 0).astype(np.int32)
+
+        cal_no_arg = PlattCalibrator(method="isotonic")
+        cal_no_arg.fit(alpha, actual_up)
+        cal_with_arg = PlattCalibrator(method="isotonic")
+        cal_with_arg.fit(alpha, actual_up, class_weight="balanced", C=2.5)
+
+        sweep = np.linspace(-0.1, 0.1, 50)
+        np.testing.assert_allclose(
+            cal_no_arg.predict_proba(sweep),
+            cal_with_arg.predict_proba(sweep),
+            err_msg="Isotonic predictions must be invariant under class_weight/C",
+        )
+        # And the metrics dict reports None for the Platt-only knobs under
+        # isotonic so save/load round-trips don't carry stale shadow knobs.
+        assert cal_with_arg.metrics()["class_weight"] is None
+        assert cal_with_arg.metrics()["C"] is None
+
+    def test_metrics_carry_class_weight_and_C_round_trip(self):
+        """save() → load() must preserve the Platt-only knobs so a loaded
+        shadow calibrator is introspectable from S3 without re-fitting."""
+        from model.calibrator import PlattCalibrator
+        np.random.seed(13)
+        n = 500
+        alpha = np.clip(np.random.randn(n) * 0.05, -0.15, 0.15)
+        actual_up = (alpha > 0).astype(np.int32)
+
+        cal = PlattCalibrator(method="platt")
+        cal.fit(alpha, actual_up, class_weight="balanced", C=2.0)
+        assert cal.metrics()["class_weight"] == "balanced"
+        assert cal.metrics()["C"] == 2.0
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "shadow_calibrator.pkl"
+            cal.save(path)
+            loaded = PlattCalibrator.load(path)
+
+        assert loaded.metrics()["class_weight"] == "balanced"
+        assert loaded.metrics()["C"] == 2.0
+
 
 class TestCalibratorOutputVariance:
     """Regression tests for the 2026-04-28 collapse pathology.

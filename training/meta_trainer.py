@@ -1961,7 +1961,12 @@ def run_meta_training(
         float(np.std(oos_meta_preds)),
     )
     calibrator = PlattCalibrator(method=cal_method)
-    calibrator.fit(oos_meta_preds, oos_up_labels, label_clip=float(cfg.LABEL_CLIP))
+    calibrator.fit(
+        oos_meta_preds, oos_up_labels,
+        label_clip=float(cfg.LABEL_CLIP),
+        class_weight=cfg.CALIBRATION_CLASS_WEIGHT,
+        C=cfg.CALIBRATION_C,
+    )
     if not calibrator.is_fitted:
         raise RuntimeError(
             f"{cal_method} direction calibrator did not fit "
@@ -1974,6 +1979,57 @@ def run_meta_training(
         cal_method, calibrator._ece_before, calibrator._ece_after,
         (1 - calibrator._ece_after / max(calibrator._ece_before, 1e-8)) * 100,
     )
+
+    # ── Step 7b-shadow: Fit shadow calibrator + run gates (observability) ────
+    # Added 2026-05-24 (calibrator-shadow arc) in response to the 2026-05-23
+    # Platt-collapse incident. When ``cfg.CALIBRATION_SHADOW_METHOD`` is set,
+    # fit a second calibrator on the SAME rows / labels with potentially
+    # different method + class_weight + C, run it through both promotion-gate
+    # checks, and persist the result in the manifest. Pure observability:
+    # the shadow calibrator does NOT feed inference, does NOT influence the
+    # ``promoted`` boolean, and is NOT saved to the live calibrator S3 key.
+    # Lets us iterate Platt's class-balance / regularisation knobs across
+    # Saturday cycles while isotonic remains live, then flip live by swapping
+    # ``calibration.method`` in predictor.yaml once shadow gates pass for ≥1
+    # cycle. Skipped entirely when shadow_method is None (no extra work, no
+    # extra log noise on operators who haven't opted in).
+    shadow_calibrator = None
+    shadow_method = cfg.CALIBRATION_SHADOW_METHOD
+    if shadow_method:
+        try:
+            shadow_calibrator = PlattCalibrator(method=shadow_method)
+            shadow_calibrator.fit(
+                oos_meta_preds, oos_up_labels,
+                label_clip=float(cfg.LABEL_CLIP),
+                class_weight=cfg.CALIBRATION_SHADOW_CLASS_WEIGHT,
+                C=cfg.CALIBRATION_SHADOW_C,
+            )
+            if shadow_calibrator.is_fitted:
+                log.info(
+                    "Shadow %s calibrator (class_weight=%r, C=%.2f): "
+                    "ECE_before=%.4f  ECE_after=%.4f  (%.1f%% reduction)",
+                    shadow_method, cfg.CALIBRATION_SHADOW_CLASS_WEIGHT,
+                    cfg.CALIBRATION_SHADOW_C,
+                    shadow_calibrator._ece_before, shadow_calibrator._ece_after,
+                    (
+                        1 - shadow_calibrator._ece_after
+                        / max(shadow_calibrator._ece_before, 1e-8)
+                    ) * 100,
+                )
+            else:
+                log.warning(
+                    "Shadow %s calibrator did not fit "
+                    "(n=%d, min required 100) — shadow gate result will be n/a",
+                    shadow_method, len(oos_meta_preds),
+                )
+                shadow_calibrator = None
+        except Exception as e:
+            log.warning(
+                "Shadow calibrator fit failed (non-blocking — live calibrator "
+                "unaffected): %s",
+                e,
+            )
+            shadow_calibrator = None
 
     # Walk-forward summary
     mom_median_ic = float(np.median(mom_fold_ics)) if mom_fold_ics else 0.0
@@ -2242,6 +2298,45 @@ def run_meta_training(
         else True
     )
 
+    # Shadow calibrator gates — pure observability, results persist in the
+    # manifest but do NOT influence ``promoted``. Lets operators compare
+    # shadow-vs-live across Saturdays before promoting shadow → live by
+    # flipping ``calibration.method`` in predictor.yaml.
+    shadow_output_dist_result = None
+    shadow_stratified_result = None
+    if shadow_calibrator is not None:
+        try:
+            shadow_output_dist_result = validate_calibrator_distribution(shadow_calibrator)
+        except Exception as e:
+            log.warning("Shadow output-distribution gate computation failed: %s", e)
+        try:
+            shadow_stratified_predictions: list[dict] = []
+            for i, raw_alpha in enumerate(meta_preds_oos_insample):
+                cal_result = shadow_calibrator.calibrate_prediction(float(raw_alpha))
+                shadow_stratified_predictions.append({
+                    "p_up": cal_result["p_up"],
+                    "predicted_direction": cal_result["predicted_direction"],
+                })
+            shadow_stratified_result = validate_stratified_per_regime(
+                shadow_stratified_predictions, row_regimes,
+            )
+        except Exception as e:
+            log.warning("Shadow stratified-per-regime gate computation failed: %s", e)
+    if shadow_calibrator is not None:
+        _shadow_od_status = (
+            "n/a" if shadow_output_dist_result is None
+            else ("PASS" if shadow_output_dist_result.passed else "FAIL")
+        )
+        _shadow_sp_status = (
+            "n/a" if shadow_stratified_result is None
+            else ("PASS" if shadow_stratified_result.passed else "FAIL")
+        )
+        log.info(
+            "Shadow %s calibrator gates (observability): output_dist=%s  "
+            "stratified_per_regime=%s",
+            shadow_method, _shadow_od_status, _shadow_sp_status,
+        )
+
     promoted = (
         meta_ic_passed
         and subsample_gate_passed
@@ -2363,6 +2458,17 @@ def run_meta_training(
             # the key is omitted — canonical Ridge remains the sole live writer.
             if meta_model_tb is not None:
                 models["meta_model_tb"] = (meta_model_tb, "meta_model_tb.pkl")
+            # Shadow calibrator (2026-05-24 calibrator-shadow arc): persist
+            # alongside the live calibrator under a distinct key so the
+            # backtester's grace-period check on isotonic_calibrator.pkl.meta.json
+            # isn't disturbed. Inference does NOT load this artifact; it
+            # exists only so operators can `pickle.load` it from S3 to
+            # introspect coefficients / fit details between Saturday cycles
+            # while tuning the shadow knobs.
+            if shadow_calibrator is not None:
+                models["isotonic_calibrator_shadow"] = (
+                    shadow_calibrator, "isotonic_calibrator_shadow.pkl",
+                )
             # Audit Track A PR 5/6 cutover (2026-05-09): canonical_meta_model
             # retired from the upload set. The single meta_model.pkl above
             # is now trained on canonical labels — no separate canonical
@@ -2606,6 +2712,36 @@ def run_meta_training(
                         else {"passed": None, "reason": "computation skipped"}
                     ),
                 },
+                # Shadow calibrator block — observability only. Mirrors the
+                # output_distribution_gate structure above so dashboards /
+                # diagnostics can render shadow-vs-live side-by-side without
+                # special-casing. Empty dict when shadow is disabled or fit
+                # failed (see Step 7b-shadow). NEVER feeds promotion logic.
+                "shadow_calibrator": (
+                    {
+                        "method": shadow_calibrator.method,
+                        "metrics": shadow_calibrator.metrics(),
+                        "output_distribution_gate": (
+                            {
+                                "passed": shadow_output_dist_result.passed,
+                                "failed_check": shadow_output_dist_result.failed_check,
+                                "reason": shadow_output_dist_result.reason,
+                                "metrics": shadow_output_dist_result.metrics,
+                            } if shadow_output_dist_result is not None
+                            else {"passed": None, "reason": "computation skipped"}
+                        ),
+                        "stratified_per_regime": (
+                            {
+                                "passed": shadow_stratified_result.passed,
+                                "failed_check": shadow_stratified_result.failed_check,
+                                "reason": shadow_stratified_result.reason,
+                                "metrics": shadow_stratified_result.metrics,
+                            } if shadow_stratified_result is not None
+                            else {"passed": None, "reason": "computation skipped"}
+                        ),
+                    } if shadow_calibrator is not None
+                    else {}
+                ),
             }
             s3_up.put_object(
                 Bucket=bucket, Key=cfg.META_MANIFEST_KEY,
@@ -2913,4 +3049,28 @@ def run_meta_training(
         "feature_ics": {},
         "noise_candidates": [],
         "calibration": calibrator.metrics(),
+        # Shadow calibrator metrics — observability only. Empty dict when
+        # shadow is disabled. Email formatter (train_handler.py) renders a
+        # second calibration row when present.
+        "shadow_calibration": (
+            {
+                **shadow_calibrator.metrics(),
+                "output_distribution_gate_passed": (
+                    shadow_output_dist_result.passed
+                    if shadow_output_dist_result is not None else None
+                ),
+                "output_distribution_gate_failed_check": (
+                    shadow_output_dist_result.failed_check
+                    if shadow_output_dist_result is not None else None
+                ),
+                "stratified_per_regime_passed": (
+                    shadow_stratified_result.passed
+                    if shadow_stratified_result is not None else None
+                ),
+                "stratified_per_regime_failed_check": (
+                    shadow_stratified_result.failed_check
+                    if shadow_stratified_result is not None else None
+                ),
+            } if shadow_calibrator is not None else {}
+        ),
     }

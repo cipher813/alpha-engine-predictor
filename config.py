@@ -335,6 +335,23 @@ AUTO_PRUNE_NOISE_FEATURES = _fs_cfg.get("auto_prune", False)
 _cal_cfg = _cfg.get("calibration", {})
 CALIBRATION_METHOD = _cal_cfg.get("method", "platt")  # "platt" or "isotonic"
 CALIBRATION_ENABLED = _cal_cfg.get("enabled", True)
+# Optional class-balance + regularisation knobs for the LIVE calibrator
+# (only consulted when CALIBRATION_METHOD == 'platt'). Defaults preserve
+# historical behavior (no class weighting, C=1.0).
+CALIBRATION_CLASS_WEIGHT = _cal_cfg.get("class_weight")  # None | "balanced" | {0:.., 1:..}
+CALIBRATION_C = float(_cal_cfg.get("C", 1.0))
+
+# Shadow calibrator — fit alongside the live calibrator on the same OOS
+# rows, run through the output-distribution + stratified-per-regime gates,
+# persist results in the manifest. Pure observability; does NOT gate
+# promotion or feed inference. Set ``shadow_method: null`` (or omit) to
+# disable shadow entirely. Added 2026-05-24 in response to the 5/23
+# Platt-collapse incident: lets us tune Platt knobs (class_weight, C)
+# across Saturday cycles without breaking the live calibrator, then
+# flip live by swapping ``method`` once shadow gates pass for ≥1 cycle.
+CALIBRATION_SHADOW_METHOD = _cal_cfg.get("shadow_method")  # None disables shadow
+CALIBRATION_SHADOW_CLASS_WEIGHT = _cal_cfg.get("shadow_class_weight")
+CALIBRATION_SHADOW_C = float(_cal_cfg.get("shadow_C", 1.0))
 
 # Multi-horizon prediction config retired 2026-04-27 alongside the v2
 # inference path — the v3 meta-model trains one horizon (cfg.FORWARD_DAYS).
