@@ -62,9 +62,22 @@ def _safe_last_date(idx: "pd.Index") -> "pd.Timestamp | None":
     return pd.Timestamp(last).normalize()
 
 
-def _verify_arctic_fresh(macro_lib, date_str: str) -> None:
+def _verify_arctic_fresh(universe_lib, macro_lib, date_str: str) -> None:
     """Assert ArcticDB's SPY close series carries the most recent NYSE
     session that has actually closed as of wall-clock now.
+
+    Reads SPY from ``universe`` ArcticDB library (L1346 (b) retirement,
+    2026-05-24). Pre-fix used ``macro_lib.read("SPY")`` which was the
+    only SPY source in ArcticDB until alpha-engine-data #245 (MERGED
+    2026-05-15) lifted SPY to a full ``universe`` member via
+    ``_UNIVERSE_EXTRA = frozenset({"SPY"})`` written by BOTH backfill
+    (Saturday) AND daily_append (weekday). Both stores now carry SPY's
+    Close; reading from ``universe`` retires the macro-special-case
+    that this entry's L1346 closes-when criterion targeted. ``macro_lib``
+    parameter retained for backwards-compatibility with callers; will
+    drop on the next signature-changing refactor. Falls back to
+    ``macro_lib`` if ``universe.SPY`` is absent — defensive transition
+    posture during the cross-repo retirement arc.
 
     Uses ``alpha_engine_lib.trading_calendar.last_closed_trading_day()`` —
     the same primitive the system-wide ``alpha_engine_lib.dates.{trading_days_stale,
@@ -86,27 +99,41 @@ def _verify_arctic_fresh(macro_lib, date_str: str) -> None:
 
     Raises PipelineAbort on stale/missing SPY.
     """
+    # L1346 (b) — prefer universe.SPY (post-PR #245). Fall back to macro.SPY
+    # if universe.SPY is absent (defensive transition during the cross-repo
+    # retirement arc; after one weekday SF on the v0.X universe-SPY-write
+    # path, this fallback can be deleted along with the macro_lib parameter).
+    df = None
+    read_source = "universe"
     try:
-        df = macro_lib.read("SPY", columns=["Close"]).data
-    except Exception as exc:
-        raise PipelineAbort(
-            f"ArcticDB macro SPY unreadable: {exc} — DataPhase1 did not run "
-            f"or the macro library is broken."
-        ) from exc
+        df = universe_lib.read("SPY", columns=["Close"]).data
+    except Exception:
+        # Fall through to macro fallback below.
+        df = None
+    if df is None or df.empty:
+        try:
+            df = macro_lib.read("SPY", columns=["Close"]).data
+            read_source = "macro (fallback)"
+        except Exception as exc:
+            raise PipelineAbort(
+                f"ArcticDB SPY unreadable from BOTH universe AND macro: {exc} "
+                f"— DataPhase1 did not run or both libraries are broken."
+            ) from exc
 
     last_date = _safe_last_date(df.index)
     if last_date is None:
         raise PipelineAbort(
-            "ArcticDB macro SPY has no rows — DataPhase1 has never written."
+            f"ArcticDB SPY (from {read_source}) has no rows — "
+            f"DataPhase1 has never written."
         )
 
     expected_min = pd.Timestamp(last_closed_trading_day()).normalize()
     if last_date < expected_min:
         raise PipelineAbort(
-            f"ArcticDB macro SPY last_date={last_date.date()} is stale for "
-            f"inference date={date_str} (expected last_date >= "
+            f"ArcticDB SPY (from {read_source}) last_date={last_date.date()} "
+            f"is stale for inference date={date_str} (expected last_date >= "
             f"{expected_min.date()}, the most recent closed trading session). "
-            f"The post-close daily-data job likely failed to update macro — "
+            f"The post-close daily-data job likely failed to update — "
             f"refusing to run inference on pre-last-close prices."
         )
 
@@ -268,8 +295,8 @@ def run(ctx: PipelineContext) -> None:
 
     # ── Freshness gate: SPY must have today's close in ArcticDB ──────────────
     if not ctx.dry_run:
-        _, macro_lib = _connect_arctic(ctx.bucket)
-        _verify_arctic_fresh(macro_lib, ctx.date_str)
+        universe_lib, macro_lib = _connect_arctic(ctx.bucket)
+        _verify_arctic_fresh(universe_lib, macro_lib, ctx.date_str)
 
     # ── Per-ticker price data age (downstream telemetry) ─────────────────────
     if ctx.price_data:

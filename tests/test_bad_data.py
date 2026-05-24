@@ -151,7 +151,7 @@ class TestArcticFreshnessGate:
 
         lib = self._macro_lib_mock(raise_exc=Exception("SymbolNotFound"))
         with pytest.raises(PipelineAbort, match="unreadable"):
-            _verify_arctic_fresh(lib, "2026-04-20")
+            _verify_arctic_fresh(lib, lib, "2026-04-20")
 
     def test_empty_spy_raises_pipeline_abort(self):
         from inference.stages.load_prices import _verify_arctic_fresh
@@ -159,7 +159,7 @@ class TestArcticFreshnessGate:
 
         lib = self._macro_lib_mock(last_date=None)
         with pytest.raises(PipelineAbort, match="no rows"):
-            _verify_arctic_fresh(lib, "2026-04-20")
+            _verify_arctic_fresh(lib, lib, "2026-04-20")
 
     def test_preclose_monday_with_friday_spy_passes(self, monkeypatch):
         """Morning SF (Mon 9 AM ET, pre-close) with SPY@Fri = the normal happy path."""
@@ -169,7 +169,7 @@ class TestArcticFreshnessGate:
 
         self._freeze_now(monkeypatch, datetime(2026, 4, 20, 9, 0, tzinfo=ZoneInfo("America/New_York")))
         lib = self._macro_lib_mock(last_date="2026-04-17")
-        _verify_arctic_fresh(lib, "2026-04-20")  # should not raise
+        _verify_arctic_fresh(lib, lib, "2026-04-20")  # should not raise
 
     def test_postclose_monday_with_monday_spy_passes(self, monkeypatch):
         """Post-close rerun with SPY@today = also a valid configuration."""
@@ -179,7 +179,7 @@ class TestArcticFreshnessGate:
 
         self._freeze_now(monkeypatch, datetime(2026, 4, 20, 16, 30, tzinfo=ZoneInfo("America/New_York")))
         lib = self._macro_lib_mock(last_date="2026-04-20")
-        _verify_arctic_fresh(lib, "2026-04-20")  # should not raise
+        _verify_arctic_fresh(lib, lib, "2026-04-20")  # should not raise
 
     def test_preclose_monday_with_thursday_spy_raises(self, monkeypatch):
         """SPY older than the most recent closed session should abort."""
@@ -191,7 +191,7 @@ class TestArcticFreshnessGate:
         self._freeze_now(monkeypatch, datetime(2026, 4, 20, 9, 0, tzinfo=ZoneInfo("America/New_York")))
         lib = self._macro_lib_mock(last_date="2026-04-16")
         with pytest.raises(PipelineAbort, match="stale"):
-            _verify_arctic_fresh(lib, "2026-04-20")
+            _verify_arctic_fresh(lib, lib, "2026-04-20")
 
     def test_postclose_monday_with_friday_spy_raises(self, monkeypatch):
         """Post-close, SPY must include today — Fri is stale for a Mon post-close run."""
@@ -203,4 +203,74 @@ class TestArcticFreshnessGate:
         self._freeze_now(monkeypatch, datetime(2026, 4, 20, 16, 30, tzinfo=ZoneInfo("America/New_York")))
         lib = self._macro_lib_mock(last_date="2026-04-17")
         with pytest.raises(PipelineAbort, match="stale"):
-            _verify_arctic_fresh(lib, "2026-04-20")
+            _verify_arctic_fresh(lib, lib, "2026-04-20")
+
+
+class TestUniverseSPYFreshnessReadL1346:
+    """L1346 (b) — predictor freshness gate now prefers universe.SPY over
+    macro.SPY (post-PR #245 _UNIVERSE_EXTRA write path).
+
+    Pins:
+      1. universe.SPY present → reads from universe (no macro touch)
+      2. universe.SPY absent → falls back to macro.SPY (transition posture)
+      3. Both absent → PipelineAbort
+    """
+
+    def _make_lib(self, last_date=None, raise_exc=None):
+        from unittest.mock import MagicMock
+        lib = MagicMock()
+        if raise_exc is not None:
+            lib.read.side_effect = raise_exc
+            return lib
+        if last_date is None:
+            lib.read.return_value.data = pd.DataFrame(columns=["Close"])
+        else:
+            idx = pd.DatetimeIndex([pd.Timestamp(last_date)])
+            lib.read.return_value.data = pd.DataFrame({"Close": [500.0]}, index=idx)
+        return lib
+
+    @staticmethod
+    def _freeze_now(monkeypatch, dt):
+        from datetime import datetime
+        from alpha_engine_lib import trading_calendar as tc
+
+        class _FrozenDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return dt if tz is None else dt.astimezone(tz)
+
+        monkeypatch.setattr(tc, "datetime", _FrozenDatetime)
+
+    def test_universe_spy_present_macro_untouched(self, monkeypatch):
+        """When universe.SPY has fresh data, macro is NEVER read."""
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        from inference.stages.load_prices import _verify_arctic_fresh
+
+        self._freeze_now(monkeypatch, datetime(2026, 4, 20, 9, 0, tzinfo=ZoneInfo("America/New_York")))
+        universe_lib = self._make_lib(last_date="2026-04-17")
+        macro_lib = self._make_lib(raise_exc=Exception("MUST NOT BE READ"))
+        _verify_arctic_fresh(universe_lib, macro_lib, "2026-04-20")
+        macro_lib.read.assert_not_called()
+
+    def test_universe_spy_absent_falls_back_to_macro(self, monkeypatch):
+        """universe.SPY raises (e.g. symbol-not-found) → fallback to macro.SPY."""
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        from inference.stages.load_prices import _verify_arctic_fresh
+
+        self._freeze_now(monkeypatch, datetime(2026, 4, 20, 9, 0, tzinfo=ZoneInfo("America/New_York")))
+        universe_lib = self._make_lib(raise_exc=Exception("SymbolNotFound"))
+        macro_lib = self._make_lib(last_date="2026-04-17")
+        # Should not raise — fallback path activates
+        _verify_arctic_fresh(universe_lib, macro_lib, "2026-04-20")
+        macro_lib.read.assert_called_once()
+
+    def test_both_absent_raises_pipeline_abort(self):
+        from inference.stages.load_prices import _verify_arctic_fresh
+        from inference.pipeline import PipelineAbort
+
+        universe_lib = self._make_lib(raise_exc=Exception("universe gone"))
+        macro_lib = self._make_lib(raise_exc=Exception("macro gone"))
+        with pytest.raises(PipelineAbort, match="BOTH universe AND macro"):
+            _verify_arctic_fresh(universe_lib, macro_lib, "2026-04-20")
