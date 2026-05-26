@@ -122,13 +122,17 @@ class TestFailureIsolation:
     not gate the canonical alpha in any failure mode."""
 
     def test_canonical_alpha_unchanged_by_pr3(self):
-        # The canonical predicted_alpha computation must be unchanged
-        # — Step 3's edits add parallel logic AFTER the canonical alpha
-        # is computed and clipped, never modify it.
+        # The canonical predicted_alpha computation must not be modified
+        # by Step 3's parallel triple-barrier logic — TB edits add parallel
+        # logic AFTER the canonical alpha is computed and clipped.
+        # B.1 (optimizer-sota-upgrades-260526.md) deliberately replaced
+        # the canonical Ridge call site with predict_single_with_std to
+        # emit posterior std alongside the mean — that change is IN-scope
+        # for B.1 and unrelated to Stage 3's TB-parallel observation.
         src = _src("inference/stages/run_inference.py")
-        # Canonical computation: meta_model.predict_single → alpha → clip
+        # Canonical computation: meta_model.predict_single_with_std → alpha → clip
         canonical_idx = src.find(
-            'alpha = float(meta_model.predict_single(meta_features))'
+            'alpha, alpha_std = meta_model.predict_single_with_std(meta_features)'
         )
         assert canonical_idx != -1
         # Parallel block sits AFTER the canonical clip, not before

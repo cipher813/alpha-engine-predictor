@@ -1,15 +1,28 @@
 """
 model/meta_model.py — Meta-model that stacks Layer 1 specialized model outputs.
 
-Ridge regression that learns the optimal combination of:
+Bayesian Ridge regression that learns the optimal combination of:
   - Research calibrator P(signal correct)
   - Momentum model score
   - Volatility model expected move
   - Regime predictor P(bull), P(bear)
   - Research composite score and context
 
-Intentionally simple (ridge, not GBM) to avoid overfitting on ~10 inputs.
-Trained on out-of-fold predictions from Layer 1 walk-forward validation.
+Bayesian Ridge (Tipping 2001) generalizes plain Ridge by learning the
+regularization strength α via Type-II marginal likelihood, AND by exposing
+a closed-form posterior predictive variance at each prediction point:
+
+    Var[ŷ*] = σ²_n + x*ᵀ Σ_w x*
+
+This `predicted_alpha_std` field is the load-bearing input to the
+α̂-uncertainty term in the executor's MVO objective (workstream B of
+optimizer-sota-upgrades-260526.md). With it, confident picks size up and
+diffuse picks size down — without it, the optimizer treats α̂ = 0.05 ±
+0.002 and α̂ = 0.05 ± 0.04 identically.
+
+Intentionally simple (Bayesian ridge, not GBM) to avoid overfitting on
+~10 inputs. Trained on out-of-fold predictions from Layer 1 walk-forward
+validation.
 """
 
 from __future__ import annotations
@@ -89,7 +102,14 @@ REGIME_DERIVED_FEATURE_META_MAP = {
 
 
 class MetaModel:
-    """Ridge regression stacker for Layer 1 model outputs."""
+    """Bayesian Ridge regression stacker for Layer 1 model outputs.
+
+    Under BayesianRidge, the legacy `alpha` parameter is retained on the
+    constructor for back-compat (callers like ``MetaModel(alpha=1.0)`` keep
+    working) but is no longer the regularization strength — BR learns that
+    via Type-II marginal likelihood. The parameter is preserved as
+    metadata for run-comparison continuity with pre-BR pickled models.
+    """
 
     def __init__(self, alpha: float = 1.0):
         self.alpha = alpha
@@ -98,6 +118,12 @@ class MetaModel:
         self._n_samples = 0
         self._val_ic = 0.0
         self._coefficients: dict[str, float] = {}
+        # Bayesian Ridge learned hyperparameters (Type-II ML estimates).
+        # _learned_alpha: noise precision  (1 / σ²_n)
+        # _learned_lambda: weight precision (controls effective L2 strength)
+        # Both None when loaded from a pre-BayesianRidge pickled Ridge.
+        self._learned_alpha: float | None = None
+        self._learned_lambda: float | None = None
         # Feature list the stored ridge was fit on. Persisted in .meta.json so
         # inference can adapt to the deployed schema rather than assuming the
         # module-level META_FEATURES (which changes as we extend the stack).
@@ -133,7 +159,7 @@ class MetaModel:
             whose forward windows overlap heavily with neighbors. Sklearn
             Ridge accepts unnormalized weights and rescales internally.
         """
-        from sklearn.linear_model import Ridge
+        from sklearn.linear_model import BayesianRidge
 
         X = np.asarray(X, dtype=np.float64)
         y = np.asarray(y, dtype=np.float64).ravel()
@@ -152,9 +178,18 @@ class MetaModel:
             return self
 
         self._n_samples = len(y)
-        self._model = Ridge(alpha=self.alpha, fit_intercept=True)
+        # BayesianRidge: uninformative Gamma hyperpriors (sklearn defaults of
+        # 1e-6 on alpha_1/2, lambda_1/2) → Type-II ML drives α + λ from data.
+        # Equivalent point predictions to Ridge with the learned λ, plus a
+        # closed-form posterior predictive variance exposed via
+        # predict(X, return_std=True). compute_score=True so the posterior
+        # log-marginal-likelihood is available in metrics() for run-to-run
+        # comparison.
+        self._model = BayesianRidge(fit_intercept=True, compute_score=True)
         self._model.fit(X, y, sample_weight=sample_weight)
         self._fitted = True
+        self._learned_alpha = float(getattr(self._model, "alpha_", None) or 0.0) or None
+        self._learned_lambda = float(getattr(self._model, "lambda_", None) or 0.0) or None
 
         # Store coefficients for interpretability
         names = feature_names or META_FEATURES[:X.shape[1]]
@@ -272,9 +307,36 @@ class MetaModel:
         x = np.array([[features.get(f, 0.0) for f in feat_names]])
         return float(self.predict(x)[0])
 
+    def predict_single_with_std(self, features: dict) -> tuple[float, float | None]:
+        """Predict (mean, posterior_std) for a single ticker.
+
+        Returns ``std=None`` when the loaded sklearn estimator does not
+        expose a posterior variance (legacy Ridge models pickled BEFORE the
+        BayesianRidge cutover). Inference callers should treat ``None`` as
+        "uncertainty signal not available" — the executor's α̂-uncertainty
+        penalty term (workstream B of optimizer-sota-upgrades-260526.md)
+        falls back to point-estimate sizing in that case.
+
+        Backwards-compat is load-bearing: the first Saturday training cycle
+        after this PR ships still loads the previous Ridge pickle into
+        production until the new training run promotes a BayesianRidge.
+        """
+        if not self._fitted:
+            raise RuntimeError("MetaModel not fitted")
+        feat_names = self._feature_names or META_FEATURES
+        x = np.array([[features.get(f, 0.0) for f in feat_names]], dtype=np.float64)
+        try:
+            mean, std = self._model.predict(x, return_std=True)
+            return float(mean[0]), float(std[0])
+        except TypeError:
+            # Legacy Ridge — no return_std kwarg. Caller treats None as
+            # "uncertainty unavailable" and falls back per the gradual-
+            # cutover policy above.
+            return float(self._model.predict(x)[0]), None
+
     def metrics(self) -> dict:
         return {
-            "type": "meta_model_ridge",
+            "type": "meta_model_bayesian_ridge",
             "fitted": self._fitted,
             "n_samples": self._n_samples,
             "val_ic": round(self._val_ic, 6),
@@ -282,6 +344,14 @@ class MetaModel:
             "coefficients": self._coefficients,
             "feature_names": self._feature_names,
             "importance": self._importance,
+            # BayesianRidge learned hyperparameters (Type-II ML). None when
+            # the loaded model predates the BR cutover or fit was skipped.
+            "learned_alpha_noise_precision": (
+                round(self._learned_alpha, 6) if self._learned_alpha is not None else None
+            ),
+            "learned_lambda_weight_precision": (
+                round(self._learned_lambda, 6) if self._learned_lambda is not None else None
+            ),
         }
 
     def save(self, path: str | Path) -> None:
@@ -309,6 +379,8 @@ class MetaModel:
             mm._coefficients = meta.get("coefficients", {})
             mm._feature_names = meta.get("feature_names", []) or []
             mm._importance = meta.get("importance", {}) or {}
+            mm._learned_alpha = meta.get("learned_alpha_noise_precision")
+            mm._learned_lambda = meta.get("learned_lambda_weight_precision")
         # Backwards-compat: a model saved before feature_names was persisted
         # (pre-PR #34) has only `coefficients`. Reconstruct feature_names from
         # the coefficients dict, excluding the intercept. This keeps previously

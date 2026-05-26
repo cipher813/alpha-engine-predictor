@@ -748,8 +748,16 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
             )
             ctx.n_nan_imputed_tickers += 1
 
+        # BayesianRidge cutover (B.1 of optimizer-sota-upgrades-260526.md):
+        # predict_single_with_std returns (mean, posterior_std) so the
+        # executor's α̂-uncertainty penalty (workstream B.3) can size
+        # conviction picks proportional to predictor confidence. Legacy
+        # Ridge pickles still return std=None during the first soak week —
+        # downstream optimizer falls back to point-estimate sizing then.
+        alpha_std: float | None = None
         if meta_model is not None and meta_model.is_fitted:
-            alpha = float(meta_model.predict_single(meta_features))
+            alpha, alpha_std = meta_model.predict_single_with_std(meta_features)
+            alpha = float(alpha)
         else:
             # Fallback: weighted average of Layer 1 outputs. Prior regime-based
             # term dropped along with the Tier 0 classifier removal (2026-04-16).
@@ -812,6 +820,15 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
             "predicted_direction": predicted_direction,
             "prediction_confidence": round(confidence, 4),
             "predicted_alpha": round(alpha, 6),
+            # B.1 (optimizer-sota-upgrades-260526.md): posterior std from
+            # BayesianRidge. None when loaded model predates BR cutover —
+            # executor's α̂-uncertainty penalty treats None as "fall back
+            # to point-estimate sizing." Additive field, downstream
+            # consumers ignore unknown fields per the S3 schema contract
+            # (alpha-engine ~/Development/CLAUDE.md §"S3 Contract Safety").
+            "predicted_alpha_std": (
+                round(float(alpha_std), 6) if alpha_std is not None else None
+            ),
             "p_up": round(p_up, 4),
             "p_flat": 0.0,
             "p_down": round(p_down, 4),
