@@ -197,65 +197,33 @@ done
 # ── SSM command primitive ─────────────────────────────────────────────────────
 # run_ssm "<description>" "<bash script>" [timeout_seconds]
 #
-# Ships the script body via AWS-RunShellScript (base64-wrapped so embedded
-# Python/heredoc quoting is transport-safe), captures full stdout/stderr to
-# S3 (past SSM's 24KB response cap), and streams the StandardOutputContent
-# delta to the dispatcher while polling. Returns non-zero on any non-Success
-# terminal status. jq-free (python3 + `aws --query` only) so it runs on the
-# Saturday-SF dispatcher (ae-dashboard) without extra deps.
+# **2026-05-27 — Lib chokepoint lift (ROADMAP L342 PR 4).** This helper
+# was the 54-line inline ``aws ssm send-command`` + poll + stream + S3
+# capture bash function that L342 was explicitly chartered to retire.
+# The lib equivalent ships in ``alpha_engine_lib.ssm_dispatcher`` (lib
+# v0.35.0+, [#73](https://github.com/cipher813/alpha-engine-lib/pull/73))
+# with identical contract: base64-wrap → SendCommand → poll → stream
+# StandardOutputContent delta → fetch StandardErrorContent on terminal
+# non-Success → propagate exit. Adds InvocationDoesNotExist
+# registration-grace handling (2026-05-23 SF event-16 substrate weakness)
+# that the pre-lift inline form lacked.
+#
+# The calling convention is unchanged so the existing 5 call sites
+# (bootstrap / deps / preflight-only / smoke / full-training) need no
+# rewrite. The body is piped to the lib CLI's ``--script-stdin``, which
+# reads it verbatim (no command-substitution scanning) — matching the
+# pattern alpha-engine-data PR 2 (#330) and alpha-engine-backtester
+# PR 3 (#251) adopted for their migrations.
 run_ssm() {
   local description="$1" script="$2" timeout_s="${3:-3600}"
-  local b64 pfile cmd_id status out last=0 err
-
-  b64=$(printf '%s' "$script" | base64 | tr -d '\n')
-  pfile=$(mktemp)
-  REMOTE_CMD="echo $b64 | base64 -d | bash" python3 - "$pfile" <<'PYJSON'
-import json, os, sys
-json.dump({"commands": [os.environ["REMOTE_CMD"]]}, open(sys.argv[1], "w"))
-PYJSON
-
-  cmd_id=$(aws ssm send-command \
-    --instance-ids "$INSTANCE_ID" \
-    --document-name AWS-RunShellScript \
-    --comment "predictor-training: $description" \
-    --timeout-seconds "$timeout_s" \
-    --parameters "file://$pfile" \
-    --output-s3-bucket-name "$S3_BUCKET" \
-    --output-s3-key-prefix "${S3_STAGING_PREFIX}/ssm-output" \
+  printf '%s' "$script" | "$LIB_PYTHON" -m alpha_engine_lib.ssm_dispatcher run \
+    --instance-id "$INSTANCE_ID" \
+    --description "predictor-training: $description" \
+    --timeout "$timeout_s" \
+    --output-bucket "$S3_BUCKET" \
+    --output-key-prefix "${S3_STAGING_PREFIX}/ssm-output" \
     --region "$AWS_REGION" \
-    --query 'Command.CommandId' --output text) || { rm -f "$pfile"; return 1; }
-  rm -f "$pfile"
-
-  echo "    [ssm $description] command-id=$cmd_id"
-  while :; do
-    sleep 5
-    status=$(aws ssm get-command-invocation --command-id "$cmd_id" \
-      --instance-id "$INSTANCE_ID" --region "$AWS_REGION" \
-      --query 'Status' --output text 2>/dev/null || echo "Pending")
-    out=$(aws ssm get-command-invocation --command-id "$cmd_id" \
-      --instance-id "$INSTANCE_ID" --region "$AWS_REGION" \
-      --query 'StandardOutputContent' --output text 2>/dev/null || echo "")
-    if [ "${#out}" -gt "$last" ]; then
-      printf '%s' "${out:$last}"
-      last=${#out}
-    elif [ "${#out}" -lt "$last" ]; then
-      # 24KB cap rotated the buffer — full log is in S3.
-      echo "    [ssm $description] (stdout exceeded 24KB cap — full log: ${S3_STAGING}/ssm-output/)"
-      last=${#out}
-    fi
-    case "$status" in
-      Success) echo ""; return 0 ;;
-      Pending|InProgress|Delayed) : ;;
-      *)
-        err=$(aws ssm get-command-invocation --command-id "$cmd_id" \
-          --instance-id "$INSTANCE_ID" --region "$AWS_REGION" \
-          --query 'StandardErrorContent' --output text 2>/dev/null || echo "")
-        echo ""
-        echo "ERROR: SSM step '$description' terminal status=$status"
-        [ -n "$err" ] && { echo "--- stderr (24KB cap; full: ${S3_STAGING}/ssm-output/) ---"; printf '%s\n' "$err"; }
-        return 1 ;;
-    esac
-  done
+    --script-stdin
 }
 
 # Each run_ssm step is a fresh SSM shell with a minimal env. The
