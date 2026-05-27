@@ -1036,6 +1036,45 @@ def main(
         except Exception as _sum_err:
             log.warning("Training summary write failed (non-blocking): %s", _sum_err)
 
+    # Step 2d2: Factor-risk-model F + D weekly persistence (ROADMAP C.2b).
+    # Reads the per-ticker parquets the train_handler already populated
+    # to ``tmp_cache`` from ArcticDB, extracts close → log returns + the
+    # 8 ``*_zscore`` factor-loading columns (C.1, alpha-engine-data
+    # #324), runs the Fama-MacBeth cross-sectional regression
+    # (C.2a, ``risk_model.build_factor_risk_model``), and persists F + D
+    # parquets to ``s3://{bucket}/risk_model/{date}/``. Non-blocking:
+    # failure here doesn't abort the training pipeline. Auto-skips
+    # when loading-column coverage is insufficient (pre-#324 cache).
+    #
+    # The actual wiring of Σ = B · F · Bᵀ + D into
+    # ``executor.portfolio_optimizer.solve_target_weights`` is C.3 —
+    # under a hard sequencing constraint per the plan doc: do NOT
+    # wire until B.5 (α̂-uncertainty cutover gate) passes. Two
+    # simultaneous Σ-substrate changes make backtester regressions
+    # untraceable. C.2b ships the weekly persistence so by the time
+    # C.3 reads ``risk_model/{date}/``, there are ≥4 weeks of F + D
+    # accumulated.
+    if not dry_run:
+        try:
+            from training.risk_model_persist import (
+                build_and_persist_risk_model,
+            )
+            _rm_payload = build_and_persist_risk_model(
+                data_dir=str(tmp_cache),
+                bucket=bucket,
+                date_str=date_str,
+            )
+            result["risk_model"] = _rm_payload
+            log.info(
+                "risk_model_persist: status=%s",
+                _rm_payload.get("status"),
+            )
+        except Exception as _rm_err:
+            log.warning(
+                "risk_model_persist failed (non-blocking): %s",
+                _rm_err, exc_info=True,
+            )
+
     # Step 2e: Triple-barrier cutover gate (Stage 3 PR 5 SF wiring).
     # Runs after model upload + training summary so the gate has access
     # to the freshly-promoted meta_model_tb.pkl and the most recent ~6
