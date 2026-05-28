@@ -70,9 +70,8 @@ def pull_from_arcticdb(local_dir: Path) -> int:
     import pandas as pd
     import boto3
 
-    region = os.environ.get("AWS_REGION", "us-east-1")
-    uri = f"s3s://s3.{region}.amazonaws.com:{BUCKET}?path_prefix={ARCTIC_PREFIX}&aws_auth=true"
-    arctic = _adb.Arctic(uri)
+    from alpha_engine_lib.arcticdb import open_arctic
+    arctic = open_arctic(BUCKET)
     universe = arctic.get_library("universe")
     macro_lib = arctic.get_library("macro")
 

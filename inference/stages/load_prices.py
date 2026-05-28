@@ -119,16 +119,18 @@ def _verify_arctic_fresh(universe_lib, date_str: str) -> None:
 
 
 def _connect_arctic(bucket: str) -> "tuple[object, object]":
-    """Open the ArcticDB universe + macro libraries. Hard-fail on unreachable."""
-    region = os.environ.get("AWS_REGION", "us-east-1")
-    uri = f"s3s://s3.{region}.amazonaws.com:{bucket}?path_prefix=arcticdb&aws_auth=true"
+    """Open the ArcticDB universe + macro libraries. Hard-fail on unreachable.
+
+    Delegates to ``alpha_engine_lib.arcticdb.open_universe_lib`` /
+    ``open_macro_lib`` (L2771 chokepoint). ``PipelineAbort`` is preserved
+    on the failure path so existing pipeline-level except handlers stay
+    correctly typed.
+    """
+    from alpha_engine_lib.arcticdb import open_universe_lib, open_macro_lib
     try:
-        arctic = adb.Arctic(uri)
-        return arctic.get_library("universe"), arctic.get_library("macro")
+        return open_universe_lib(bucket), open_macro_lib(bucket)
     except Exception as exc:
-        raise PipelineAbort(
-            f"ArcticDB unreachable at {uri}: {exc}"
-        ) from exc
+        raise PipelineAbort(str(exc)) from exc
 
 
 def load_price_data_from_arctic(
