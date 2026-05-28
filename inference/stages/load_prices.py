@@ -169,12 +169,15 @@ def load_price_data_from_arctic(
     * Per-ticker read error rate > 5% → ``PipelineAbort``.
     * Individual ticker missing/empty → logged WARNING and dropped from output.
 
-    Defensive dedup
-    ---------------
-    The 2026-04-15 write-path fix (builders/daily_append.py → ``update()`` instead
-    of ``append()``) prevents new duplicate-date rows, but historical rows may
-    still carry duplicates. Each frame is deduped on read with ``keep="last"``.
-    Remove after 1-2 clean Saturday cycles confirm upstream is clean.
+    Upstream invariant
+    ------------------
+    ArcticDB writes are duplicate-free post the 2026-04-15 write-path fix
+    (builders/daily_append.py → ``update()`` instead of ``append()``).
+    Reads here do NOT defensively dedup — if duplicates ever re-appear,
+    pandas raises downstream at the first ``reindex`` callsite (in
+    ``compute_features``), surfacing the upstream regression instead of
+    silently picking ``keep="last"`` (which would mask a values-differ
+    write-path regression as a clean read).
     """
     end_ts   = pd.Timestamp(date_str).normalize()
     start_ts = end_ts - pd.Timedelta(days=lookback_days)
@@ -186,14 +189,14 @@ def load_price_data_from_arctic(
         df = res.data
         if df.empty:
             return df
-        return df[~df.index.duplicated(keep="last")].sort_index()
+        return df.sort_index()
 
     def _read_close(lib, sym: str) -> pd.DataFrame:
         res = lib.read(sym, date_range=(start_ts, end_ts), columns=["Close"])
         df = res.data
         if df.empty:
             return df
-        return df[~df.index.duplicated(keep="last")].sort_index()
+        return df.sort_index()
 
     # ── Stocks: universe library only ────────────────────────────────────────
     price_data: dict[str, pd.DataFrame] = {}

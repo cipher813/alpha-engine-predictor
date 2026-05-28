@@ -1,5 +1,6 @@
 """Tests for data/dataset.py — array building and normalization."""
 
+import inspect
 import json
 import tempfile
 from pathlib import Path
@@ -192,3 +193,42 @@ class TestLoadNormStats:
             mean, std = load_norm_stats(f.name)
             assert isinstance(mean, np.ndarray)
             assert isinstance(std, np.ndarray)
+
+
+class TestDefensiveDedupRetiredL2188:
+    """Pin L2188 — `keep="last"` defensive dedup retired post-soak.
+
+    The 2026-04-15 ArcticDB write-path fix (alpha-engine-data
+    builders/daily_append.py → `update()` over `append()`) made
+    duplicates structurally impossible. The defensive `keep="last"`
+    dedup on the read path was a transition device; per
+    feedback_no_silent_fails it must NOT be re-introduced — silent
+    dedup of values-differ duplicates would mask an upstream regression
+    as a clean read.
+
+    Sites guarded:
+      - data/dataset.py::_load_ticker_parquet (training read path)
+      - inference/stages/load_prices.py::_read_ohlcv + _read_close
+        (inference read path)
+    """
+
+    def test_dataset_loader_does_not_dedup(self):
+        from data import dataset
+        src = inspect.getsource(dataset._load_ticker_parquet)
+        assert ".duplicated(" not in src, (
+            "data/dataset.py::_load_ticker_parquet must not silently "
+            "dedup on read — duplicates are structurally impossible "
+            "post the 2026-04-15 ArcticDB write-path fix. If duplicates "
+            "appear, surface them via pandas reindex raising downstream "
+            "rather than masking values-differ regressions per "
+            "feedback_no_silent_fails."
+        )
+
+    def test_inference_readers_do_not_dedup(self):
+        from inference.stages import load_prices
+        src = inspect.getsource(load_prices.load_price_data_from_arctic)
+        assert ".duplicated(" not in src, (
+            "inference/stages/load_prices.py::_read_ohlcv + _read_close "
+            "must not silently dedup on read — same rationale as the "
+            "dataset loader pin above."
+        )
