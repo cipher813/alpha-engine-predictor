@@ -1029,52 +1029,16 @@ def send_predictor_email(
 
     # Morning briefing HTML archival removed — no consumers read it (email delivers the content).
 
-    app_password = (get_secret("GMAIL_APP_PASSWORD", required=False, default="") or "").strip()
-
-    if app_password:
-        import smtplib
-        from email.mime.multipart import MIMEMultipart
-        from email.mime.text import MIMEText
-
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = subject
-        msg["From"]    = sender
-        msg["To"]      = ", ".join(recipients)
-        msg.attach(MIMEText(plain_body, "plain", "utf-8"))
-        msg.attach(MIMEText(html_body,  "html",  "utf-8"))
-
-        try:
-            with smtplib.SMTP("smtp.gmail.com", 587) as server:
-                server.ehlo()
-                server.starttls()
-                server.ehlo()
-                server.login(sender, app_password.replace(" ", ""))
-                server.sendmail(sender, recipients, msg.as_string())
-            log.info("Predictor email sent via Gmail SMTP: '%s'", subject)
-            return True
-        except Exception as exc:
-            log.warning("Gmail SMTP failed (%s) — trying SES fallback", exc)
-
-    # SES fallback
-    try:
-        import boto3
-        ses = boto3.client("ses", region_name=cfg.AWS_REGION)
-        ses.send_email(
-            Source=sender,
-            Destination={"ToAddresses": recipients},
-            Message={
-                "Subject": {"Data": subject, "Charset": "UTF-8"},
-                "Body": {
-                    "Text": {"Data": plain_body, "Charset": "UTF-8"},
-                    "Html": {"Data": html_body,  "Charset": "UTF-8"},
-                },
-            },
-        )
-        log.info("Predictor email sent via SES: '%s'", subject)
-        return True
-    except Exception as exc:
-        log.warning("SES send failed: %s — predictor email not delivered", exc)
-        return False
+    # SMTP/SES dispatch via the alpha_engine_lib.email_sender chokepoint
+    # (L4356 — Gmail SMTP primary, SES fallback). Identical semantics to
+    # the pre-consolidation inline path; never raises, returns False on
+    # any failure mode.
+    from alpha_engine_lib.email_sender import send_email as _send_email
+    return _send_email(
+        subject, plain_body,
+        recipients=recipients, html=html_body,
+        sender=sender, region=cfg.AWS_REGION,
+    )
 
 
 # ── Stage entry point ────────────────────────────────────────────────────────
