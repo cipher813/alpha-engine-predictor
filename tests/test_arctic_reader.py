@@ -10,9 +10,22 @@ import pytest
 
 @pytest.fixture
 def fake_arcticdb(monkeypatch):
-    """Replace store.arctic_reader.adb with a controllable mock."""
+    """Replace the ``arcticdb`` module singleton's ``Arctic`` class with a
+    controllable mock. Patches at the singleton level so BOTH direct
+    ``import arcticdb as adb; adb.Arctic(...)`` callers AND the
+    ``alpha_engine_lib.arcticdb._import_arcticdb()`` lazy-import path
+    (used by ``open_arctic`` / ``open_universe_lib`` / ``open_macro_lib``)
+    pick up the mock. Without singleton-level patching, a lib-routed
+    call would bypass the mock and hit real S3 (post-L2771 chokepoint
+    migration)."""
+    import arcticdb as _real_arcticdb
     import store.arctic_reader as mod
     fake = MagicMock(name="arcticdb")
+    # Patch on the actual arcticdb module attribute — caught by both
+    # the consumer's `adb.Arctic(...)` and the lib's `open_arctic(...)`.
+    monkeypatch.setattr(_real_arcticdb, "Arctic", fake.Arctic)
+    # Also patch the consumer module's local ``adb`` reference for any
+    # legacy callers that still use it directly outside of `_get_arctic`.
     monkeypatch.setattr(mod, "adb", fake)
     return fake
 

@@ -58,22 +58,13 @@ def _load_ticker_parquet(path: Path) -> pd.DataFrame:
         df.index = idx
         if not df.index.is_monotonic_increasing:
             df = df.sort_index()
-        # Deduplicate on date index. Mirrors inference's defensive handling
-        # at inference/stages/load_prices.py:403. 2026-04-15 smoke tests
-        # showed 904/909 tickers failing feature computation with
-        # "cannot reindex on an axis with duplicate labels" — ArcticDB reads
-        # are emitting same-date rows for essentially every ticker. Upstream
-        # fix belongs in alpha-engine-data's ArcticDB write path; this is
-        # the consistency fix that brings training into alignment with the
-        # inference path that already expects and handles the duplicates.
-        if df.index.has_duplicates:
-            n_before = len(df)
-            df = df[~df.index.duplicated(keep="last")]
-            log.warning(
-                "Deduplicated %d duplicate date rows in %s (kept last: %d → %d). "
-                "Upstream ArcticDB write is emitting duplicates — file against alpha-engine-data.",
-                n_before - len(df), path.name, n_before, len(df),
-            )
+        # ArcticDB writes are duplicate-free post the 2026-04-15 write-path
+        # fix (alpha-engine-data builders/daily_append.py → update() instead
+        # of append()). If duplicates ever re-appear here, the downstream
+        # ``compute_features`` reindex raises and surfaces the upstream
+        # regression — preferred over silently picking ``keep="last"``,
+        # which would mask a values-differ write-path bug as a clean read
+        # per feedback_no_silent_fails.
         return df
     except Exception as exc:
         log.warning("Failed to load %s: %s", path.name, exc)

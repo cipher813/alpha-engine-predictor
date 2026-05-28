@@ -32,10 +32,9 @@ ARCTIC_PREFIX = "arcticdb"
 
 
 def _get_arctic(bucket: str) -> adb.Arctic:
-    """Create ArcticDB connection."""
-    region = os.environ.get("AWS_REGION", "us-east-1")
-    uri = f"s3s://s3.{region}.amazonaws.com:{bucket}?path_prefix={ARCTIC_PREFIX}&aws_auth=true"
-    return adb.Arctic(uri)
+    """Create ArcticDB connection via the lib chokepoint (L2771)."""
+    from alpha_engine_lib.arcticdb import open_arctic
+    return open_arctic(bucket)
 
 
 def download_from_arctic(
