@@ -117,25 +117,30 @@ def get_veto_threshold(
     regime_intensity_z: float | None = None,
     forced_bear: bool = False,
     drawdown_effective_regime: str | None = None,
+    drawdown_protective_severity: int | None = None,
 ) -> float:
     """
     Return the active veto confidence threshold, adjusted by market regime.
 
-    In bear/caution regimes, the threshold is lowered (more aggressive vetoing)
+    In bear regimes, the threshold is lowered (more aggressive vetoing)
     to protect capital. In bull regimes, the threshold is raised (more permissive)
-    to avoid missing opportunities.
+    to avoid missing opportunities. Drawdown-protective state is a separate
+    axis (see ``drawdown_protective_severity`` parameter below).
 
     Confidence semantics post-2026-05-12: ``|p_up - 0.5| * 2`` (ROADMAP L1615).
     A threshold of 0.30 corresponds to the prior 0.65 winner-probability gate
     via the linear map ``new = (old - 0.5) * 2``. Regime adjustments doubled
     to preserve the same relative pull on the new [0, 1] axis.
 
-    Discrete regime adjustments (applied to the base threshold from S3 or
-    config) when Stage D' Wire 4 is OFF:
+    Discrete regime adjustments (3-class Ang-Bekaert, post v0.42.0 —
+    caution-regime-retirement-260528.md) when Stage D' Wire 4 is OFF:
       bear:    -0.20  (e.g., 0.30 → 0.10 — veto more aggressively)
-      caution: -0.10  (e.g., 0.30 → 0.20)
       neutral:  0.00  (no adjustment)
       bullish: +0.10  (e.g., 0.30 → 0.40 — allow more entries)
+    Legacy "caution" / "bearish" emissions coerce to the nearest 3-class
+    neighbor (caution → neutral, bearish → bear) for grandfather safety;
+    raw LLM caution is coerced upstream at macro-agent
+    ``_validate_regime``.
 
     Continuous regime adjustment (Stage D' Wire 4, regime-v3-260514):
       When ``regime_veto_enabled=True`` in S3 predictor_params AND
@@ -163,14 +168,22 @@ def get_veto_threshold(
 
     Drawdown-regime clamp (regime-drawdown-hysteresis-260518.md, PR 3):
       When ``drawdown_regime_enabled=True`` in S3 predictor_params AND
-      the composed daily drawdown effective regime
-      (``ctx.drawdown_effective_regime``, stamped by the daily stage)
-      is protective, the threshold is clamped — ``bear`` → the same
-      bear floor as forced-bear (``base - cap``), ``caution`` → a milder
-      floor (``base - cap/2``), mirroring the discrete −0.20/−0.10
-      relationship. Composed most-protective with the forced-bear clamp
-      and the Wire-4/discrete result: all clamps accumulate via ``min``
-      (lower threshold = more aggressive veto); none is half-honored.
+      the drawdown leg's protective severity ordinal
+      (``ctx.drawdown_protective_severity``, stamped by the daily stage:
+      0=risk_on, 1=caution, 2=risk_off/alpha_bleed) is non-zero, the
+      threshold is clamped — severity 2 → bear floor (``base - cap``,
+      same as forced-bear); severity 1 → milder caution floor
+      (``base - cap/2``). Composed most-protective with the forced-bear
+      clamp and the Wire-4/discrete result: all clamps accumulate via
+      ``min`` (lower threshold = more aggressive veto); none is
+      half-honored.
+
+      Backward-compat: if ``drawdown_protective_severity`` is None but
+      ``drawdown_effective_regime`` is provided (legacy callsites or
+      historical artifacts), the severity is derived from the string
+      via the type-system separation introduced in v0.42.0 (caution-
+      regime-retirement-260528.md Phase 2A). Drop the string-arg path
+      once all callers stamp the ordinal directly.
 
       Default ``drawdown_regime_enabled=False``: dormant; the
       counterfactual is logged (parallel-observe) for the promotion gate.
@@ -202,11 +215,16 @@ def get_veto_threshold(
             )
     else:
         # Legacy path: discrete adjustment by qualitative regime string.
+        # 3-class Ang-Bekaert (v0.42.0). Legacy 4-class strings ("caution",
+        # "bearish") grandfathered for forward compat with historical
+        # artifacts and pre-cutover predictor_params.json values; the
+        # macro-agent _validate_regime upstream coerces raw LLM "caution"
+        # to "neutral" so new emissions stay 3-class.
         regime = market_regime.lower().strip() if market_regime else ""
         regime_adjustments = {
             "bear": -0.20,
-            "bearish": -0.20,
-            "caution": -0.10,
+            "bearish": -0.20,    # legacy alias (caution-regime-retirement-260528)
+            "caution": -0.10,    # legacy 4-class (grandfather; coerced upstream)
             "neutral": 0.0,
             "bull": 0.10,
             "bullish": 0.10,
@@ -245,22 +263,36 @@ def get_veto_threshold(
                 threshold, clamped, bear_floor,
             )
 
-    dd = (drawdown_effective_regime or "").lower().strip()
-    if dd in ("bear", "caution"):
-        dd_floor = max(0.0, min(0.80, base - (cap if dd == "bear" else cap / 2.0)))
+    # Drawdown-protective clamp — read the SOTA severity ordinal if
+    # stamped; fall back to deriving it from the legacy string field
+    # for grandfather safety. v0.42.0 Phase 2A type-system separation
+    # (caution-regime-retirement-260528.md): drawdown leg is an axis
+    # ORTHOGONAL to macro market_regime; severity ordinal is the
+    # canonical input.
+    dd_severity = drawdown_protective_severity
+    if dd_severity is None and drawdown_effective_regime is not None:
+        # Backward-compat: derive severity from the legacy macro-aliased
+        # field. Mapping mirrors the pre-cutover string check.
+        legacy = (drawdown_effective_regime or "").lower().strip()
+        dd_severity = {"bear": 2, "caution": 1}.get(legacy, 0)
+
+    if dd_severity and dd_severity > 0:
+        dd_floor = max(0.0, min(0.80, base - (cap if dd_severity >= 2 else cap / 2.0)))
         dd_clamped = min(threshold, dd_floor)
+        dd_label = "risk_off" if dd_severity >= 2 else "caution"
         if bool(params and params.get("drawdown_regime_enabled", False)):
             if dd_clamped < effective:
                 log.warning(
-                    "Veto threshold DRAWDOWN clamp (%s): %.3f → %.3f "
-                    "(dd_floor=%.3f)", dd, effective, dd_clamped, dd_floor,
+                    "Veto threshold DRAWDOWN clamp (severity=%d, %s): %.3f → %.3f "
+                    "(dd_floor=%.3f)", dd_severity, dd_label,
+                    effective, dd_clamped, dd_floor,
                 )
             effective = min(effective, dd_clamped)
         else:
             log.info(
-                "drawdown_regime OBSERVE (flag off): effective_regime=%s, "
+                "drawdown_regime OBSERVE (flag off): severity=%d (%s), "
                 "veto would clamp %.3f → %.3f (dd_floor=%.3f)",
-                dd, threshold, dd_clamped, dd_floor,
+                dd_severity, dd_label, threshold, dd_clamped, dd_floor,
             )
 
     return effective
@@ -1147,6 +1179,9 @@ def run(ctx: PipelineContext) -> None:
         forced_bear=getattr(ctx, "regime_forced_bear", False),
         drawdown_effective_regime=getattr(
             ctx, "drawdown_effective_regime", None
+        ),
+        drawdown_protective_severity=getattr(
+            ctx, "drawdown_protective_severity", None
         ),
     )
 

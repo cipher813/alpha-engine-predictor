@@ -95,22 +95,49 @@ class DrawdownTunables:
 
 # ── Canonical regime vocabulary + most-protective composition ────────────
 
-# Protection ordering. Higher = more protective (de-risked).
+# Macro regime protection ordering. 3-class Ang-Bekaert taxonomy
+# (v0.42.0 / 2026-05-28). Legacy 4th "caution" tier retired per
+# caution-regime-retirement-260528.md — macro-side stress signals
+# (VIX, HY OAS, SPY 30d return) flow continuously through
+# regime_intensity_z (predictor META_FEATURE 13). The drawdown leg's
+# protective state is now a SEPARATE axis (see
+# DRAWDOWN_PROTECTIVE_SEVERITY below) and no longer aliases into the
+# macro regime vocabulary at compose time.
 _PROTECTION_ORDER: dict[str, int] = {
     "bull": 0,
     "neutral": 1,
-    "caution": 2,
-    "bear": 3,
+    "bear": 2,
+}
+
+# Drawdown-leg protective-severity ordinal. 3-state hysteresis preserved
+# as the institutional Bridgewater All-Weather / AQR risk-parity tiered
+# de-risking pattern. This axis is ORTHOGONAL to macro regime;
+# downstream consumers compose via most-protective override at decision
+# time (executor _rank, predictor veto threshold).
+#   0 = no protection (risk_on)
+#   1 = caution (half-step protective; veto base - cap/2)
+#   2 = full protective (risk_off / excess alpha_bleed; veto base - cap)
+DRAWDOWN_PROTECTIVE_SEVERITY: dict[str, int] = {
+    "risk_on": 0,
+    "caution": 1,
+    "risk_off": 2,
+    "alpha_bleed": 2,  # excess tier escalates immediately
 }
 
 
 def most_protective(*labels: str | None) -> str:
-    """Conservative aggregation: the most-protective non-None label.
+    """Conservative aggregation over MACRO regime labels: the
+    most-protective non-None label in the 3-class vocabulary.
 
-    The canonical helper the ``substrate.py`` docstring promised. Capital
-    protection needs no consensus — any leg can escalate. ``None`` legs
-    (a leg that does not escalate, e.g. drawdown ``risk_on``) are ignored;
-    all-None ⇒ ``"neutral"`` (no information, no escalation).
+    ``None`` legs (a leg that does not escalate, e.g. drawdown ``risk_on``)
+    are ignored; all-None ⇒ ``"neutral"`` (no information, no escalation).
+
+    Note: post-v0.42.0 the drawdown leg's protective state is a separate
+    axis (see ``DRAWDOWN_PROTECTIVE_SEVERITY``) and only contributes
+    ``"bear"`` to the macro composition when its tier reaches ``risk_off``
+    (severity 2). Caution-tier drawdown (severity 1) is observable via
+    ``drawdown_protective_severity`` but does NOT alias into the macro
+    regime vocabulary.
     """
     present = [str(l) for l in labels if l]
     if not present:
@@ -119,14 +146,40 @@ def most_protective(*labels: str | None) -> str:
 
 
 def spy_tier_to_regime(tier: str) -> str | None:
-    """Map an SPY drawdown tier onto the regime vocabulary (None = no
-    escalation contribution)."""
-    return {"risk_on": None, "caution": "caution", "risk_off": "bear"}.get(tier)
+    """Map an SPY drawdown tier onto the MACRO regime vocabulary.
+
+    Post-v0.42.0 (caution-regime-retirement-260528.md): the drawdown
+    leg's ``caution`` tier no longer aliases into the macro regime — it
+    sits on the orthogonal drawdown axis (see
+    ``spy_tier_to_protective_severity``). Only ``risk_off`` escalates
+    the macro composition to bear. Use
+    ``spy_tier_to_protective_severity`` for the drawdown-axis ordinal
+    used by veto / sizing consumers.
+    """
+    return {"risk_on": None, "caution": None, "risk_off": "bear"}.get(tier)
 
 
 def excess_tier_to_regime(tier: str) -> str | None:
-    """Map the book-vs-market excess tier onto the regime vocabulary."""
+    """Map the book-vs-market excess tier onto the macro regime
+    vocabulary. ``alpha_bleed`` still escalates the composition to
+    bear directly (the drawdown leg's most-conservative state)."""
     return {"risk_on": None, "alpha_bleed": "bear"}.get(tier)
+
+
+def spy_tier_to_protective_severity(tier: str | None) -> int:
+    """Map an SPY drawdown tier to its protective-severity ordinal
+    (0=risk_on, 1=caution, 2=risk_off). Unknown tiers and ``None``
+    return 0 (no escalation)."""
+    if tier is None:
+        return 0
+    return DRAWDOWN_PROTECTIVE_SEVERITY.get(tier, 0)
+
+
+def excess_tier_to_protective_severity(tier: str | None) -> int:
+    """Map the book-vs-market excess tier to protective severity."""
+    if tier is None:
+        return 0
+    return DRAWDOWN_PROTECTIVE_SEVERITY.get(tier, 0)
 
 
 def compose_effective_regime(
@@ -136,13 +189,32 @@ def compose_effective_regime(
     excess_tier: str | None = None,
     forced_bear: bool = False,
 ) -> dict[str, Any]:
-    """Compose the effective regime = most-protective over the ensemble.
+    """Compose effective regime (macro axis) + drawdown protective
+    state (separate axis).
 
-    Returns ``{"effective_regime": str, "drivers": {leg: contribution}}``.
-    The raw legs are preserved so the composed value is always
-    explainable in audit. ``hmm_argmax`` is bull/neutral/bear (already
-    the regime vocabulary); the drawdown tiers map via the helpers; a
-    Stage-F ``forced_bear`` contributes ``"bear"``.
+    Returns:
+        {
+          "effective_regime": <3-class macro regime: bull/neutral/bear>,
+          "drivers": {leg: macro-regime contribution or None},
+          "drawdown_tier": <raw SPY hysteresis state: risk_on/caution/risk_off, or None>,
+          "drawdown_protective_severity": <0 | 1 | 2 ordinal across the drawdown axis>,
+          "forced_bear": <bool>,
+        }
+
+    Type-system separation (v0.42.0 / 2026-05-28 —
+    caution-regime-retirement-260528.md):
+
+    * ``effective_regime`` is the 3-class macro axis (Ang-Bekaert).
+      Drawdown ``risk_off`` and excess ``alpha_bleed`` still alias to
+      ``bear`` here (their most-protective tier IS macro bear); drawdown
+      ``caution`` no longer aliases at all (its protective semantic lives
+      on the drawdown axis below).
+    * ``drawdown_protective_severity`` is the canonical drawdown axis
+      ordinal that veto / sizing consumers should read. Composed as
+      ``max(spy_severity, excess_severity)``.
+
+    Consumers compose the two axes via most-protective override at
+    decision time (executor _rank table, predictor veto threshold).
     """
     drivers: dict[str, str | None] = {
         "hmm": hmm_argmax,
@@ -153,7 +225,19 @@ def compose_effective_regime(
         "forced_bear": "bear" if forced_bear else None,
     }
     effective = most_protective(*drivers.values())
-    return {"effective_regime": effective, "drivers": drivers}
+
+    drawdown_severity = max(
+        spy_tier_to_protective_severity(spy_tier),
+        excess_tier_to_protective_severity(excess_tier),
+    )
+
+    return {
+        "effective_regime": effective,
+        "drivers": drivers,
+        "drawdown_tier": spy_tier,
+        "drawdown_protective_severity": drawdown_severity,
+        "forced_bear": forced_bear,
+    }
 
 
 # ── Vectorized bear stretches (THE single source of truth) ───────────────

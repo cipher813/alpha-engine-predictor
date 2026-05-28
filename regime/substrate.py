@@ -106,15 +106,16 @@ def _compute_guardrail_flags(
     spy_30d_bear = bool(np.isfinite(spy_30d_pct) and spy_30d_pct < t["spy_30d_bear_threshold"])
     hy_oas_caution = bool(np.isfinite(hy_oas) and hy_oas > t["hy_oas_caution_threshold_bps"])
 
-    # Severity floor — what the macro agent's guardrail would force as
-    # a minimum. Reported as a hint, not authoritative.
+    # Macro severity-floor hint (v0.42.0 — caution-regime-retirement-260528.md):
+    # only the "bear" hint survives. The soft-caution hints retired with
+    # the macro-agent rule-based override (their driving signals already
+    # flow continuously through regime_intensity_z). The threshold-
+    # crossing boolean feature flags (vix/spy_30d/hy_oas_caution_breached)
+    # remain for observability — they're feature flags, not regime
+    # classifications.
     active_severity_floor: str | None = None
     if vix_bear and spy_30d_bear:
         active_severity_floor = "bear"
-    elif vix_caution and spy_30d_caution:
-        active_severity_floor = "caution"
-    elif hy_oas_caution:
-        active_severity_floor = "caution"
 
     return {
         "vix_caution_breached": vix_caution,

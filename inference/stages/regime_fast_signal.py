@@ -154,8 +154,15 @@ def _advance_drawdown(ctx: PipelineContext, s3, dual, run_id: str) -> None:
             forced_bear=bool(ctx.regime_forced_bear),
         )
         art["effective_regime"] = composed
-        # Observe-only stamp — no consumer reads this in PR 2.
+        # Observe-only stamp — no consumer reads this load-bearingly until
+        # drawdown_regime_enabled flips on. v0.42.0 Phase 2A: stamp both
+        # the legacy macro-axis projection (effective_regime) AND the
+        # canonical drawdown-axis severity ordinal for the type-system
+        # separation. Severity is the SOTA input for veto / sizing.
         ctx.drawdown_effective_regime = composed["effective_regime"]
+        ctx.drawdown_protective_severity = int(
+            composed.get("drawdown_protective_severity", 0)
+        )
 
         _s3_put_json(
             s3, ctx.bucket, DRAWDOWN_STATE_KEY,

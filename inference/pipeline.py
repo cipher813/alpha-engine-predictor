@@ -113,7 +113,16 @@ class PipelineContext:
     # consumer PRs, gated `drawdown_regime_enabled` default-off, will).
     # Stamped from the drawdown artifact so the consumer PRs read it
     # in-process, mirroring `regime_forced_bear`.
+    #
+    # Type-system separation (v0.42.0 Phase 2A —
+    # caution-regime-retirement-260528.md): drawdown_effective_regime is
+    # the macro-axis projection (3-class) kept for backward-compat;
+    # drawdown_protective_severity is the canonical drawdown-axis ordinal
+    # (0=risk_on, 1=caution, 2=risk_off/alpha_bleed) consumed by veto
+    # / sizing. New consumers should read the severity; legacy callsites
+    # may still read drawdown_effective_regime during the transition.
     drawdown_effective_regime: Optional[str] = None
+    drawdown_protective_severity: Optional[int] = None
 
     def near_timeout(self) -> bool:
         """Check if we're nearing the Lambda soft timeout."""
