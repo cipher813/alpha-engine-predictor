@@ -896,47 +896,15 @@ def send_training_email(result: dict, date_str: str) -> bool:
             + f"{feat_health_plain}\n"
         )
 
-    app_password = (get_secret("GMAIL_APP_PASSWORD", required=False, default="") or "").strip()
-
-    if app_password:
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = subject
-        msg["From"]    = sender
-        msg["To"]      = ", ".join(recipients)
-        msg.attach(MIMEText(plain_body, "plain", "utf-8"))
-        msg.attach(MIMEText(html_body,  "html",  "utf-8"))
-        try:
-            with smtplib.SMTP("smtp.gmail.com", 587) as server:
-                server.ehlo()
-                server.starttls()
-                server.ehlo()
-                server.login(sender, app_password.replace(" ", ""))
-                server.sendmail(sender, recipients, msg.as_string())
-            log.info("Training email sent via Gmail SMTP: '%s'", subject)
-            return True
-        except Exception as exc:
-            log.warning("Gmail SMTP failed (%s) — trying SES fallback", exc)
-
-    # SES fallback
-    try:
-        import boto3
-        ses = boto3.client("ses", region_name=cfg.AWS_REGION)
-        ses.send_email(
-            Source=sender,
-            Destination={"ToAddresses": recipients},
-            Message={
-                "Subject": {"Data": subject, "Charset": "UTF-8"},
-                "Body": {
-                    "Text": {"Data": plain_body, "Charset": "UTF-8"},
-                    "Html": {"Data": html_body,  "Charset": "UTF-8"},
-                },
-            },
-        )
-        log.info("Training email sent via SES: '%s'", subject)
-        return True
-    except Exception as exc:
-        log.warning("SES failed: %s — training email not delivered", exc)
-        return False
+    # SMTP/SES dispatch via the alpha_engine_lib.email_sender chokepoint
+    # (L4356 — Gmail SMTP primary, SES fallback). Same semantics as the
+    # pre-consolidation inline path.
+    from alpha_engine_lib.email_sender import send_email as _send_email
+    return _send_email(
+        subject, plain_body,
+        recipients=recipients, html=html_body,
+        sender=sender, region=cfg.AWS_REGION,
+    )
 
 
 # ── Orchestrator ───────────────────────────────────────────────────────────────
