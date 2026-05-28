@@ -160,16 +160,33 @@ class TestComposeEmitsBothAxes:
 class TestVetoThresholdSeverityOrdinal:
     """Post-v0.42.0 the veto threshold reads drawdown_protective_severity
     directly. Legacy drawdown_effective_regime string still works as a
-    grandfather derivation path."""
+    grandfather derivation path.
+
+    Tests pin base=0.30 + cap=0.20 explicitly in the fake params so the
+    expected floor values are deterministic across environments —
+    cfg.MIN_CONFIDENCE drifts between local + CI."""
+
+    # Pinned for arithmetic determinism. Floors derived as:
+    #   severity 0 → base = 0.30 (no clamp)
+    #   severity 1 → base - cap/2 = 0.30 - 0.10 = 0.20 (caution floor)
+    #   severity 2 → base - cap   = 0.30 - 0.20 = 0.10 (bear floor)
+    _PINNED_BASE = 0.30
+    _PINNED_CAP = 0.20
 
     @pytest.fixture
     def s3_mock(self, monkeypatch):
         # Patch the predictor_params loader to return drawdown_regime_enabled=True
-        # so the severity clamp actually fires (not OBSERVE-mode).
+        # so the severity clamp actually fires (not OBSERVE-mode). Pin
+        # veto_confidence + regime_veto_cap so the floor values are
+        # deterministic regardless of cfg.MIN_CONFIDENCE drift.
         from inference.stages import write_output
 
         def _fake_load(_bucket):
-            return {"drawdown_regime_enabled": True}
+            return {
+                "drawdown_regime_enabled": True,
+                "veto_confidence": self._PINNED_BASE,
+                "regime_veto_cap": self._PINNED_CAP,
+            }
 
         monkeypatch.setattr(write_output, "_load_predictor_params_from_s3", _fake_load)
         return "test-bucket"
@@ -177,21 +194,18 @@ class TestVetoThresholdSeverityOrdinal:
     def test_severity_2_clamps_to_bear_floor(self, s3_mock):
         from inference.stages.write_output import get_veto_threshold
 
-        # severity 2 → base - cap floor. Default base=0.30 cap=0.20 → 0.10.
         t = get_veto_threshold(s3_mock, drawdown_protective_severity=2)
         assert t == pytest.approx(0.10, abs=0.001)
 
     def test_severity_1_clamps_to_caution_floor(self, s3_mock):
         from inference.stages.write_output import get_veto_threshold
 
-        # severity 1 → base - cap/2 floor. Default base=0.30 cap=0.20 → 0.20.
         t = get_veto_threshold(s3_mock, drawdown_protective_severity=1)
         assert t == pytest.approx(0.20, abs=0.001)
 
     def test_severity_0_no_clamp(self, s3_mock):
         from inference.stages.write_output import get_veto_threshold
 
-        # severity 0 → no clamp. Default base.
         t = get_veto_threshold(s3_mock, drawdown_protective_severity=0)
         assert t == pytest.approx(0.30, abs=0.001)
 
@@ -200,10 +214,8 @@ class TestVetoThresholdSeverityOrdinal:
         — grandfather derives severity from the string."""
         from inference.stages.write_output import get_veto_threshold
 
-        # Legacy "bear" → severity 2 → bear floor 0.10.
         t_bear = get_veto_threshold(s3_mock, drawdown_effective_regime="bear")
         assert t_bear == pytest.approx(0.10, abs=0.001)
-        # Legacy "caution" → severity 1 → caution floor 0.20.
         t_caution = get_veto_threshold(s3_mock, drawdown_effective_regime="caution")
         assert t_caution == pytest.approx(0.20, abs=0.001)
 
