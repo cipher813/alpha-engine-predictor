@@ -614,7 +614,11 @@ def run_meta_training(
     data_path = Path(data_dir)
 
     from data.dataset import _load_ticker_parquet, cross_sectional_rank_normalize
-    from data.label_generator import compute_labels, compute_triple_barrier_alpha_labels
+    from data.label_generator import (
+        compute_labels,
+        compute_triple_barrier_alpha_labels,
+        compute_triple_barrier_touch_labels,
+    )
     # compute_features is intentionally NOT imported — training reads
     # pre-computed features from ArcticDB via the parquet cache written
     # by store/arctic_reader.py:download_from_arctic. Source of truth is
@@ -736,6 +740,11 @@ def run_meta_training(
     # at front-of-history (vol-window warm-up) and tail (past data end)
     # — these align naturally with the canonical fwd_chunks tail-drop.
     fwd_tb_chunks: list[np.ndarray] = []
+    # Task B: parallel triple-barrier touch-order meta-labels (1=up barrier
+    # first, 0=down first, NaN=timeout) on the SAME vol-scaled barriers as the
+    # alpha label above. Supervision target for the observe-only meta-label
+    # classifier whose calibrated P(up before down) feeds executor sizing.
+    fwd_tb_touch_chunks: list[np.ndarray] = []
 
     for path in all_parquets:
         ticker = path.stem
@@ -769,6 +778,15 @@ def run_meta_training(
             # Front-of-history rows where σ_t hasn't warmed up get NaN
             # labels and are filtered downstream at the parallel-Ridge fit.
             labeled = compute_triple_barrier_alpha_labels(
+                labeled,
+                benchmark_returns=sector_etf_s if sector_etf_s is not None else spy_series,
+                forward_window=cfg.TRIPLE_BARRIER_FORWARD_WINDOW,
+                vol_window=cfg.TRIPLE_BARRIER_VOL_WINDOW,
+                vol_multiplier=cfg.TRIPLE_BARRIER_VOL_MULTIPLIER,
+                min_periods=cfg.TRIPLE_BARRIER_MIN_PERIODS,
+            )
+            # Task B: parallel touch-order meta-label on the same barriers.
+            labeled = compute_triple_barrier_touch_labels(
                 labeled,
                 benchmark_returns=sector_etf_s if sector_etf_s is not None else spy_series,
                 forward_window=cfg.TRIPLE_BARRIER_FORWARD_WINDOW,
@@ -852,6 +870,14 @@ def run_meta_training(
                 pd.Series(float("nan"), index=labeled.index),
             ).to_numpy(dtype=np.float32)
         )
+        # Task B: touch-order meta-label, same tail-dropped index. Absent if
+        # the generator returned early (empty input) → NaN fallback.
+        fwd_tb_touch_chunks.append(
+            labeled.get(
+                "triple_barrier_touch_21d",
+                pd.Series(float("nan"), index=labeled.index),
+            ).to_numpy(dtype=np.float32)
+        )
         fwd_horizons_chunks.append(np.column_stack([
             labeled.get(
                 f"forward_return_{h}d",
@@ -913,12 +939,13 @@ def run_meta_training(
     y_fwd_unsorted = np.concatenate(fwd_chunks)
     y_fwd_horizons_unsorted = np.concatenate(fwd_horizons_chunks, axis=0)
     y_fwd_tb_unsorted = np.concatenate(fwd_tb_chunks)
+    y_fwd_tb_touch_unsorted = np.concatenate(fwd_tb_touch_chunks)
 
     # Free the chunk lists — referenced data has been copied into the
     # contiguous arrays above. Without this `del` the chunks linger
     # through walk-forward and double the RSS we just reduced.
     del date_chunks, ticker_chunks, mom_chunks, vol_chunks, risk_chunks
-    del fwd_chunks, fwd_horizons_chunks, fwd_tb_chunks
+    del fwd_chunks, fwd_horizons_chunks, fwd_tb_chunks, fwd_tb_touch_chunks
 
     # Stable sort by date so ties keep ticker-order deterministic for
     # snapshot tests + reproducibility.
@@ -953,10 +980,14 @@ def run_meta_training(
     y_fwd = y_fwd_unsorted[sort_idx]
     y_fwd_horizons = y_fwd_horizons_unsorted[sort_idx]
     y_fwd_tb = y_fwd_tb_unsorted[sort_idx]
+    # Task B touch-order labels are 0.0/1.0/NaN — NOT clipped (clip below
+    # applies only to the continuous alpha labels).
+    y_fwd_tb_touch = y_fwd_tb_touch_unsorted[sort_idx]
 
     del date_unsorted, ticker_unsorted
     del X_mom_unsorted, X_vol_unsorted, X_risk_unsorted
     del y_fwd_unsorted, y_fwd_horizons_unsorted, y_fwd_tb_unsorted
+    del y_fwd_tb_touch_unsorted
 
     # Winsorize
     if cfg.LABEL_CLIP:
@@ -1384,6 +1415,10 @@ def run_meta_training(
                     # the canonical fit. Carrying ticker so Step 7b can
                     # compute per-ticker LdP Ch. 4.4 sample weights.
                     "actual_fwd_triple_barrier": float(y_fwd_tb[idx]),
+                    # Task B: touch-order meta-label (1=up first, 0=down first,
+                    # NaN=timeout under "nan" policy). Step 7c filters NaN rows
+                    # separately for the meta-label classifier fit.
+                    "actual_fwd_barrier_touch": float(y_fwd_tb_touch[idx]),
                     "ticker": ticker,
                     # Track 1-of-2 of the audit Phase 1 horizon battery (2026-05-07):
                     # carry the row's date so subsequent IC computations can
@@ -1743,6 +1778,67 @@ def run_meta_training(
             "skipped this cycle. Canonical Ridge unaffected.",
             n_tb_finite,
         )
+
+    # ── Step 7c: Meta-label classifier (Task B, observe-only) ───────────────
+    # López de Prado meta-labeling: a calibrated classifier on the SAME
+    # META_FEATURES, supervised on the triple-barrier touch-order label
+    # (1=up/profit barrier first, 0=down/stop first; timeouts are NaN and
+    # excluded). Its calibrated P(up before down) is emitted by inference as
+    # the observe-only ``barrier_win_prob`` field; the executor sizing
+    # consumer (Task B2) stays dormant until a cutover gate clears. Mirrors
+    # the Step 7b observe-only lifecycle: fit on the FULL oos_meta_rows set
+    # (touch-finiteness is its own mask), persist if fit succeeds, never
+    # gate the canonical path. Behind ``META_LABEL_CLASSIFIER_ENABLED``
+    # (default on; observe-only so safe) for an operator kill-switch.
+    meta_label_clf = None
+    if getattr(cfg, "META_LABEL_CLASSIFIER_ENABLED", True):
+        from model.meta_label_classifier import MetaLabelClassifier
+        touch_y_full = np.array([
+            r.get("actual_fwd_barrier_touch", float("nan")) for r in oos_meta_rows
+        ])
+        touch_finite_mask = np.isfinite(touch_y_full)
+        n_touch_finite = int(touch_finite_mask.sum())
+        if n_touch_finite >= 100:
+            touch_X = meta_X_all[touch_finite_mask]
+            touch_y = touch_y_full[touch_finite_mask]
+            # LdP Ch. 4.4 average-uniqueness weights, per-ticker (same as 7b).
+            touch_dates = np.array([
+                r["date"] for r in oos_meta_rows if r is not None
+            ])[touch_finite_mask]
+            touch_tickers = np.array([
+                r.get("ticker", "_unknown") for r in oos_meta_rows
+            ])[touch_finite_mask]
+            t_date_min = pd.Timestamp(min(touch_dates))
+            t_positions = np.array([
+                int((pd.Timestamp(d) - t_date_min).days) for d in touch_dates
+            ], dtype=np.int64)
+            touch_weights = average_uniqueness_weights(
+                window_starts=t_positions,
+                window_length=cfg.TRIPLE_BARRIER_FORWARD_WINDOW,
+                group_ids=touch_tickers,
+            )
+            meta_label_clf = MetaLabelClassifier()
+            meta_label_clf.fit(
+                touch_X, touch_y,
+                feature_names=META_FEATURES,
+                sample_weight=touch_weights,
+            )
+            log.info(
+                "Meta-label classifier fit (Task B observe-only): "
+                "n_touch_finite=%d / n_total=%d (AUC=%.4f, base_rate=%.3f)",
+                n_touch_finite, len(oos_meta_rows),
+                meta_label_clf._auc, meta_label_clf._base_rate,
+            )
+            if not meta_label_clf.is_fitted:
+                # fit() skipped internally (e.g. single-class subsample) —
+                # don't persist an unfitted shell.
+                meta_label_clf = None
+        else:
+            log.info(
+                "Meta-label classifier: only %d touch-finite rows (need >=100) "
+                "— skipped this cycle. Canonical path unaffected.",
+                n_touch_finite,
+            )
 
     # Filter oos_meta_rows to canonical-finite rows so downstream consumers
     # (horizon battery, row_regimes, isotonic calibrator) align naturally
@@ -2552,6 +2648,15 @@ def run_meta_training(
             # the key is omitted — canonical Ridge remains the sole live writer.
             if meta_model_tb is not None:
                 models["meta_model_tb"] = (meta_model_tb, "meta_model_tb.pkl")
+            # Task B (observe-only): meta-label classifier ships ALONGSIDE the
+            # canonical Ridge. Inference emits `barrier_win_prob`; the executor
+            # sizing consumer stays dormant until the Task B2 cutover. When the
+            # classifier is None (disabled, or <100 touch-finite rows this
+            # cycle), the key is omitted and inference emits null.
+            if meta_label_clf is not None:
+                models["meta_label_classifier"] = (
+                    meta_label_clf, "meta_label_classifier.pkl",
+                )
             # Shadow calibrator (2026-05-24 calibrator-shadow arc): persist
             # alongside the live calibrator under a distinct key so the
             # backtester's grace-period check on isotonic_calibrator.pkl.meta.json

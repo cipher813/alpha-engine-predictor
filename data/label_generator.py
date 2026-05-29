@@ -34,7 +34,10 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from labeling.triple_barrier import triple_barrier_alpha_labels
+from labeling.triple_barrier import (
+    triple_barrier_alpha_labels,
+    triple_barrier_touch_order,
+)
 
 
 def compute_labels(
@@ -268,6 +271,70 @@ def compute_triple_barrier_alpha_labels(
         forward_window=forward_window,
         up_barrier_pct=barrier_arr,
         down_barrier_pct=barrier_arr,
+    )
+    df[column_name] = labels
+    return df
+
+
+def compute_triple_barrier_touch_labels(
+    df: pd.DataFrame,
+    benchmark_returns: pd.Series | None = None,
+    forward_window: int = 21,
+    vol_window: int = 20,
+    vol_multiplier: float = 2.0,
+    min_periods: int = 10,
+    timeout_policy: str = "nan",
+    column_name: str = "triple_barrier_touch_21d",
+) -> pd.DataFrame:
+    """Append vol-scaled triple-barrier *touch-order* meta-labels (Task B).
+
+    Sibling of :func:`compute_triple_barrier_alpha_labels` using the SAME
+    sector-neutral residual log-returns and vol-scaled barriers
+    (``barrier = vol_multiplier × σ_t``), but supervising on WHICH barrier the
+    path touches first rather than the realized return:
+
+      - 1.0 : up (profit) barrier touched first
+      - 0.0 : down (stop) barrier touched first
+      - time-out (neither): governed by ``timeout_policy`` (``"nan"`` excludes
+        the row; ``"sign"`` labels by window-end direction).
+
+    Sharing the barrier definition with the alpha label keeps the meta-label
+    coherent with the existing triple-barrier alpha target. Front-of-history
+    rows (insufficient vol history → NaN barrier) and tail rows are NaN and
+    are NOT dropped — the caller filters NaN at training-array assembly.
+
+    This is the supervision target for the Task B meta-label classifier whose
+    calibrated ``P(up before down)`` feeds executor position sizing.
+
+    Returns the input DataFrame with ``column_name`` appended.
+    """
+    if df.empty:
+        df = df.copy()
+        df[column_name] = pd.Series(dtype=float)
+        return df
+
+    df = df.copy()
+    close = df["Close"].astype(float)
+    stock_log_ret = np.log(close / close.shift(1))
+
+    if benchmark_returns is not None:
+        bench_aligned = benchmark_returns.reindex(df.index, method="ffill").astype(float)
+        bench_log_ret = np.log(bench_aligned / bench_aligned.shift(1))
+        residual_log_ret = stock_log_ret - bench_log_ret
+    else:
+        residual_log_ret = stock_log_ret
+
+    log_ret_arr = residual_log_ret.fillna(0.0).to_numpy(dtype=np.float64)
+
+    sigma = residual_log_ret.ewm(span=vol_window, min_periods=min_periods).std()
+    barrier_arr = vol_multiplier * sigma.to_numpy(dtype=np.float64)  # NaN where σ is NaN
+
+    labels = triple_barrier_touch_order(
+        log_ret_arr,
+        forward_window=forward_window,
+        up_barrier_pct=barrier_arr,
+        down_barrier_pct=barrier_arr,
+        timeout_policy=timeout_policy,
     )
     df[column_name] = labels
     return df

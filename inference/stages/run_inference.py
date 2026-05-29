@@ -307,6 +307,11 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
     # evaluation. None when the artifact is absent (early observation
     # period or any cycle where Step 7b's n_tb_finite<100 skipped fit).
     meta_model_tb = ctx.meta_models.get("meta_tb")
+    # Task B (observe-only): meta-label classifier. When loaded, predict
+    # P(up barrier before down) per ticker and emit ``barrier_win_prob``.
+    # None when the artifact is absent (early observation period, classifier
+    # disabled, or a cycle with <100 touch-finite labels).
+    meta_label_clf = ctx.meta_models.get("meta_label_clf")
 
     if vol_scorer is None and meta_model is None:
         # Per feedback_hard_fail_until_stable: this is a cold-start load
@@ -793,6 +798,19 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
                 log.debug("meta_alpha_tb predict failed for %s: %s", ticker, _e)
                 meta_alpha_tb = None
 
+        # Task B (observe-only): calibrated P(up barrier before down) from the
+        # same META_FEATURES vector. Runs after the canonical alpha is computed
+        # so a meta-label exception cannot leak into the canonical path. Rides
+        # as null when the classifier isn't loaded or per-ticker predict raises.
+        barrier_win_prob: float | None = None
+        if meta_label_clf is not None and meta_label_clf.is_fitted:
+            try:
+                barrier_win_prob = float(meta_label_clf.predict_single(meta_features))
+                barrier_win_prob = float(np.clip(barrier_win_prob, 0.0, 1.0))
+            except Exception as _e:
+                log.debug("barrier_win_prob predict failed for %s: %s", ticker, _e)
+                barrier_win_prob = None
+
         # Calibrated confidence. Confidence semantics: |p_up - 0.5| * 2 — see
         # model/calibrator.calibrate_prediction docstring for the rationale
         # (DOWN-veto inversion at 75%+ band, ROADMAP L1594).
@@ -903,6 +921,16 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
             "meta_alpha_tb": (
                 round(meta_alpha_tb, 6)
                 if meta_alpha_tb is not None else None
+            ),
+            # Task B observe-only field: calibrated P(up/profit barrier touched
+            # before down/stop barrier) from the meta-label classifier. Feeds
+            # the executor's position-sizing multiplier once the Task B2
+            # consumer flips on; rides as null until the classifier is trained
+            # + promoted. Additive — downstream consumers ignore unknown fields
+            # per the S3 schema contract.
+            "barrier_win_prob": (
+                round(barrier_win_prob, 4)
+                if barrier_win_prob is not None else None
             ),
             # regime_bull/regime_bear removed from per-ticker output 2026-04-16
             # (Tier 0 classifier retired). Downstream consumers (dashboard,

@@ -37,11 +37,13 @@ class TestTripleBarrierLabelPlumbing:
 
     def test_compute_triple_barrier_imported(self):
         src = _src("training/meta_trainer.py")
-        # Imported alongside compute_labels — single-line for visibility.
-        assert (
-            "from data.label_generator import compute_labels, "
-            "compute_triple_barrier_alpha_labels"
-        ) in src
+        # Imported from data.label_generator alongside compute_labels. The
+        # import became multi-line when the Task B touch-label generator was
+        # added; assert the symbols are present rather than the exact layout.
+        assert "from data.label_generator import (" in src
+        assert "compute_labels," in src
+        assert "compute_triple_barrier_alpha_labels," in src
+        assert "compute_triple_barrier_touch_labels," in src
 
     def test_tb_chunks_declared_alongside_fwd_chunks(self):
         src = _src("training/meta_trainer.py")

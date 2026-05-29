@@ -180,6 +180,20 @@ def _load_meta_models(ctx: PipelineContext) -> None:
     except Exception as e:
         log.debug("meta_model_tb not available (observe-only OK): %s", e)
 
+    # Task B (observe-only): meta-label classifier ships ALONGSIDE the
+    # canonical Ridge. Inference predicts P(up barrier before down) and emits
+    # the parallel ``barrier_win_prob`` field; the executor sizing consumer
+    # stays dormant until the Task B2 cutover. Loader is tolerant: absent file
+    # (early observation period, classifier disabled, or a cycle with <100
+    # touch-finite labels) → the field rides as null.
+    try:
+        from model.meta_label_classifier import MetaLabelClassifier
+        path = _dl(f"{prefix}meta_label_classifier.pkl", "meta_label_classifier.pkl")
+        ctx.meta_models["meta_label_clf"] = MetaLabelClassifier.load(path)
+        log.info("Loaded meta-label classifier (Task B, observe-only)")
+    except Exception as e:
+        log.debug("meta_label_classifier not available (observe-only OK): %s", e)
+
     # Calibrator (Platt scaling on meta-model output)
     ctx.calibrator = None
     if getattr(cfg, "CALIBRATION_ENABLED", True):
