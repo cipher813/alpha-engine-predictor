@@ -17,10 +17,13 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import pytest
+
 from labeling.triple_barrier import (
     TRIPLE_BARRIER_SENTINEL,
     triple_barrier_alpha_labels,
     triple_barrier_class_labels,
+    triple_barrier_touch_order,
 )
 
 
@@ -285,3 +288,88 @@ class TestCrossFlavor:
         finite_alpha = alpha_labels[~np.isnan(alpha_labels)]
         assert (finite_class == 1).all()
         assert np.allclose(finite_alpha, 0.0)
+
+
+# ── Touch-order meta-label tests (Task B) ───────────────────────────────
+
+
+class TestTripleBarrierTouchOrder:
+    """López de Prado meta-label: which barrier (up/down) is touched first.
+
+    Supervision target for the Task B meta-label classifier whose calibrated
+    P(up before down) feeds executor position sizing.
+    """
+
+    def test_steady_uptrend_yields_one(self):
+        # +1%/day crosses the up barrier first → label 1.0.
+        log_returns = np.full(100, 0.01)
+        labels = triple_barrier_touch_order(
+            log_returns, forward_window=21, up_barrier_pct=0.05, down_barrier_pct=0.05
+        )
+        finite = labels[~np.isnan(labels)]
+        assert (finite == 1.0).all()
+
+    def test_steady_downtrend_yields_zero(self):
+        log_returns = np.full(100, -0.01)
+        labels = triple_barrier_touch_order(
+            log_returns, forward_window=21, up_barrier_pct=0.05, down_barrier_pct=0.05
+        )
+        finite = labels[~np.isnan(labels)]
+        assert (finite == 0.0).all()
+
+    def test_timeout_nan_policy_excludes_no_touch_rows(self):
+        # Flat returns never touch either barrier → time-out → NaN (default).
+        log_returns = np.zeros(60)
+        labels = triple_barrier_touch_order(log_returns, forward_window=21)
+        # every non-tail row is a time-out → all NaN under "nan" policy
+        assert np.isnan(labels).all()
+
+    def test_timeout_sign_policy_labels_by_window_end(self):
+        # Small positive drift never touches the barrier but ends positive
+        # → "sign" policy labels it 1.0.
+        log_returns = np.full(60, 0.001)
+        labels = triple_barrier_touch_order(
+            log_returns,
+            forward_window=21,
+            up_barrier_pct=0.05,
+            down_barrier_pct=0.05,
+            timeout_policy="sign",
+        )
+        finite = labels[~np.isnan(labels)]
+        assert (finite == 1.0).all()
+
+    def test_timeout_sign_policy_negative_drift_zero(self):
+        log_returns = np.full(60, -0.001)
+        labels = triple_barrier_touch_order(
+            log_returns, forward_window=21, timeout_policy="sign"
+        )
+        finite = labels[~np.isnan(labels)]
+        assert (finite == 0.0).all()
+
+    def test_tail_rows_get_nan(self):
+        log_returns = np.full(50, 0.01)
+        labels = triple_barrier_touch_order(log_returns, forward_window=21)
+        assert np.isnan(labels[-21:]).all()
+
+    def test_asymmetric_barriers_change_touch_order(self):
+        # Mild uptrend: with a tight up barrier it touches up; with a tight
+        # down barrier (and wide up) the same path would not touch up first.
+        log_returns = np.full(60, 0.004)  # +0.4%/day
+        up_first = triple_barrier_touch_order(
+            log_returns, forward_window=21, up_barrier_pct=0.02, down_barrier_pct=0.50
+        )
+        assert (up_first[~np.isnan(up_first)] == 1.0).all()
+
+    def test_per_row_barrier_nan_propagates(self):
+        log_returns = np.full(60, 0.01)
+        up_arr = np.full(60, 0.05)
+        up_arr[:10] = np.nan
+        labels = triple_barrier_touch_order(
+            log_returns, forward_window=21, up_barrier_pct=up_arr, down_barrier_pct=0.05
+        )
+        assert np.isnan(labels[:10]).all()
+        assert (~np.isnan(labels[10:60 - 21])).all()
+
+    def test_invalid_timeout_policy_raises(self):
+        with pytest.raises(ValueError):
+            triple_barrier_touch_order(np.zeros(50), timeout_policy="bogus")

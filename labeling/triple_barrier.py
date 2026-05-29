@@ -151,3 +151,87 @@ def triple_barrier_alpha_labels(
         if not hit:
             labels[i] = cum
     return labels
+
+
+def triple_barrier_touch_order(
+    log_returns: np.ndarray,
+    forward_window: int = 21,
+    up_barrier_pct: float | np.ndarray = 0.05,
+    down_barrier_pct: float | np.ndarray = 0.05,
+    timeout_policy: str = "nan",
+) -> np.ndarray:
+    """Generate triple-barrier *touch-order* meta-labels (LdP Ch. 3.6).
+
+    For each row, looks forward ``forward_window`` rows and records WHICH
+    horizontal barrier the path touches first:
+
+      - 1.0 : up (profit) barrier touched first
+      - 0.0 : down (stop) barrier touched first
+      - time-out (neither touched within the window): governed by
+        ``timeout_policy``:
+
+          * ``"nan"`` (default) → NaN; the row is excluded from training,
+            giving the pure first-touch conditional target "given a barrier
+            was touched, which one" (López de Prado's meta-label).
+          * ``"sign"`` → 1.0 if window-end cumulative return > 0 else 0.0;
+            retains time-out rows by labelling them with realized direction,
+            preserving sample size at the cost of mixing touched vs untouched
+            outcomes.
+
+    Tail rows where the forward window extends past data end get NaN. NaN
+    barriers at any row propagate to a NaN label at that row (mirrors
+    :func:`triple_barrier_alpha_labels`).
+
+    This is the supervision target for the Task B meta-label classifier, whose
+    calibrated ``P(up before down)`` feeds executor position sizing. The barrier
+    widths are configurable so the meta-label can be aligned to EITHER the
+    predictor's 21d / vol-scaled label barriers (default) or — once the Task A
+    coherence diagnostic reports — the executor's realized execution barriers.
+
+    Args:
+        log_returns: (n,) log-return series.
+        forward_window: time-out barrier in trading days.
+        up_barrier_pct: profit-take barrier (cumulative log return). Scalar
+            broadcasts across all rows; ndarray of length n applies row-wise;
+            NaN at row i → NaN label at row i.
+        down_barrier_pct: stop-loss barrier as a positive number; the function
+            negates internally. Scalar or ndarray as above.
+        timeout_policy: ``"nan"`` | ``"sign"`` — how to label time-out rows.
+
+    Returns:
+        (n,) float64 array — 1.0 / 0.0 / NaN per row.
+
+    Raises:
+        ValueError: if ``timeout_policy`` is not ``"nan"`` or ``"sign"``.
+    """
+    if timeout_policy not in ("nan", "sign"):
+        raise ValueError(
+            f"timeout_policy must be 'nan' or 'sign', got {timeout_policy!r}"
+        )
+    n = len(log_returns)
+    up_arr = np.broadcast_to(np.asarray(up_barrier_pct, dtype=np.float64), (n,))
+    down_arr = np.broadcast_to(np.asarray(down_barrier_pct, dtype=np.float64), (n,))
+    labels = np.full(n, np.nan, dtype=np.float64)
+    for i in range(n - forward_window):
+        up_i = up_arr[i]
+        down_i = down_arr[i]
+        if np.isnan(up_i) or np.isnan(down_i):
+            continue  # NaN barrier → NaN label (already initialized)
+        cum = 0.0
+        touched = 0  # 0 = neither, 1 = up first, -1 = down first
+        for j in range(forward_window):
+            cum += log_returns[i + 1 + j]
+            if cum >= up_i:
+                touched = 1
+                break
+            if cum <= -down_i:
+                touched = -1
+                break
+        if touched == 1:
+            labels[i] = 1.0
+        elif touched == -1:
+            labels[i] = 0.0
+        elif timeout_policy == "sign":
+            labels[i] = 1.0 if cum > 0 else 0.0
+        # else timeout_policy == "nan": leave NaN
+    return labels
