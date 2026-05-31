@@ -284,6 +284,15 @@ WF_TEST_WINDOW_DAYS = _wf_cfg.get(
 )
 WF_MIN_TRAIN_DAYS = _wf_cfg.get("min_train_days", 504)
 WF_PURGE_DAYS = _wf_cfg.get("purge_days", 5)
+# W1.1b (ROADMAP L4469): post-test embargo (López de Prado). Trading-day count
+# dropped from training AFTER each test block. STRUCTURALLY A NO-OP in the
+# current expanding-forward walk-forward (train is always strictly before the
+# test block, so there is no train-after-test within a fold) — it becomes
+# load-bearing in W1.2 (combinatorial purged CV, which interleaves test
+# groups). Read by the leak-free-meta-IC diagnostic (training/leakfree_meta_ic)
+# and the future CPCV path. Default 0 = current behavior; W1.4 raises it to
+# ~ceil(0.01·T) alongside the CPCV cutover.
+WF_EMBARGO_DAYS = _wf_cfg.get("embargo_days", 0)
 WF_MIN_FOLDS_POSITIVE = _wf_cfg.get("min_folds_positive", 0.60)
 WF_MEDIAN_IC_GATE = _wf_cfg.get("median_ic_gate", 0.02)
 

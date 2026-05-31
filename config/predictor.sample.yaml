@@ -151,6 +151,7 @@ walk_forward:
   test_window_trading_days: 126  # ~6 calendar months of trading days per fold
   min_train_days: 504            # ~2 years minimum training (trading days)
   purge_days: 21                 # matches forward_days (prevent label leakage)
+  embargo_days: 0                # W1.1b (L4469) post-test embargo; 0=current (no-op in forward-WF), W1.4 raises to ~ceil(0.01*T) with the CPCV cutover
   min_folds_positive: 0.60       # 60% of folds must have IC > 0
   median_ic_gate: 0.01           # median IC across folds (lower bar — includes black swan periods)
   wf_n_estimators: 500           # faster GBM for fold validation (not production)

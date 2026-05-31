@@ -1675,6 +1675,56 @@ def run_meta_training(
         n_canonical, len(oos_meta_rows), meta_model._val_ic,
     )
 
+    # ── W1.1a (ROADMAP L4469): leak-free walk-forward OOS meta IC (OBSERVE) ──
+    # The val_ic just logged (and the manifest's `meta_model_oos_ic`) are
+    # IN-SAMPLE at the META level: the L2 (BayesianRidge) is fit on the full
+    # stack of OOS-L1 rows, then its IC is read back on that SAME stack
+    # (`meta_preds_oos_insample` below). The L1 predictions are OOS but the L2
+    # aggregation is not, so the number is inflated (~0.50 on 2026-05-30) vs
+    # the Gu-Kelly-Xiu realistic ceiling (IC ~0.03-0.07). This runs a SECOND-
+    # level purged(+embargoed) expanding walk-forward over the meta rows and
+    # reports the CROSS-SECTIONAL rank IC (per-date Spearman averaged — the
+    # Fama-MacBeth / GKX standard) with a date-blocked bootstrap CI. OBSERVE
+    # ONLY: it is reported in the manifest, NOT used to gate promotion. L4469
+    # W1.4 flips the gate from the in-sample _val_ic to this number after 2-3
+    # Saturday observe firings. See training/leakfree_meta_ic.py.
+    try:
+        from training.leakfree_meta_ic import leakfree_meta_oos_ic
+        _meta_dates = [
+            r.get("date")
+            for r, _m in zip(oos_meta_rows, canonical_finite_mask) if _m
+        ]
+
+        def _meta_fit_predict(_Xtr, _ytr, _Xte):
+            _m = MetaModel(alpha=1.0)
+            _m.fit(_Xtr, _ytr, feature_names=META_FEATURES)
+            return _m.predict(_Xte).ravel()
+
+        leakfree_meta_ic = leakfree_meta_oos_ic(
+            meta_X, meta_y, _meta_dates,
+            fit_predict_fn=_meta_fit_predict,
+            forward_days=cfg.FORWARD_DAYS,
+            embargo_days=getattr(cfg, "WF_EMBARGO_DAYS", 0),
+            bootstrap_fn=lambda p, y, d: _bootstrap_ic_ci_by_date(
+                p, y, d, n_iter=1000, ci=0.95, seed=4469),
+        )
+        log.info(
+            "W1.1a leak-free meta OOS IC (OBSERVE, NOT gated): xsec=%s "
+            "pooled=%s [%s, %s] over %s folds / %s rows / %s dates — vs "
+            "IN-SAMPLE _val_ic=%.4f. Expect xsec << _val_ic (leakage); the "
+            "drop is the honest number, not a regression. L4469 W1.4 flips "
+            "the gate after observe firings.",
+            leakfree_meta_ic.get("xsec_ic"), leakfree_meta_ic.get("pooled_ic"),
+            leakfree_meta_ic.get("pooled_ci_lo"),
+            leakfree_meta_ic.get("pooled_ci_hi"),
+            leakfree_meta_ic.get("n_folds"), leakfree_meta_ic.get("n"),
+            leakfree_meta_ic.get("n_dates"), meta_model._val_ic,
+        )
+    except Exception as _e:  # observe-only diagnostic must never fail training
+        log.warning(
+            "W1.1a leak-free meta OOS IC failed (OBSERVE, non-fatal): %s", _e)
+        leakfree_meta_ic = {"status": "error", "error": str(_e)}
+
     # Parity diagnostic: canonical Ridge predictions vs legacy labels
     # (cross-target). Useful for monitoring whether the cutover degrades
     # the historical reporting metric. Same 4-cell-grid spirit as Track A
@@ -3110,6 +3160,15 @@ def run_meta_training(
             )
             else None
         ),
+        # W1.1a (L4469, OBSERVE): the genuinely leak-free meta IC. The
+        # `meta_model_oos_ic` above is OOS at the L1 level but IN-SAMPLE at
+        # the META level (the L2 is read back on its own fit pool) and is a
+        # *pooled* overlapping Spearman; this field refits the L2 per fold in
+        # a purged/embargoed walk-forward and reports the CROSS-SECTIONAL rank
+        # IC (`xsec_ic`) + pooled CI. NOT gated yet — W1.4 flips the promotion
+        # gate from the in-sample _val_ic to this after observe firings.
+        # Additive per S3 contract safety.
+        "meta_model_oos_ic_leakfree": leakfree_meta_ic,
         "meta_coefficients": meta_model._coefficients,
         "meta_importance": meta_model._importance,
         "horizon_diagnostic": {
