@@ -3039,6 +3039,14 @@ def run_meta_training(
                     "volatility_median_ic": round(vol_median_ic, 6),
                     "n_folds": len(folds),
                 },
+                # W1 (L4469, OBSERVE): the leak-free OOS meta-IC battery, also
+                # carried in the run-result dict. Mirrored into the manifest so
+                # it is the SINGLE authoritative training-state artifact (L4468
+                # SSOT) — the dashboard/operator surface reads training state
+                # from here, never from the inference-cadence latest.json copy.
+                "meta_model_oos_ic_leakfree": leakfree_meta_ic,
+                "meta_model_oos_ic_cpcv": cpcv_meta_ic,
+                "meta_model_promotion_stats": promotion_stats,
                 "meta_coefficients": meta_model._coefficients,
                 # Audit Phase 2a (2026-05-07): output-distribution gate
                 # result. Persisted regardless of pass/fail so a borderline
