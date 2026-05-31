@@ -38,18 +38,10 @@ import numpy as np
 from scipy.stats import spearmanr
 
 
-def cross_sectional_rank_ic(preds, y, dates) -> tuple[float, int]:
-    """Mean of per-date Spearman rank IC (Fama-MacBeth / GKX standard).
-
-    For each unique date, rank predictions vs realized across the names
-    present that day and take Spearman; average the per-date ICs. A pooled
-    Spearman across all (name, date) rows conflates time-series with
-    cross-sectional skill and inflates the estimate — this is the
-    cross-sectional number that matches how the system actually trades.
-
-    Returns ``(mean_ic, n_dates_used)``; ``(nan, 0)`` if no date has ≥2
-    finite, non-degenerate name pairs.
-    """
+def cross_sectional_ic_series(preds, y, dates) -> list[float]:
+    """Per-date Spearman rank IC series (one IC per date with ≥2 finite,
+    non-degenerate name pairs). This is the "returns" series the W1.3 Deflated
+    Sharpe Ratio operates on; its mean is the cross-sectional rank IC."""
     preds = np.asarray(preds, dtype=float)
     y = np.asarray(y, dtype=float)
     dates = np.asarray(dates)
@@ -63,9 +55,22 @@ def cross_sectional_rank_ic(preds, y, dates) -> tuple[float, int]:
         sp = spearmanr(preds[m], y[m]).correlation
         if np.isfinite(sp):
             per_date.append(float(sp))
-    if not per_date:
+    return per_date
+
+
+def cross_sectional_rank_ic(preds, y, dates) -> tuple[float, int]:
+    """Mean of the per-date Spearman rank IC (Fama-MacBeth / GKX standard).
+
+    A pooled Spearman across all (name, date) rows conflates time-series with
+    cross-sectional skill and inflates the estimate — this is the
+    cross-sectional number that matches how the system actually trades (rank
+    tickers within a day). Returns ``(mean_ic, n_dates_used)``; ``(nan, 0)``
+    if no date is usable.
+    """
+    series = cross_sectional_ic_series(preds, y, dates)
+    if not series:
         return float("nan"), 0
-    return float(np.mean(per_date)), len(per_date)
+    return float(np.mean(series)), len(series)
 
 
 def expanding_wf_folds(
@@ -173,7 +178,9 @@ def leakfree_meta_oos_ic(
     op = np.asarray(oos_pred, dtype=float)
     ot = np.asarray(oos_true, dtype=float)
     od = np.asarray(oos_date)
-    xsec_ic, n_dates = cross_sectional_rank_ic(op, ot, od)
+    ic_series = cross_sectional_ic_series(op, ot, od)
+    xsec_ic = float(np.mean(ic_series)) if ic_series else float("nan")
+    n_dates = len(ic_series)
     fin = np.isfinite(op) & np.isfinite(ot)
     pooled = float("nan")
     if fin.sum() >= 10:
@@ -198,6 +205,9 @@ def leakfree_meta_oos_ic(
         "n": int(fin.sum()),
         "n_dates": n_dates,
         "xsec_ic": _r(xsec_ic),
+        # Per-date cross-sectional IC series — the "returns" the W1.3 Deflated
+        # Sharpe Ratio operates on. Rounded for the manifest payload.
+        "ic_series": [round(float(x), 6) for x in ic_series],
         "pooled_ic": _r(pooled),
         "pooled_ci_lo": _r(ci_lo),
         "pooled_ci_hi": _r(ci_hi),
