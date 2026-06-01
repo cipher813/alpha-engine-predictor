@@ -331,3 +331,58 @@ def cpcv_meta_oos_ic(
         "frac_positive": _r(float((arr > 0).mean())),
         "ics": [_r(x) for x in ics],
     }
+
+
+def leakfree_horizon_ic_curve(
+    meta_X,
+    horizon_to_labels: dict,
+    row_dates,
+    *,
+    fit_predict_fn: Callable,
+    embargo_days: int = 0,
+    **kwargs,
+) -> dict:
+    """W3.2 (L4469): leak-free cross-sectional IC at each horizon.
+
+    For each horizon ``h`` (trading days), refit the L2 per fold on that
+    horizon's realized label and report the SAME purged+embargoed expanding
+    walk-forward read as ``leakfree_meta_oos_ic`` — with the purge set to ``h``
+    (the label's own forward span). This is the honest curve that settles
+    "which horizon should we target?": where does the leak-free IC peak?
+
+    The pooled / non-overlapping horizon battery (meta_trainer Step 7a) is
+    overlapping-Spearman-inflated; this one is leak-free and apples-to-apples
+    across horizons (same ``meta_X`` rows / dates, only the label + purge vary).
+
+    Parameters
+    ----------
+    meta_X : (n_rows, n_meta_features) stacked OOS L1 predictions.
+    horizon_to_labels : {h_int: y_array} — realized return at each horizon,
+        aligned row-for-row to ``meta_X``. Non-finite rows are masked inside.
+    row_dates : per-row dates (for the cross-sectional / purge folds).
+    fit_predict_fn : the injected L2 estimator (refit per fold).
+    embargo_days : post-test embargo (López de Prado); 0 = current forward-WF.
+
+    Returns ``{f"{h}d": <leakfree_meta_oos_ic dict>}`` — observe-only; gates
+    nothing. Extra kwargs pass through to ``leakfree_meta_oos_ic``.
+    """
+    curve: dict = {}
+    dates_arr = np.asarray(row_dates)
+    for h, y_h in horizon_to_labels.items():
+        y_arr = np.asarray(y_h, dtype=float)
+        # Per-horizon finite mask: longer horizons carry more tail-of-history
+        # NaN labels (no h-day forward price). leakfree_meta_oos_ic passes y
+        # straight into the L2 fit, which rejects NaN — so mask here, dropping
+        # NaN-label rows from meta_X / dates together to keep row alignment.
+        fin = np.isfinite(y_arr)
+        if fin.sum() == 0:
+            curve[f"{int(h)}d"] = {"status": "no_finite_labels", "forward_days": int(h)}
+            continue
+        curve[f"{int(h)}d"] = leakfree_meta_oos_ic(
+            meta_X[fin], y_arr[fin], dates_arr[fin],
+            fit_predict_fn=fit_predict_fn,
+            forward_days=int(h),
+            embargo_days=embargo_days,
+            **kwargs,
+        )
+    return curve
