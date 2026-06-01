@@ -527,6 +527,19 @@ def gbm_blender_fit_predict(**lgb_params) -> Callable:
     def _fit_predict(X_tr, y_tr, X_te):
         model = lgb.LGBMRegressor(**params)
         model.fit(X_tr, y_tr)
-        return np.asarray(model.predict(X_te), dtype=float).ravel()
+        preds = np.asarray(model.predict(X_te), dtype=float).ravel()
+        # Release the Booster's retained train Dataset before the next fold/horizon
+        # fit. This factory is called per-fold across the W3.2×W4.1 horizon curve
+        # (~7 horizons × WF folds) + the W4.1 shadow — without the release the
+        # C-level Datasets accumulate to multiple GB and OOM PredictorTraining
+        # (the c5.large incident 2026-06-01). predict() above already used the
+        # trees, so freeing the dataset is numerically inert — mirrors
+        # GBMScorer's free_dataset (PR #193). Per [[reference-lightgbm-free-dataset-post-fit]].
+        try:
+            model.booster_.free_dataset()
+        except Exception:  # best-effort; never block the observe diagnostic
+            pass
+        del model
+        return preds
 
     return _fit_predict
