@@ -2041,6 +2041,83 @@ def run_meta_training(
         log.warning("W3.2 leak-free horizon IC failed (OBSERVE, non-fatal): %s", _e)
         horizon_ics_leakfree = {"status": "error", "error": str(_e)}
 
+    # ── W4 watch + L4469 P2 (OBSERVE): is the leak-free meta IC real ALPHA, ──
+    # and does pre-2020 data drag it? Three cheap leak-free reads, all reusing
+    # the W1 machinery, all gating NOTHING:
+    #   (A)  per-input standalone cross-sectional alpha-IC — surfaces whether
+    #        `expected_move` (the meta's dominant coef, a VOL L1) actually
+    #        predicts cross-sectional ALPHA or is in-sample dominance only.
+    #   (A2) leave-one-out leak-free meta IC dropping `expected_move` — if the
+    #        leak-free meta IC barely moves, expected_move isn't carrying alpha.
+    #   (B)  leak-free meta IC on post-2020-03-31 rows vs full history — settles
+    #        the standing "pre-2020 may be noise" P2 in ONE run (no extra cycle).
+    # Self-contained (own dates + fit_predict) so a failure in the W1/W3 blocks
+    # above can't take it down. The canonical 21d target is unchanged.
+    meta_l1_standalone_alpha_ic: dict = {"status": "not_run"}
+    meta_oos_ic_leakfree_no_expected_move: dict = {"status": "not_run"}
+    meta_oos_ic_leakfree_post2020: dict = {"status": "not_run"}
+    try:
+        from training.leakfree_meta_ic import (
+            leakfree_meta_oos_ic as _d_lf,
+            per_feature_standalone_ic as _d_pfsi,
+        )
+
+        _d_dates = [
+            r.get("date")
+            for r, _m in zip(oos_meta_rows, canonical_finite_mask) if _m
+        ]
+
+        def _d_fit_predict(_Xtr, _ytr, _Xte, _names=TRAIN_META_FEATURES):
+            _m = MetaModel(alpha=1.0)
+            _m.fit(_Xtr, _ytr, feature_names=_names)
+            return _m.predict(_Xte).ravel()
+
+        # (A) per-input standalone alpha-IC
+        meta_l1_standalone_alpha_ic = _d_pfsi(
+            meta_X, meta_y, _d_dates, TRAIN_META_FEATURES,
+        )
+
+        # (A2) leave-one-out: drop expected_move from the L2
+        if "expected_move" in TRAIN_META_FEATURES:
+            _keep = [f for f in TRAIN_META_FEATURES if f != "expected_move"]
+            _keep_idx = [
+                i for i, f in enumerate(TRAIN_META_FEATURES) if f != "expected_move"
+            ]
+            meta_oos_ic_leakfree_no_expected_move = _d_lf(
+                meta_X[:, _keep_idx], meta_y, _d_dates,
+                fit_predict_fn=lambda a, b, c, _n=_keep: _d_fit_predict(a, b, c, _names=_n),
+                forward_days=cfg.FORWARD_DAYS,
+                embargo_days=getattr(cfg, "WF_EMBARGO_DAYS", 0),
+            )
+
+        # (B) pre-2020 clamp A/B (lexical ISO-date compare; ≥200 post rows).
+        _post = np.array([
+            (d is not None and str(d)[:10] >= "2020-03-31") for d in _d_dates
+        ])
+        if int(_post.sum()) >= 200:
+            meta_oos_ic_leakfree_post2020 = _d_lf(
+                meta_X[_post], meta_y[_post],
+                [d for d, m in zip(_d_dates, _post) if m],
+                fit_predict_fn=_d_fit_predict,
+                forward_days=cfg.FORWARD_DAYS,
+                embargo_days=getattr(cfg, "WF_EMBARGO_DAYS", 0),
+            )
+
+        _em = meta_l1_standalone_alpha_ic.get("expected_move", {}) if isinstance(
+            meta_l1_standalone_alpha_ic, dict) else {}
+        log.info(
+            "W4/P2 observe (NOT gated): expected_move standalone alpha-IC=%s | "
+            "meta leak-free full xsec=%s / drop-expected_move=%s / post-2020=%s. "
+            "If full≈drop-EM and EM-standalone≈0, the headline IC is NOT EM-alpha.",
+            _em.get("xsec_ic"),
+            leakfree_meta_ic.get("xsec_ic") if isinstance(leakfree_meta_ic, dict) else None,
+            meta_oos_ic_leakfree_no_expected_move.get("xsec_ic"),
+            meta_oos_ic_leakfree_post2020.get("xsec_ic"),
+        )
+    except Exception as _e:  # observe-only diagnostic must never fail training
+        log.warning("W4/P2 observe diagnostics failed (OBSERVE, non-fatal): %s", _e)
+        meta_l1_standalone_alpha_ic = {"status": "error", "error": str(_e)}
+
     # Parity diagnostic: canonical Ridge predictions vs legacy labels
     # (cross-target). Useful for monitoring whether the cutover degrades
     # the historical reporting metric. Same 4-cell-grid spirit as Track A
@@ -3277,6 +3354,11 @@ def run_meta_training(
                 # W2 (L4469, OBSERVE): standalone leak-free read of the
                 # residual-momentum L1 (the isolated promotion-gate number).
                 "residual_momentum_leakfree_oos_ic": residual_momentum_leakfree,
+                # W4 watch + L4469 P2 (OBSERVE): is the meta IC real alpha +
+                # pre-2020 drag. NOT gated.
+                "meta_l1_standalone_alpha_ic": meta_l1_standalone_alpha_ic,
+                "meta_oos_ic_leakfree_no_expected_move": meta_oos_ic_leakfree_no_expected_move,
+                "meta_oos_ic_leakfree_post2020": meta_oos_ic_leakfree_post2020,
                 "meta_model_oos_ic_cpcv": cpcv_meta_ic,
                 "meta_model_promotion_stats": promotion_stats,
                 "meta_coefficients": meta_model._coefficients,
@@ -3511,6 +3593,13 @@ def run_meta_training(
         # the residual-momentum L1 — its isolated promotion-gate number, vs the
         # dead-momentum baseline (~-0.001). NOT gated. Additive per S3 contract.
         "residual_momentum_leakfree_oos_ic": residual_momentum_leakfree,
+        # W4 watch + L4469 P2 (OBSERVE, NOT gated): is the headline leak-free
+        # meta IC real ALPHA, and does pre-2020 data drag it? (A) per-input
+        # standalone alpha-IC; (A2) leak-free meta IC w/o expected_move; (B)
+        # leak-free meta IC on post-2020-03-31 rows. Additive per S3 contract.
+        "meta_l1_standalone_alpha_ic": meta_l1_standalone_alpha_ic,
+        "meta_oos_ic_leakfree_no_expected_move": meta_oos_ic_leakfree_no_expected_move,
+        "meta_oos_ic_leakfree_post2020": meta_oos_ic_leakfree_post2020,
         # W1.2 (L4469, OBSERVE): combinatorial purged CV distribution of
         # leak-free cross-sectional OOS ICs (mean/std/percentiles/frac_positive
         # over C(N,k) combinations). Feeds the W1.3 Deflated-Sharpe / PBO gate.
