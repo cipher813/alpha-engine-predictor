@@ -41,6 +41,7 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     "data/earnings_fetcher.py": 2,
     "health_status.py": 2,
     "inference/s3_io.py": 2,
+    "model/registry.py": 1,  # _lineage.json write (Phase-0 registry snapshot; copy_object not counted)
     "monitoring/drift_detector.py": 1,
     "regime/retrospective_eval_handler.py": 2,
     "regime/substrate.py": 2,
