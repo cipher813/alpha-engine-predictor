@@ -386,3 +386,27 @@ def leakfree_horizon_ic_curve(
             **kwargs,
         )
     return curve
+
+
+def per_feature_standalone_ic(meta_X, meta_y, row_dates, feature_names) -> dict:
+    """Standalone cross-sectional rank IC of EACH meta-feature column vs the
+    (canonical) realized label — the honest per-input alpha-IC.
+
+    No refit: each column is already an OOS L1 prediction (momentum_score,
+    expected_move, research_calibrator_prob, …) or a raw context feature, so its
+    per-date Spearman vs realized alpha IS its standalone cross-sectional skill.
+    Surfaces the W4 watch-item (L4469): whether ``expected_move`` — the meta's
+    dominant coefficient, a VOLATILITY L1 — actually predicts cross-sectional
+    ALPHA, or is merely in-sample dominance with ~0 standalone alpha-IC.
+    OBSERVE-only; gates nothing. Returns ``{feature: {xsec_ic, n_dates}}``.
+    """
+    X = np.asarray(meta_X, dtype=float)
+    y = np.asarray(meta_y, dtype=float)
+    out: dict = {}
+    for j, name in enumerate(feature_names):
+        series = cross_sectional_ic_series(X[:, j], y, row_dates)
+        out[name] = {
+            "xsec_ic": round(float(np.mean(series)), 6) if series else None,
+            "n_dates": len(series),
+        }
+    return out
