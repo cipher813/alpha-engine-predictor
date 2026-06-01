@@ -2118,6 +2118,44 @@ def run_meta_training(
         log.warning("W4/P2 observe diagnostics failed (OBSERVE, non-fatal): %s", _e)
         meta_l1_standalone_alpha_ic = {"status": "error", "error": str(_e)}
 
+    # ── W4.1 (L4469, OBSERVE): nonlinear-L2 SHADOW blender ───────────────────
+    # W1 established the live meta is a LINEAR BayesianRidge. Gu-Kelly-Xiu: a
+    # nonlinear blender materially beats OLS on the SAME factor inputs (NN
+    # Sharpe 1.35 vs OLS 0.61). This measures — SHADOW, live L2 UNCHANGED —
+    # whether a LightGBM meta recovers more leak-free IC from the identical L1
+    # outputs, via the SAME purged+embargoed expanding WF + meta_X / folds as
+    # the W1 linear read (so `meta_oos_ic_leakfree_nonlinear.xsec_ic` vs
+    # `meta_model_oos_ic_leakfree.xsec_ic` is apples-to-apples). Tells us whether
+    # the next move is "better L1s" or "nonlinear meta." OBSERVE; gates nothing.
+    meta_oos_ic_leakfree_nonlinear: dict = {"status": "not_run"}
+    try:
+        from training.leakfree_meta_ic import (
+            gbm_blender_fit_predict,
+            leakfree_meta_oos_ic as _nl_lf,
+        )
+
+        _nl_dates = [
+            r.get("date")
+            for r, _m in zip(oos_meta_rows, canonical_finite_mask) if _m
+        ]
+        meta_oos_ic_leakfree_nonlinear = _nl_lf(
+            meta_X, meta_y, _nl_dates,
+            fit_predict_fn=gbm_blender_fit_predict(),
+            forward_days=cfg.FORWARD_DAYS,
+            embargo_days=getattr(cfg, "WF_EMBARGO_DAYS", 0),
+        )
+        log.info(
+            "W4.1 nonlinear-L2 shadow leak-free meta IC (OBSERVE, NOT gated): "
+            "nonlinear xsec=%s vs linear xsec=%s. Does a nonlinear blender "
+            "recover more leak-free IC from the SAME L1s (GKX NN>>OLS)? Live L2 "
+            "(BayesianRidge) UNCHANGED — this only informs the next architecture move.",
+            meta_oos_ic_leakfree_nonlinear.get("xsec_ic"),
+            leakfree_meta_ic.get("xsec_ic") if isinstance(leakfree_meta_ic, dict) else None,
+        )
+    except Exception as _e:  # observe-only diagnostic must never fail training
+        log.warning("W4.1 nonlinear-L2 shadow failed (OBSERVE, non-fatal): %s", _e)
+        meta_oos_ic_leakfree_nonlinear = {"status": "error", "error": str(_e)}
+
     # Parity diagnostic: canonical Ridge predictions vs legacy labels
     # (cross-target). Useful for monitoring whether the cutover degrades
     # the historical reporting metric. Same 4-cell-grid spirit as Track A
@@ -3359,6 +3397,8 @@ def run_meta_training(
                 "meta_l1_standalone_alpha_ic": meta_l1_standalone_alpha_ic,
                 "meta_oos_ic_leakfree_no_expected_move": meta_oos_ic_leakfree_no_expected_move,
                 "meta_oos_ic_leakfree_post2020": meta_oos_ic_leakfree_post2020,
+                # W4.1 (OBSERVE): nonlinear-L2 shadow leak-free meta IC.
+                "meta_oos_ic_leakfree_nonlinear": meta_oos_ic_leakfree_nonlinear,
                 "meta_model_oos_ic_cpcv": cpcv_meta_ic,
                 "meta_model_promotion_stats": promotion_stats,
                 "meta_coefficients": meta_model._coefficients,
@@ -3600,6 +3640,9 @@ def run_meta_training(
         "meta_l1_standalone_alpha_ic": meta_l1_standalone_alpha_ic,
         "meta_oos_ic_leakfree_no_expected_move": meta_oos_ic_leakfree_no_expected_move,
         "meta_oos_ic_leakfree_post2020": meta_oos_ic_leakfree_post2020,
+        # W4.1 (OBSERVE): nonlinear-L2 shadow leak-free meta IC — vs the linear
+        # meta_model_oos_ic_leakfree on the SAME folds. Additive per S3 contract.
+        "meta_oos_ic_leakfree_nonlinear": meta_oos_ic_leakfree_nonlinear,
         # W1.2 (L4469, OBSERVE): combinatorial purged CV distribution of
         # leak-free cross-sectional OOS ICs (mean/std/percentiles/frac_positive
         # over C(N,k) combinations). Feeds the W1.3 Deflated-Sharpe / PBO gate.
