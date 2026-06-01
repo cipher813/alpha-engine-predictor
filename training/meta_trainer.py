@@ -457,6 +457,24 @@ from model.research_features import (
     extract_research_features as _extract_research_features,
 )
 from model import momentum_scorer
+from model import residual_momentum_scorer
+from model.residual_momentum_scorer import RESIDUAL_MOMENTUM_FEATURES
+from data.residual_momentum_features import compute_residual_momentum_features
+
+
+def build_train_meta_features(resid_mom_enabled: bool) -> list[str]:
+    """W2 (L4469) observe gate: the L2 training-time meta-feature list.
+
+    IDENTICAL to ``META_FEATURES`` unless the residual-momentum L1 is enabled,
+    in which case ``residual_momentum_score`` is appended. NEVER mutates the
+    ``META_FEATURES`` module constant — inference imports it, and the persisted
+    ``meta_model._feature_names`` must stay byte-identical when the gate is
+    closed so the live prediction path is unchanged. Promotion = flip the flag.
+    """
+    from model.meta_model import META_FEATURES
+    return list(META_FEATURES) + (
+        ["residual_momentum_score"] if resid_mom_enabled else []
+    )
 
 
 def _load_signals_history(s3, bucket: str) -> dict[str, dict]:
@@ -745,6 +763,12 @@ def run_meta_training(
     # alpha label above. Supervision target for the observe-only meta-label
     # classifier whose calibrated P(up before down) feeds executor sizing.
     fwd_tb_touch_chunks: list[np.ndarray] = []
+    # W2 (L4469): per-ticker residual/idiosyncratic-momentum features, computed
+    # predictor-locally from the raw close + benchmark series (NOT from the
+    # ArcticDB feature store — net-new single-source research features). Aligned
+    # to the same tail-dropped labeled.index as mom_chunks. OBSERVE-mode: gated
+    # out of META_FEATURES unless cfg.RESIDUAL_MOMENTUM_ENABLED.
+    resid_mom_chunks: list[np.ndarray] = []
 
     for path in all_parquets:
         ticker = path.stem
@@ -849,6 +873,26 @@ def run_meta_training(
         vol_chunks.append(
             labeled[cfg.VOLATILITY_FEATURES].to_numpy(dtype=np.float32)
         )
+        # W2 (L4469): residual-momentum features. Computed on the FULL raw_df
+        # close index (backward-only, point-in-time) then reindexed to the
+        # tail-dropped labeled.index so it aligns row-for-row with mom/vol.
+        # Benchmark = sector ETF if present else SPY (matches the label
+        # convention). Always emitted (the column is harmless extra data); the
+        # observe gate controls only META_FEATURES inclusion downstream.
+        resid_mom_df = compute_residual_momentum_features(
+            raw_df["Close"].astype(float),
+            benchmark_close=(sector_etf_s if sector_etf_s is not None else spy_series),
+            spy_close=spy_series,
+            beta_window=cfg.RESID_MOM_BETA_WINDOW,
+            mom_window=cfg.RESID_MOM_WINDOW,
+            skip_window=cfg.RESID_MOM_SKIP_DAYS,
+            vol_window=cfg.RESID_MOM_VOL_WINDOW,
+            mom_change_window=cfg.RESID_MOM_CHANGE_WINDOW,
+        )
+        resid_mom_chunks.append(
+            resid_mom_df.reindex(labeled.index)[RESIDUAL_MOMENTUM_FEATURES]
+            .to_numpy(dtype=np.float32)
+        )
         # Stage 2b: per-ticker risk features. ``reindex`` returns NaN
         # for any column missing from the parquet — older feature_engineer
         # outputs (pre-#202) lack these columns, but LightGBM handles
@@ -892,7 +936,7 @@ def run_meta_training(
         # next iteration's allocations bounded by one DF's worth of
         # peak memory rather than the cumulative sum across 900 tickers
         # (the 2026-04-28 OOM root cause).
-        del labeled, raw_df, close_for_horizon, bench_for_horizon
+        del labeled, raw_df, close_for_horizon, bench_for_horizon, resid_mom_df
 
     log.info(
         "Feature read complete: %d accepted / %d candidates  "
@@ -940,12 +984,14 @@ def run_meta_training(
     y_fwd_horizons_unsorted = np.concatenate(fwd_horizons_chunks, axis=0)
     y_fwd_tb_unsorted = np.concatenate(fwd_tb_chunks)
     y_fwd_tb_touch_unsorted = np.concatenate(fwd_tb_touch_chunks)
+    X_resid_mom_unsorted = np.concatenate(resid_mom_chunks, axis=0)  # W2
 
     # Free the chunk lists — referenced data has been copied into the
     # contiguous arrays above. Without this `del` the chunks linger
     # through walk-forward and double the RSS we just reduced.
     del date_chunks, ticker_chunks, mom_chunks, vol_chunks, risk_chunks
     del fwd_chunks, fwd_horizons_chunks, fwd_tb_chunks, fwd_tb_touch_chunks
+    del resid_mom_chunks
 
     # Stable sort by date so ties keep ticker-order deterministic for
     # snapshot tests + reproducibility.
@@ -983,11 +1029,12 @@ def run_meta_training(
     # Task B touch-order labels are 0.0/1.0/NaN — NOT clipped (clip below
     # applies only to the continuous alpha labels).
     y_fwd_tb_touch = y_fwd_tb_touch_unsorted[sort_idx]
+    X_resid_mom = X_resid_mom_unsorted[sort_idx]  # W2
 
     del date_unsorted, ticker_unsorted
     del X_mom_unsorted, X_vol_unsorted, X_risk_unsorted
     del y_fwd_unsorted, y_fwd_horizons_unsorted, y_fwd_tb_unsorted
-    del y_fwd_tb_touch_unsorted
+    del y_fwd_tb_touch_unsorted, X_resid_mom_unsorted
 
     # Winsorize
     if cfg.LABEL_CLIP:
@@ -1008,10 +1055,17 @@ def run_meta_training(
     X_vol_raw = X_vol.copy()
     mom_nan_mask = np.any(np.isnan(X_mom_raw), axis=1)
     vol_nan_mask = np.any(np.isnan(X_vol_raw), axis=1)
+    # W2: the deterministic residual-momentum scorer reads the RAW matrix (like
+    # momentum); keep the nan-mask for a future short-history subsample gate.
+    X_resid_mom_raw = X_resid_mom.copy()
+    resid_mom_nan_mask = np.any(np.isnan(X_resid_mom_raw), axis=1)
 
     # Cross-sectional rank normalize (per-date, per-feature)
     X_mom = cross_sectional_rank_normalize(X_mom, all_dates)
     X_vol = cross_sectional_rank_normalize(X_vol, all_dates)
+    # W2: rank-normed residual-mom kept available for a future direct-to-
+    # META_FEATURES promotion; the scorer itself uses X_resid_mom_raw.
+    X_resid_mom = cross_sectional_rank_normalize(X_resid_mom, all_dates)
     # Stage 2b: rank-norm risk features alongside vol. Per-ticker
     # cross-sectional variation lets the trees split on relative rank
     # (e.g., "this ticker is in the top 10% of beta cross-section today").
@@ -1273,6 +1327,7 @@ def run_meta_training(
     n_rows_dropped_ticker_missing = 0       # ticker absent from snapshot's universe
     n_rows_with_real_signals = 0            # rows actually retained for L2 training
     vol_fold_ics = []
+    resid_mom_fold_ics = []  # W2: per-fold raw IC of the residual-momentum L1
 
     for i, fold in enumerate(folds):
         fold_start = time.time()
@@ -1329,6 +1384,20 @@ def run_meta_training(
         )
         mom_ic = float(np.corrcoef(mom_preds, y_fwd[te])[0, 1]) if np.std(mom_preds) > 1e-10 else 0.0
         mom_fold_ics.append(mom_ic)
+
+        # W2 (L4469): residual-momentum L1 — deterministic, reads the raw
+        # matrix like momentum. Per-fold raw IC tracked for the manifest; the
+        # standalone leak-free read (purged + embargoed cross-sectional rank IC)
+        # is computed after the loop. The score column is always written to the
+        # OOS row dict; the observe gate controls only META_FEATURES inclusion.
+        resid_mom_preds = residual_momentum_scorer.predict_array(
+            X_resid_mom_raw[te], RESIDUAL_MOMENTUM_FEATURES,
+        )
+        resid_mom_ic = (
+            float(np.corrcoef(resid_mom_preds, y_fwd[te])[0, 1])
+            if np.std(resid_mom_preds) > 1e-10 else 0.0
+        )
+        resid_mom_fold_ics.append(resid_mom_ic)
 
         # Train volatility model (predicts absolute return magnitude)
         abs_fwd = np.abs(y_fwd)
@@ -1406,6 +1475,10 @@ def run_meta_training(
                 row = {
                     "momentum_score": float(mom_preds[local_idx]),
                     "expected_move": float(vol_preds[local_idx]),
+                    # W2: always written; only enters the L2 matrix when the
+                    # observe gate (cfg.RESIDUAL_MOMENTUM_ENABLED) selects it
+                    # into TRAIN_META_FEATURES below.
+                    "residual_momentum_score": float(resid_mom_preds[local_idx]),
                     **research_features,
                     "actual_fwd": float(y_fwd[idx]),
                     # Stage 3 PR 2: parallel triple-barrier alpha label
@@ -1649,8 +1722,19 @@ def run_meta_training(
     # full meta_X is preserved as `meta_X_all` for downstream diagnostics
     # that span all rows; the Ridge fit + isotonic + per-regime stack all
     # consume the canonical-finite subset.
-    log.info("Training meta-model on %d OOS rows...", len(oos_meta_rows))
-    meta_X_all = np.array([[r[f] for f in META_FEATURES] for r in oos_meta_rows])
+    # W2 (L4469) OBSERVE gate: the residual-momentum column enters the L2 stack
+    # ONLY when cfg.RESIDUAL_MOMENTUM_ENABLED. When False, TRAIN_META_FEATURES is
+    # IDENTICAL to META_FEATURES → meta_X columns, the fitted/persisted
+    # meta_model._feature_names, and the inference path are all byte-identical to
+    # the pre-W2 trainer. We never mutate the META_FEATURES module constant
+    # (inference imports it). Promotion = flip the flag after 2-3 observe firings.
+    _resid_mom_enabled = bool(getattr(cfg, "RESIDUAL_MOMENTUM_ENABLED", False))
+    TRAIN_META_FEATURES = build_train_meta_features(_resid_mom_enabled)
+    log.info(
+        "Training meta-model on %d OOS rows... (residual_momentum L1 in stack: %s)",
+        len(oos_meta_rows), _resid_mom_enabled,
+    )
+    meta_X_all = np.array([[r[f] for f in TRAIN_META_FEATURES] for r in oos_meta_rows])
     meta_y_all = np.array([r["actual_fwd"] for r in oos_meta_rows])  # legacy, kept for diagnostics
     canonical_y_full = np.array([
         r.get("actual_fwd_canonical", float("nan")) for r in oos_meta_rows
@@ -1668,7 +1752,7 @@ def run_meta_training(
     meta_X = meta_X_all[canonical_finite_mask]
     meta_y = canonical_y_full[canonical_finite_mask]
     meta_model = MetaModel(alpha=1.0)
-    meta_model.fit(meta_X, meta_y, feature_names=META_FEATURES)
+    meta_model.fit(meta_X, meta_y, feature_names=TRAIN_META_FEATURES)
     log.info(
         "Meta-Ridge fit on canonical labels: n_canonical=%d / n_total=%d "
         "(val_ic_canonical=%.4f)",
@@ -1703,7 +1787,7 @@ def run_meta_training(
 
         def _meta_fit_predict(_Xtr, _ytr, _Xte):
             _m = MetaModel(alpha=1.0)
-            _m.fit(_Xtr, _ytr, feature_names=META_FEATURES)
+            _m.fit(_Xtr, _ytr, feature_names=TRAIN_META_FEATURES)
             return _m.predict(_Xte).ravel()
 
         leakfree_meta_ic = leakfree_meta_oos_ic(
@@ -1816,6 +1900,69 @@ def run_meta_training(
             cpcv_meta_ic = {"status": "error", "error": str(_e)}
         if promotion_stats.get("status") == "not_run":
             promotion_stats = {"status": "error", "error": str(_e)}
+
+    # ── W2 (L4469): standalone leak-free read of the residual-momentum L1 ────
+    # The scorer is DETERMINISTIC (fit-free), so its honest skill is the
+    # CROSS-SECTIONAL rank IC (Fama-MacBeth, per-date Spearman) of its
+    # predictions vs the canonical label — no train/test split to leak through.
+    # Same machinery + downside/DSR legs as the W1 meta read, over the SAME
+    # canonical-finite rows for parity. This is the standalone "isolated
+    # promotion gate" number W2's acceptance criterion needs. OBSERVE ONLY:
+    # emitted to the manifest, enters NO promotion gate, and runs REGARDLESS of
+    # cfg.RESIDUAL_MOMENTUM_ENABLED.
+    residual_momentum_leakfree = {"status": "not_run"}
+    try:
+        from training.leakfree_meta_ic import cross_sectional_ic_series
+        from training.deflated_sharpe import (
+            deflated_sharpe_ratio as _rm_dsr,
+            downside_ic_stats as _rm_dstats,
+        )
+        _rm_preds = residual_momentum_scorer.predict_array(
+            X_resid_mom_raw[canonical_finite_mask], RESIDUAL_MOMENTUM_FEATURES,
+        )
+        _rm_dates = [
+            r.get("date")
+            for r, _m in zip(oos_meta_rows, canonical_finite_mask) if _m
+        ]
+        _rm_ic_series = cross_sectional_ic_series(_rm_preds, meta_y, _rm_dates)
+        _rm_xsec = float(np.mean(_rm_ic_series)) if _rm_ic_series else float("nan")
+        _rm_downside = _rm_dstats(
+            _rm_ic_series,
+            sortino_threshold=float(getattr(cfg, "WF_SORTINO_IC_THRESHOLD", 0.0)),
+        )
+        _rm_overfit = _rm_dsr(
+            _rm_ic_series,
+            n_trials=int(getattr(cfg, "WF_DSR_N_TRIALS", 10)),
+            threshold=float(getattr(cfg, "WF_DSR_THRESHOLD", 0.95)),
+        )
+        residual_momentum_leakfree = {
+            "status": "ok" if _rm_ic_series else "insufficient_dates",
+            "xsec_ic": round(_rm_xsec, 6) if _rm_ic_series else None,
+            "n": int(len(_rm_preds)),
+            "n_dates": len(_rm_ic_series),
+            "ic_series": [round(float(x), 6) for x in _rm_ic_series],
+            "downside": _rm_downside,
+            "overfit": _rm_overfit,
+            "enabled_in_stack": _resid_mom_enabled,
+            "forward_days": cfg.FORWARD_DAYS,
+            "embargo_days": int(getattr(cfg, "WF_EMBARGO_DAYS", 0)),
+        }
+        log.info(
+            "W2 residual-momentum L1 leak-free read (OBSERVE, NOT gated): "
+            "xsec_ic=%s over %s dates / %s rows | Sortino-of-IC=%s DSR=%s | "
+            "in_stack=%s. vs dead-momentum baseline ~-0.001 and the realistic "
+            "0.03-0.07 live-IC range.",
+            residual_momentum_leakfree.get("xsec_ic"),
+            residual_momentum_leakfree.get("n_dates"),
+            residual_momentum_leakfree.get("n"),
+            _rm_downside.get("sortino_of_ic"), _rm_overfit.get("dsr"),
+            _resid_mom_enabled,
+        )
+    except Exception as _e:  # observe-only diagnostic must never fail training
+        log.warning(
+            "W2 residual-momentum leak-free read failed (OBSERVE, non-fatal): %s",
+            _e)
+        residual_momentum_leakfree = {"status": "error", "error": str(_e)}
 
     # Parity diagnostic: canonical Ridge predictions vs legacy labels
     # (cross-target). Useful for monitoring whether the cutover degrades
@@ -2298,6 +2445,7 @@ def run_meta_training(
     # Walk-forward summary
     mom_median_ic = float(np.median(mom_fold_ics)) if mom_fold_ics else 0.0
     vol_median_ic = float(np.median(vol_fold_ics)) if vol_fold_ics else 0.0
+    resid_mom_median_ic = float(np.median(resid_mom_fold_ics)) if resid_mom_fold_ics else 0.0  # W2
     log.info("WF summary: momentum median_IC=%.4f  volatility median_IC=%.4f",
              mom_median_ic, vol_median_ic)
 
@@ -3037,6 +3185,10 @@ def run_meta_training(
                 "walk_forward": {
                     "momentum_median_ic": round(mom_median_ic, 6),
                     "volatility_median_ic": round(vol_median_ic, 6),
+                    # W2 (L4469, OBSERVE): residual-momentum L1 raw fold-IC
+                    # median + whether it was in the live stack this run.
+                    "residual_momentum_median_ic": round(resid_mom_median_ic, 6),
+                    "residual_momentum_enabled": _resid_mom_enabled,
                     "n_folds": len(folds),
                 },
                 # W1 (L4469, OBSERVE): the leak-free OOS meta-IC battery, also
@@ -3045,6 +3197,9 @@ def run_meta_training(
                 # SSOT) — the dashboard/operator surface reads training state
                 # from here, never from the inference-cadence latest.json copy.
                 "meta_model_oos_ic_leakfree": leakfree_meta_ic,
+                # W2 (L4469, OBSERVE): standalone leak-free read of the
+                # residual-momentum L1 (the isolated promotion-gate number).
+                "residual_momentum_leakfree_oos_ic": residual_momentum_leakfree,
                 "meta_model_oos_ic_cpcv": cpcv_meta_ic,
                 "meta_model_promotion_stats": promotion_stats,
                 "meta_coefficients": meta_model._coefficients,
@@ -3130,12 +3285,18 @@ def run_meta_training(
             feature_list = {
                 "trained_at": date_str,
                 "version": "v3.0-meta",
-                "l2_features": list(META_FEATURES),
+                # W2: reflect the ACTUAL L2 feature set the Ridge was fit on
+                # (identical to META_FEATURES while the observe gate is closed).
+                "l2_features": list(TRAIN_META_FEATURES),
                 "l1_features": {
                     "momentum": ["momentum_5d", "momentum_20d",
                                  "price_vs_ma50", "rsi_14"],
                     "volatility": list(cfg.VOLATILITY_FEATURES),
                     "research_calibrator": list(RESEARCH_GBM_FEATURES),
+                    # W2 (observe): residual-momentum L1 inputs (computed +
+                    # measured regardless of the gate; in the L2 only when
+                    # residual_momentum_enabled).
+                    "residual_momentum": list(RESIDUAL_MOMENTUM_FEATURES),
                 },
             }
             s3_up.put_object(
@@ -3269,6 +3430,10 @@ def run_meta_training(
         # gate from the in-sample _val_ic to this after observe firings.
         # Additive per S3 contract safety.
         "meta_model_oos_ic_leakfree": leakfree_meta_ic,
+        # W2 (L4469, OBSERVE): standalone leak-free cross-sectional rank IC of
+        # the residual-momentum L1 — its isolated promotion-gate number, vs the
+        # dead-momentum baseline (~-0.001). NOT gated. Additive per S3 contract.
+        "residual_momentum_leakfree_oos_ic": residual_momentum_leakfree,
         # W1.2 (L4469, OBSERVE): combinatorial purged CV distribution of
         # leak-free cross-sectional OOS ICs (mean/std/percentiles/frac_positive
         # over C(N,k) combinations). Feeds the W1.3 Deflated-Sharpe / PBO gate.
@@ -3364,6 +3529,10 @@ def run_meta_training(
         "walk_forward": {
             "momentum_median_ic": round(mom_median_ic, 6),
             "volatility_median_ic": round(vol_median_ic, 6),
+            # W2 (L4469, OBSERVE): residual-momentum L1 raw fold-IC median +
+            # whether it was in the live L2 stack this run. NOT in passes_wf.
+            "residual_momentum_median_ic": round(resid_mom_median_ic, 6),
+            "residual_momentum_enabled": _resid_mom_enabled,
             "n_folds": len(folds),
             "folds": fold_results,
             # Momentum dropped from the WF promotion gate 2026-05-13. Per

@@ -57,7 +57,11 @@ class TestProducerSourceContract:
         # The write block has to land at the manifest-write site so a
         # successful retrain produces both artifacts atomically.
         assert "META_FEATURE_LIST_KEY" in src
-        assert '"l2_features": list(META_FEATURES)' in src
+        # W2 (L4469): the L2 feature list now reflects TRAIN_META_FEATURES (the
+        # observe-gated list — identical to META_FEATURES while the residual-
+        # momentum gate is closed) so the artifact records what the L2 was
+        # actually fit on.
+        assert '"l2_features": list(TRAIN_META_FEATURES)' in src
         assert '"l1_features":' in src
 
     def test_research_gbm_features_imported(self):
