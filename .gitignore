@@ -28,10 +28,25 @@ env/
 data/cache/
 data/norm_stats.json
 data/constituents_cache.csv
+# Local scratch caches / snapshots — large, machine-generated; never commit.
+# (A `git add -A` once swept these into the public repo — keep them ignored.)
+private/
+.claude/
+*.parquet
 
 # Model checkpoints and training artifacts
 checkpoints/
 tune.db
+# Locally-materialized model artifacts (real ones live in S3) — never commit.
+*.pkl
+*.pkl.meta.json
+meta_*.txt
+meta_*.txt.meta.json
+meta_research_cal.json
+
+# Local design/scratch docs (working notes; the tracked docs are OVERVIEW.md etc.)
+alpha-engine-predictor-design-*.md
+alpha-engine-predictor-dnn-design-*.md
 
 # Evaluation and prediction outputs
 eval_report.json
@@ -58,6 +73,10 @@ config/predictor.yaml
 # Logs
 *.log
 logs/
+
+# Scratch temp files (dry-run dumps, ad-hoc JSON)
+tmp*.json
+tmp*/
 
 # pytest
 .pytest_cache/

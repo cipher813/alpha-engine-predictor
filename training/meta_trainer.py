@@ -1964,6 +1964,83 @@ def run_meta_training(
             _e)
         residual_momentum_leakfree = {"status": "error", "error": str(_e)}
 
+    # ── W3.2 (L4469): leak-free per-HORIZON IC curve (OBSERVE) ───────────────
+    # The operator's 5/21/60/90d question — where does the HONEST (leak-free)
+    # cross-sectional IC peak? The existing `horizon_ics` block uses a POOLED
+    # overlapping Spearman + a non-overlapping subsample; this runs the SAME W1
+    # purged+embargoed expanding walk-forward (refit the L2 per fold on EACH
+    # horizon's realized label, purge = h days), reporting the leak-free
+    # cross-sectional rank IC + downside/DSR legs per horizon. Same meta_X /
+    # canonical-finite row population across horizons so the curve is
+    # apples-to-apples. OBSERVE ONLY: emitted to the manifest, gates NOTHING —
+    # the canonical 21d target is unchanged. Gross IC alone does NOT settle the
+    # horizon; net-of-cost judgment is W3.4 (turnover-adjusted alpha, deferred).
+    horizon_ics_leakfree: dict[str, dict] = {}
+    try:
+        from training.deflated_sharpe import (
+            deflated_sharpe_ratio as _h_dsr,
+            downside_ic_stats as _h_dstats,
+        )
+        from training.leakfree_meta_ic import leakfree_horizon_ic_curve
+
+        def _h_fit_predict(_Xtr, _ytr, _Xte):
+            _m = MetaModel(alpha=1.0)
+            _m.fit(_Xtr, _ytr, feature_names=TRAIN_META_FEATURES)
+            return _m.predict(_Xte).ravel()
+
+        _h_dates = [
+            r.get("date")
+            for r, _m in zip(oos_meta_rows, canonical_finite_mask) if _m
+        ]
+        _h_labels = {
+            _h: np.array([
+                r.get(f"actual_fwd_{_h}d", float("nan"))
+                for r, _m in zip(oos_meta_rows, canonical_finite_mask) if _m
+            ])
+            for _h in _DIAGNOSTIC_HORIZONS
+        }
+        _raw_curve = leakfree_horizon_ic_curve(
+            meta_X, _h_labels, _h_dates,
+            fit_predict_fn=_h_fit_predict,
+            embargo_days=getattr(cfg, "WF_EMBARGO_DAYS", 0),
+        )
+        for _key, _lf in _raw_curve.items():
+            _entry = {
+                "status": _lf.get("status"),
+                "xsec_ic": _lf.get("xsec_ic"),
+                "pooled_ic": _lf.get("pooled_ic"),
+                "n": _lf.get("n"),
+                "n_dates": _lf.get("n_dates"),
+                "n_folds": _lf.get("n_folds"),
+                "forward_days": _lf.get("forward_days"),
+            }
+            _ic_series_h = _lf.get("ic_series", []) if isinstance(_lf, dict) else []
+            if _ic_series_h:
+                _entry["downside"] = _h_dstats(
+                    _ic_series_h,
+                    sortino_threshold=float(getattr(cfg, "WF_SORTINO_IC_THRESHOLD", 0.0)),
+                )
+                _entry["overfit"] = _h_dsr(
+                    _ic_series_h,
+                    n_trials=int(getattr(cfg, "WF_DSR_N_TRIALS", 10)),
+                    threshold=float(getattr(cfg, "WF_DSR_THRESHOLD", 0.95)),
+                )
+            horizon_ics_leakfree[_key] = _entry
+        _curve = {
+            k: v["xsec_ic"] for k, v in horizon_ics_leakfree.items()
+            if isinstance(v.get("xsec_ic"), (int, float)) and np.isfinite(v["xsec_ic"])
+        }
+        _peak = max(_curve, key=_curve.get) if _curve else None
+        log.info(
+            "W3.2 leak-free horizon IC curve (OBSERVE, NOT gated): %s | peak=%s "
+            "vs canonical target=21d. Settle the horizon net-of-cost (W3.4) "
+            "before any cutover — gross IC alone does not decide it.",
+            {k: round(float(v), 4) for k, v in _curve.items()}, _peak,
+        )
+    except Exception as _e:  # observe-only diagnostic must never fail training
+        log.warning("W3.2 leak-free horizon IC failed (OBSERVE, non-fatal): %s", _e)
+        horizon_ics_leakfree = {"status": "error", "error": str(_e)}
+
     # Parity diagnostic: canonical Ridge predictions vs legacy labels
     # (cross-target). Useful for monitoring whether the cutover degrades
     # the historical reporting metric. Same 4-cell-grid spirit as Track A
@@ -3517,6 +3594,14 @@ def run_meta_training(
             "regime_distribution": regime_counts,
             "peak_horizon": _peak[0],
             "peak_spearman": round(_peak[1]["spearman"], 6) if np.isfinite(_peak[1]["spearman"]) else None,
+            # W3.2 (L4469, OBSERVE): the LEAK-FREE per-horizon IC curve — the
+            # purged+embargoed expanding-WF cross-sectional rank IC (L2 refit
+            # per fold on each horizon's label) + downside/DSR legs. This is
+            # the honest curve that settles the operator's 5/21/60/90d question;
+            # the `curve` field above is pooled/non-overlapping (inflated). NOT
+            # gated; the canonical 21d target is unchanged. Additive per S3
+            # contract. Net-of-cost judgment is W3.4 (deferred).
+            "curve_leakfree": horizon_ics_leakfree,
             # Audit Track A PR 2/6 (2026-05-07): canonical-label IC
             # diagnostic. Persisted regardless of pass/fail for cross-cycle
             # trend monitoring. The audit's PR 5 cutover decision will
