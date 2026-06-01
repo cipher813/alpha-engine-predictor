@@ -410,3 +410,41 @@ def per_feature_standalone_ic(meta_X, meta_y, row_dates, feature_names) -> dict:
             "n_dates": len(series),
         }
     return out
+
+
+def gbm_blender_fit_predict(**lgb_params) -> Callable:
+    """W4.1 (L4469): a NONLINEAR (LightGBM) L2-blender ``fit_predict_fn`` for
+    ``leakfree_meta_oos_ic`` — the shadow alternative to the linear BayesianRidge
+    meta-learner.
+
+    The W1 finding established the meta is a *linear* stacker; Gu-Kelly-Xiu is
+    the canonical evidence that a nonlinear blender materially beats OLS on the
+    SAME factor inputs (NN Sharpe 1.35 vs OLS 0.61). This factory lets the
+    trainer measure, OBSERVE-only, whether a nonlinear meta recovers more
+    leak-free IC from the identical L1 outputs — WITHOUT changing the live L2.
+    Because the read is leak-free OOS, overfitting shows up as a LOW OOS IC, so
+    the comparison is honest. Conservative defaults bound overfit on the
+    ~12-feature meta; a fresh booster is fit per walk-forward fold.
+    """
+    import lightgbm as lgb
+
+    params = dict(
+        n_estimators=200,
+        num_leaves=15,
+        learning_rate=0.05,
+        min_child_samples=50,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        reg_lambda=1.0,
+        n_jobs=2,
+        verbosity=-1,
+        random_state=4469,
+    )
+    params.update(lgb_params)
+
+    def _fit_predict(X_tr, y_tr, X_te):
+        model = lgb.LGBMRegressor(**params)
+        model.fit(X_tr, y_tr)
+        return np.asarray(model.predict(X_te), dtype=float).ravel()
+
+    return _fit_predict
