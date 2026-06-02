@@ -3034,7 +3034,9 @@ def run_meta_training(
     # Booster's `free_dataset()` (called inside GBMScorer.fit() post-
     # 2026-05-24), this caps peak RSS during the 3-variant volatility
     # training instead of letting it accumulate to OOM.
-    import gc
+    # (gc is imported module-level; a local ``import gc`` here would make
+    # gc function-local for ALL of run_meta_training and UnboundLocalError
+    # the earlier gc.collect() after the unsorted-array del block.)
     peak_rss_mb = max(peak_rss_mb, _log_rss("before X_vol_aug del"))
     del X_vol_aug
     gc.collect()
