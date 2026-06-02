@@ -179,10 +179,19 @@ def leakfree_meta_oos_ic(
         n_used_folds += 1
 
     if n_used_folds == 0 or len(oos_pred) < 10:
+        # L4469 CF3: `n_folds=0` here is (almost always) honest data-starvation,
+        # NOT a code defect — an expanding purged+embargoed WF needs roughly
+        # `min_test + forward_days + test_size` unique dates to clear even one
+        # fold, so it stays empty while canonical-label coverage is thin (the
+        # CPCV path is the data-efficient working read meanwhile). Emit
+        # `n_unique_dates` so the manifest shows the true cause (starvation vs a
+        # real bug) instead of leaving it to be guessed. Self-heals as coverage
+        # grows; no fold-forcing (that would violate the no-shortcuts default).
         out = {
             "status": "insufficient_folds",
             "n_folds": n_used_folds,
             "n": len(oos_pred),
+            "n_unique_dates": len(uniq),
             "xsec_ic": float("nan"),
             "pooled_ic": float("nan"),
             "forward_days": forward_days,
@@ -223,6 +232,10 @@ def leakfree_meta_oos_ic(
         "n_folds": n_used_folds,
         "n": int(fin.sum()),
         "n_dates": n_dates,
+        # Total unique input dates (vs `n_dates` = test dates that produced an
+        # IC). Pairs with the `insufficient_folds` branch so coverage is always
+        # legible in the manifest (L4469 CF3).
+        "n_unique_dates": len(uniq),
         "xsec_ic": _r(xsec_ic),
         # Per-date cross-sectional IC series — the "returns" the W1.3 Deflated
         # Sharpe Ratio operates on. Rounded for the manifest payload.

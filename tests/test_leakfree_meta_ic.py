@@ -199,6 +199,21 @@ def test_insufficient_data_returns_status_not_crash():
     assert out["status"] in ("insufficient_folds", "ok")
 
 
+def test_starvation_reports_unique_date_count():
+    # L4469 CF3: when the span is too short to clear a purged+embargoed fold the
+    # read must surface WHY (data-starvation) — `n_unique_dates` makes the
+    # n_folds=0 case diagnosable from the manifest instead of guessed-at.
+    X, y, dates = _make_panel(n_dates=5, n_names=3, signal=0.5, seed=4)
+    out = leakfree_meta_oos_ic(
+        X, y, dates, fit_predict_fn=_ridge_fit_predict,
+        forward_days=21, n_folds=5, min_test=21,
+    )
+    assert "n_unique_dates" in out
+    assert out["n_unique_dates"] == 5
+    if out["status"] == "insufficient_folds":
+        assert out["n_folds"] == 0
+
+
 # ── cpcv_meta_oos_ic (W1.2 — combinatorial purged CV) ─────────────────────
 
 

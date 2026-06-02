@@ -1964,9 +1964,19 @@ def run_meta_training(
             deflated_sharpe_ratio as _rm_dsr,
             downside_ic_stats as _rm_dstats,
         )
-        _rm_preds = residual_momentum_scorer.predict_array(
-            X_resid_mom_raw[canonical_finite_mask], RESIDUAL_MOMENTUM_FEATURES,
-        )
+        # L4469 CF3 fix: reuse the leak-free per-fold residual-momentum
+        # predictions ALREADY stored on each OOS row (`residual_momentum_score`,
+        # written unconditionally at fold time on the test slice — see ~L1516,
+        # `predict_array(X_resid_mom_raw[te])[local_idx]`). The prior code
+        # re-ran the scorer on `X_resid_mom_raw[canonical_finite_mask]`, but
+        # `X_resid_mom_raw` is FULL-training length N while `canonical_finite_mask`
+        # is OOS length — a boolean-index shape mismatch (IndexError) that crashed
+        # the read into status="error". Pulling the stored per-row value (mirrors
+        # the W2.3 `factor_momentum_ratio` idiom below) is identical in value,
+        # correctly OOS-aligned, and matches `meta_y` / `_rm_dates` row-for-row.
+        _rm_preds = np.array([
+            r.get("residual_momentum_score", float("nan")) for r in oos_meta_rows
+        ])[canonical_finite_mask]
         _rm_dates = [
             r.get("date")
             for r, _m in zip(oos_meta_rows, canonical_finite_mask) if _m

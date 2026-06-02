@@ -67,3 +67,40 @@ class TestGateInvariant:
         last_col = X_on[:, -1]
         expected = np.array([r["residual_momentum_score"] for r in rows])
         np.testing.assert_array_equal(last_col, expected)
+
+
+class TestW2LeakfreeReadShape:
+    """Regression guard for the W2 residual-momentum leak-free read (CF3).
+
+    The crashed code re-ran the scorer on ``X_resid_mom_raw`` — a FULL-training
+    length-N array — indexed by ``canonical_finite_mask``, which is OOS length.
+    Boolean indexing requires the mask to match the array's first dim, so that
+    raised ``IndexError`` and dumped the read into status="error". The fix pulls
+    the leak-free per-fold value already stored on each OOS row, mirroring the
+    factor_momentum_ratio idiom.
+    """
+
+    def test_full_length_array_masked_by_oos_mask_raises(self):
+        # Reproduce the bug geometry: N (full training) >> n_oos (meta rows).
+        n_full, n_oos = 500, 60
+        X_resid_mom_raw = np.zeros((n_full, 5))
+        canonical_finite_mask = np.ones(n_oos, dtype=bool)
+        with np.testing.assert_raises(IndexError):
+            _ = X_resid_mom_raw[canonical_finite_mask]
+
+    def test_stored_row_idiom_is_oos_aligned(self):
+        # The fix: extract the stored per-row score, then mask — length follows
+        # the mask, matching meta_y / _rm_dates row-for-row.
+        rows = _synthetic_rows(n=60, seed=7)
+        canonical_finite_mask = np.array(
+            [i % 3 != 0 for i in range(len(rows))], dtype=bool
+        )
+        preds = np.array(
+            [r.get("residual_momentum_score", float("nan")) for r in rows]
+        )[canonical_finite_mask]
+        assert preds.shape[0] == int(canonical_finite_mask.sum())
+        expected = np.array(
+            [r["residual_momentum_score"]
+             for r, m in zip(rows, canonical_finite_mask) if m]
+        )
+        np.testing.assert_array_equal(preds, expected)
