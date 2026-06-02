@@ -3809,28 +3809,66 @@ def run_meta_training(
                 bucket, cfg.META_FEATURE_LIST_KEY,
             )
 
-            # Phase 0 model registry (champion/challenger governance): on a
-            # PROMOTED training, snapshot the complete live inference contract
-            # (all weights + feature_list + manifest, just written above) into an
-            # immutable content-addressed bundle so the version is reproducible
-            # in isolation for shadow comparison. Additive server-side copy —
-            # best-effort: a registry-write failure must never fail training (it
-            # touches no live weight / gate). Gated on `promoted` because only an
-            # accepted version becomes a champion/challenger candidate.
-            if promoted:
-                try:
-                    from model.registry import snapshot_to_registry
+            # Phase 0 model registry (champion/challenger governance): snapshot
+            # the complete inference contract into an immutable content-addressed
+            # bundle so EVERY trained version is reproducible in isolation for
+            # shadow comparison. Best-effort — a registry-write failure must
+            # never fail training (it touches no live weight / gate).
+            #
+            # L4469 capture-gap fix: register on EVERY run, not only on
+            # promotion. A PROMOTED run snapshots from the live prefix (which now
+            # holds the accepted contract) as the `champion`. A NON-promoted run
+            # snapshots as a `challenger` from the dated ARCHIVE — the archive
+            # always holds THIS run's weights (written unconditionally above) but
+            # lacks manifest.json + feature_list.json (the two
+            # REQUIRED_CONTRACT_FILES), so we complete it by copying the
+            # candidate's just-written manifest + feature_list (the live keys
+            # carry the candidate's values regardless of promotion) into the
+            # archive first. Without this, no challenger ever exists to shadow —
+            # the exact Phase-0 gap that left the registry holding only the
+            # champion (found 2026-06-02).
+            try:
+                from model.registry import snapshot_to_registry
 
+                if promoted:
                     _vid = snapshot_to_registry(
                         s3_up, bucket,
                         model_version=manifest.get("version", "v3.0-meta"),
-                        date=date_str,
+                        date=date_str, stage="champion",
                     )
-                    log.info("Phase-0 registry snapshot: predictor/registry/%s/", _vid)
-                except Exception as _reg_err:
-                    log.warning(
-                        "Phase-0 registry snapshot failed (non-blocking): %s", _reg_err,
+                    log.info(
+                        "Phase-0 registry snapshot (champion): predictor/registry/%s/",
+                        _vid,
                     )
+                else:
+                    _arch_prefix = f"{cfg.META_WEIGHTS_PREFIX}archive/{date_str}/"
+                    # Complete the archived candidate bundle: the archive has the
+                    # weights but not the two REQUIRED_CONTRACT_FILES. Copy the
+                    # candidate's manifest + feature_list (live keys = candidate's
+                    # values on a non-promoted run) so the bundle is reproducible.
+                    for _live_key, _fname in (
+                        (cfg.META_MANIFEST_KEY, "manifest.json"),
+                        (cfg.META_FEATURE_LIST_KEY, "feature_list.json"),
+                    ):
+                        s3_up.copy_object(
+                            Bucket=bucket,
+                            Key=f"{_arch_prefix}{_fname}",
+                            CopySource={"Bucket": bucket, "Key": _live_key},
+                        )
+                    _vid = snapshot_to_registry(
+                        s3_up, bucket,
+                        model_version=manifest.get("version", "v3.0-meta"),
+                        date=date_str, stage="challenger",
+                        source_prefix=_arch_prefix,
+                    )
+                    log.info(
+                        "Phase-0 registry snapshot (challenger): predictor/registry/%s/",
+                        _vid,
+                    )
+            except Exception as _reg_err:
+                log.warning(
+                    "Phase-0 registry snapshot failed (non-blocking): %s", _reg_err,
+                )
 
             # Track 4-of-N of audit Phase 1 horizon battery (2026-05-07):
             # persist OOS meta-rows to S3 so the standalone analysis module

@@ -84,6 +84,7 @@ def snapshot_to_registry(
     registry_prefix: str = DEFAULT_REGISTRY_PREFIX,
     code_sha: str | None = None,
     created_utc: str | None = None,
+    stage: str | None = None,
 ) -> str:
     """Snapshot the live inference contract under ``source_prefix`` into an
     immutable content-addressed bundle ``{registry_prefix}{version_id}/``.
@@ -92,6 +93,13 @@ def snapshot_to_registry(
     bundle that can't be run in isolation must never be registered. Idempotent:
     if the same-fingerprint bundle already has a ``_lineage.json``, returns its
     ``version_id`` without recopying. Returns the ``version_id``.
+
+    ``stage`` (``champion`` | ``challenger`` | ``archived``) is recorded in the
+    lineage so the champion/challenger arc can tell, from the registry alone,
+    which versions were promoted to live (champion) vs captured as observe-only
+    candidates (challenger) — the Phase-0 capture gap fix (L4469): every trained
+    candidate is registered, not only the promoted one, so a challenger exists
+    to shadow.
     """
     keys = _list_contract_keys(s3, bucket, source_prefix)
     names = {k.rsplit("/", 1)[-1] for k in keys}
@@ -107,12 +115,33 @@ def snapshot_to_registry(
     version_id = f"{model_version}-{date}-{fp}"
     dest = f"{registry_prefix}{version_id}/"
 
-    # Idempotency: a completed bundle is marked by its _lineage.json.
+    # Idempotency: a completed bundle is marked by its _lineage.json. The
+    # bundle's BYTES are immutable, but the ``stage`` can legitimately advance
+    # (a challenger captured observe-only later gets promoted — same content,
+    # same fingerprint, same version_id). On that one transition patch the
+    # recorded stage in place; otherwise leave the bundle untouched.
+    _existing = None
     try:
-        s3.head_object(Bucket=bucket, Key=f"{dest}_lineage.json")
-        return version_id  # already snapshotted — immutable, leave as-is
+        _existing_raw = s3.get_object(
+            Bucket=bucket, Key=f"{dest}_lineage.json"
+        )["Body"].read()
+        _existing = json.loads(_existing_raw)
     except Exception:
-        pass  # not present → write it
+        _existing = None  # missing / unreadable → write a fresh bundle below
+    if _existing is not None:
+        if (
+            stage is not None
+            and stage != _existing.get("stage")
+            and stage == "champion"  # only promote-in-place; never demote
+        ):
+            _existing["stage"] = stage
+            s3.put_object(
+                Bucket=bucket,
+                Key=f"{dest}_lineage.json",
+                Body=json.dumps(_existing, indent=2).encode(),
+                ContentType="application/json",
+            )
+        return version_id  # already snapshotted — immutable bytes
 
     for key in keys:
         filename = key.rsplit("/", 1)[-1]
@@ -126,6 +155,7 @@ def snapshot_to_registry(
         "version_id": version_id,
         "model_version": model_version,
         "date": date,
+        "stage": stage,
         "code_sha": code_sha,
         "source_prefix": source_prefix,
         "fingerprint": fp,
