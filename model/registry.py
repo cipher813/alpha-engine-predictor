@@ -173,6 +173,43 @@ def snapshot_to_registry(
     return version_id
 
 
+def list_versions(
+    s3,
+    bucket: str,
+    *,
+    stage: str | None = None,
+    registry_prefix: str = DEFAULT_REGISTRY_PREFIX,
+) -> list[dict]:
+    """List registered versions by reading each bundle's ``_lineage.json``.
+
+    Returns lineage dicts (each carries ``version_id``, ``stage``, ``date``,
+    ``created_utc``, ...), filtered to ``stage`` when given, sorted newest-first
+    by ``(date, created_utc)``. Used by the Phase-1 shadow runner to enumerate
+    challengers to shadow. Best-effort: a bundle whose ``_lineage.json`` is
+    missing or unreadable is skipped, not fatal.
+    """
+    out: list[dict] = []
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=registry_prefix):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            if not key.endswith("/_lineage.json"):
+                continue
+            try:
+                body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+                lineage = json.loads(body)
+            except Exception:
+                continue
+            if stage is not None and lineage.get("stage") != stage:
+                continue
+            out.append(lineage)
+    out.sort(
+        key=lambda d: (str(d.get("date") or ""), str(d.get("created_utc") or "")),
+        reverse=True,
+    )
+    return out
+
+
 def _cli() -> None:
     """Backfill CLI: snapshot the current live model (or any prefix) into the
     registry. Usage: ``python -m model.registry --bucket B --model-version V

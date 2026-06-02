@@ -186,6 +186,14 @@ residual_momentum:
 level_neutralization:
   enabled: false                 # observe gate — producer-side single source of truth
 
+# ── Champion/challenger Phase 1 shadow runner (L4469) ─────────────────────────
+# After the live champion inference, re-score the same prices/universe with each
+# registered CHALLENGER's weights → predictions_shadow/{version_id}/{date}.json.
+# Trade-on-none, non-critical, time-guarded. No-op until challengers exist.
+shadow_versions:
+  enabled: true                  # observe-only (challengers never trade)
+  max_n: 3                       # max challengers shadowed per inference run
+
 # ── Feature engineering parameters ────────────────────────────────────────────
 features:
   rsi_period: 14                   # RSI lookback period

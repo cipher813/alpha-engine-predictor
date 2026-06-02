@@ -375,6 +375,20 @@ RESIDUAL_MOMENTUM_ENABLED = _resid_mom_cfg.get("enabled", False)
 # of truth — the executor optimizer + gbm_veto inherit the centered value.
 _level_neut_cfg = _cfg.get("level_neutralization", {})
 XSEC_DEMEAN_ALPHA_ENABLED = _level_neut_cfg.get("enabled", False)
+
+# ── Champion/challenger Phase 1 shadow runner (L4469) ───────────────────────
+# After the live (champion) inference writes predictions/{date}.json, the
+# shadow runner re-scores the SAME prices/universe with each registered
+# CHALLENGER's weights and writes predictor/predictions_shadow/{version_id}/
+# {date}.json. Challengers TRADE ON NONE — only the live predictions feed the
+# executor. The stage is non-critical (a shadow failure never aborts inference)
+# and time-guarded (skips remaining challengers near the Lambda soft-timeout),
+# so it can never delay or break the live path. No-op until challengers exist
+# in the registry (they register from the next retrain via the L4469 capture
+# fix), so default-on is safe. ``max_n`` bounds the per-run challenger count.
+_shadow_cfg = _cfg.get("shadow_versions", {})
+SHADOW_VERSIONS_ENABLED = _shadow_cfg.get("enabled", True)
+SHADOW_VERSIONS_MAX_N = int(_shadow_cfg.get("max_n", 3))
 RESID_MOM_BETA_WINDOW = _resid_mom_cfg.get("beta_window", 60)
 RESID_MOM_WINDOW = _resid_mom_cfg.get("window", 252)
 RESID_MOM_SKIP_DAYS = _resid_mom_cfg.get("skip_days", 21)
