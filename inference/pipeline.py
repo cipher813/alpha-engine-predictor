@@ -51,6 +51,14 @@ class PipelineContext:
     start_ts: float = 0.0
     soft_timeout_s: int = 780
 
+    # Champion/challenger Phase 1 shadow runner (L4469): when set to a
+    # registered version's bundle prefix (predictor/registry/{version_id}/),
+    # load_model pulls THAT version's weights instead of the live champion's.
+    # None on the live path. Set only on cloned shadow contexts by
+    # inference.stages.shadow_versions — never on the context that feeds the
+    # executor.
+    weights_prefix_override: Optional[str] = None
+
     # ── Model state (set by load_model) ──────────────────────────────────────
     scorer: object = None           # primary GBM scorer
     mse_scorer: object = None       # MSE model
@@ -182,6 +190,12 @@ STAGES = [
     # affects predictions.
     ("regime_fast_signal", "inference.stages.regime_fast_signal", False),
     ("write_output",   "inference.stages.write_output",   False),
+    # Champion/challenger Phase 1 shadow runner (L4469). Runs LAST — after the
+    # live predictions are written — and is non-critical: it re-scores the same
+    # prices/universe with each registered challenger's weights into
+    # predictions_shadow/{version_id}/, trades on none, and a failure here never
+    # touches the live path. Time-guarded against the Lambda soft-timeout.
+    ("shadow_versions", "inference.stages.shadow_versions", False),
 ]
 
 

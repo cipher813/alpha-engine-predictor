@@ -36,7 +36,11 @@ def _load_meta_models(ctx: PipelineContext) -> None:
 
     ctx.inference_mode = "meta"
     ctx.meta_models = {}
-    prefix = cfg.META_WEIGHTS_PREFIX
+    # Champion/challenger Phase 1 (L4469): a shadow run sets
+    # ctx.weights_prefix_override to a registered version's bundle
+    # (predictor/registry/{version_id}/) so the SAME loader pulls a challenger's
+    # weights instead of the live champion's. None → live champion prefix.
+    prefix = getattr(ctx, "weights_prefix_override", None) or cfg.META_WEIGHTS_PREFIX
 
     def _dl(s3_key, local_name):
         """Download from S3 to temp, return path."""

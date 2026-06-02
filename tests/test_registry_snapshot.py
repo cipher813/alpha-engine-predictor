@@ -12,7 +12,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from model.registry import RegistryError, snapshot_to_registry
+from model.registry import RegistryError, list_versions, snapshot_to_registry
 
 _PREFIX = "predictor/weights/meta/"
 
@@ -115,6 +115,39 @@ def test_promote_in_place_patches_stage_when_bundle_exists():
     s3.copy_object.assert_not_called()  # bundle bytes immutable
     body = s3.put_object.call_args_list[-1].kwargs["Body"]
     assert json.loads(body)["stage"] == "champion"
+
+
+def test_list_versions_filters_by_stage_and_sorts_newest_first():
+    s3 = MagicMock()
+    pag = MagicMock()
+    pag.paginate.return_value = [{"Contents": [
+        {"Key": "predictor/registry/v-2026-06-01-aaa/_lineage.json"},
+        {"Key": "predictor/registry/v-2026-06-02-bbb/_lineage.json"},
+        {"Key": "predictor/registry/v-2026-05-30-ccc/_lineage.json"},
+        {"Key": "predictor/registry/v-2026-06-02-bbb/meta_model.pkl"},  # not a lineage
+    ]}]
+    s3.get_paginator.return_value = pag
+    lineages = {
+        "predictor/registry/v-2026-06-01-aaa/_lineage.json":
+            {"version_id": "v-2026-06-01-aaa", "stage": "challenger", "date": "2026-06-01"},
+        "predictor/registry/v-2026-06-02-bbb/_lineage.json":
+            {"version_id": "v-2026-06-02-bbb", "stage": "challenger", "date": "2026-06-02"},
+        "predictor/registry/v-2026-05-30-ccc/_lineage.json":
+            {"version_id": "v-2026-05-30-ccc", "stage": "champion", "date": "2026-05-30"},
+    }
+
+    def _get(Bucket, Key):
+        body = MagicMock()
+        body.read.return_value = json.dumps(lineages[Key]).encode()
+        return {"Body": body}
+
+    s3.get_object.side_effect = _get
+
+    challengers = list_versions(s3, "bkt", stage="challenger")
+    assert [v["version_id"] for v in challengers] == [
+        "v-2026-06-02-bbb", "v-2026-06-01-aaa",  # newest first, champion excluded
+    ]
+    assert len(list_versions(s3, "bkt")) == 3  # no filter → all
 
 
 def test_no_demote_when_bundle_exists():
