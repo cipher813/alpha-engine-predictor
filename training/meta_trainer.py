@@ -3316,6 +3316,19 @@ def run_meta_training(
         and output_dist_gate_passed
         and stratified_gate_passed
     )
+    # Challenger-first promotion (L4469): training does NOT auto-overwrite the
+    # live champion. A gate-passing model is registered as a CHALLENGER (shadow
+    # + scored); the operator promotes the best to champion via
+    # `python -m model.registry promote` once the leaderboard shows realized
+    # OOS edge. `gate_passed` is the gate's verdict; `promoted` — which gates
+    # BOTH the live-weight upload and the champion registry snapshot below — is
+    # the EFFECTIVE outcome, true only when auto-promote is explicitly
+    # re-enabled. Default-off closes the auto-ship-a-broken-model hole (the
+    # 5/30 8-model overwrote the champion on an inflated in-sample IC, then
+    # flushed the live book to SPY on its first inference).
+    gate_passed = promoted
+    auto_promote_enabled = bool(getattr(cfg, "TRAINING_AUTO_PROMOTE_ENABLED", False))
+    promoted = gate_passed and auto_promote_enabled
     # Promotion-blocker reason string. Resolved from the SAME gate booleans
     # the live `promoted` formula above uses, so it can never disagree with
     # the actual outcome. Persisted into training_summary so downstream
@@ -3337,7 +3350,7 @@ def run_meta_training(
     if not stratified_gate_passed:
         _blockers.append("stratified")
     promoted_blocker_reason: str | None = (
-        None if promoted else ("+".join(_blockers) if _blockers else "unknown")
+        None if promoted else ("+".join(_blockers) if _blockers else ("challenger_first_auto_promote_disabled" if gate_passed else "unknown"))
     )
     _stratified_status = (
         "n/a" if stratified_result is None
@@ -3358,7 +3371,11 @@ def run_meta_training(
         "PASS" if output_dist_result.passed else "FAIL",
         _stratified_status,
         "" if output_dist_blocking else " (OBSERVE-ONLY: not blocking)",
-        "PROMOTE" if promoted else "BLOCK",
+        (
+            "PROMOTE" if promoted
+            else "CHALLENGER (gate-pass; auto-promote OFF, challenger-first)"
+            if gate_passed else "BLOCK"
+        ),
         mom_median_ic, vol_median_ic,
     )
     elapsed_s = (datetime.now(timezone.utc) - start_ts).total_seconds()
@@ -3535,6 +3552,13 @@ def run_meta_training(
                     if cfg.TRAIN_START_DATE is not None else None
                 ),
                 "promoted": promoted,
+                # Challenger-first forensic trail (L4469): gate_passed = the
+                # promotion gate's verdict; auto_promote_enabled = whether
+                # training is allowed to overwrite the live champion. When
+                # gate_passed and NOT auto_promote_enabled, the run registered a
+                # challenger and live weights were left unchanged.
+                "gate_passed": gate_passed,
+                "auto_promote_enabled": auto_promote_enabled,
                 "models": {
                     "momentum": {
                         "kind": "deterministic_baseline",

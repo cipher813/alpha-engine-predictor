@@ -12,7 +12,12 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from model.registry import RegistryError, list_versions, snapshot_to_registry
+from model.registry import (
+    RegistryError,
+    list_versions,
+    promote_to_champion,
+    snapshot_to_registry,
+)
 
 _PREFIX = "predictor/weights/meta/"
 
@@ -148,6 +153,70 @@ def test_list_versions_filters_by_stage_and_sorts_newest_first():
         "v-2026-06-02-bbb", "v-2026-06-01-aaa",  # newest first, champion excluded
     ]
     assert len(list_versions(s3, "bkt")) == 3  # no filter → all
+
+
+def _promote_s3(*, bundle_files, prior_champion=None):
+    """S3 mock for promote_to_champion: a challenger bundle under
+    registry/{vid}/ plus an optional prior champion, with paginate keyed on
+    Prefix (bundle listing vs registry-wide lineage listing)."""
+    vid = "v-2026-06-06-newchamp"
+    reg = "predictor/registry/"
+    src = f"{reg}{vid}/"
+    s3 = MagicMock()
+
+    def _paginate(Bucket, Prefix):
+        if Prefix == src:  # _list_contract_keys: the bundle's flat files
+            return [{"Contents": [{"Key": src + f} for f in bundle_files]}]
+        contents = [{"Key": f"{src}_lineage.json"}]  # list_versions: all lineages
+        if prior_champion:
+            contents.append({"Key": f"{reg}{prior_champion}/_lineage.json"})
+        return [{"Contents": contents}]
+
+    pag = MagicMock()
+    pag.paginate.side_effect = _paginate
+    s3.get_paginator.return_value = pag
+
+    lineages = {f"{src}_lineage.json": {"version_id": vid, "stage": "challenger"}}
+    if prior_champion:
+        lineages[f"{reg}{prior_champion}/_lineage.json"] = \
+            {"version_id": prior_champion, "stage": "champion"}
+
+    def _get(Bucket, Key):
+        body = MagicMock()
+        body.read.return_value = json.dumps(lineages[Key]).encode()
+        return {"Body": body}
+
+    s3.get_object.side_effect = _get
+    return s3, vid
+
+
+def test_promote_copies_bundle_to_live_and_flips_stages():
+    s3, vid = _promote_s3(
+        bundle_files=["meta_model.pkl", "feature_list.json", "manifest.json", "_lineage.json"],
+        prior_champion="v-old-champ",
+    )
+    out = promote_to_champion(s3, "bkt", vid)
+    # Contract (excl _lineage.json) copied into the LIVE champion prefix.
+    copied = {c.kwargs["Key"] for c in s3.copy_object.call_args_list}
+    assert copied == {
+        "predictor/weights/meta/meta_model.pkl",
+        "predictor/weights/meta/feature_list.json",
+        "predictor/weights/meta/manifest.json",
+    }
+    # Stages flipped: prior champion -> archived, the promoted version -> champion.
+    stages = {
+        json.loads(c.kwargs["Body"])["version_id"]: json.loads(c.kwargs["Body"])["stage"]
+        for c in s3.put_object.call_args_list
+    }
+    assert stages == {"v-old-champ": "archived", vid: "champion"}
+    assert out["version_id"] == vid
+
+
+def test_promote_refuses_incomplete_bundle():
+    s3, vid = _promote_s3(bundle_files=["meta_model.pkl", "_lineage.json"])  # no feature_list/manifest
+    with pytest.raises(RegistryError, match="incomplete"):
+        promote_to_champion(s3, "bkt", vid)
+    s3.copy_object.assert_not_called()  # never point live at an unreproducible contract
 
 
 def test_no_demote_when_bundle_exists():

@@ -27,6 +27,11 @@ model:
 
 # ── Training hyperparameters (NN) ─────────────────────────────────────────────
 training:
+  # Challenger-first (L4469): when false (default), a gate-passing retrain does
+  # NOT overwrite the live champion — it registers as a challenger; the operator
+  # promotes via `python -m model.registry --promote <version_id>`. Set true only
+  # to restore legacy auto-promote. Env override: TRAINING_AUTO_PROMOTE_ENABLED.
+  auto_promote_enabled: false
   batch_size: 256                  # training batch size
   learning_rate: 1.0e-3            # AdamW learning rate
   weight_decay: 1.0e-5             # L2 regularization

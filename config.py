@@ -373,8 +373,38 @@ RESIDUAL_MOMENTUM_ENABLED = _resid_mom_cfg.get("enabled", False)
 # (via predictor.yaml) only AFTER 2-3 firings confirm a consistent common-mode
 # mean + skew-correction (observe-before-cutover). Producer-side single source
 # of truth — the executor optimizer + gbm_veto inherit the centered value.
+def _flag_env_or_yaml(env_name: str, yaml_value: bool) -> bool:
+    """Boolean flag with an env-var override (live-toggle, no redeploy) falling
+    back to the predictor.yaml value. An explicit env value (1/true/yes/on or
+    0/false/no/off) wins; unset/blank → the yaml/default. Lets an operator flip
+    a gate via `aws lambda update-function-configuration --environment` without
+    rebuilding the container image."""
+    raw = os.environ.get(env_name)
+    if raw is not None and raw.strip() != "":
+        return raw.strip().lower() in ("1", "true", "yes", "on")
+    return bool(yaml_value)
+
+
 _level_neut_cfg = _cfg.get("level_neutralization", {})
-XSEC_DEMEAN_ALPHA_ENABLED = _level_neut_cfg.get("enabled", False)
+# Env-overridable (L4469): flip the level fix live via the inference Lambda's
+# XSEC_DEMEAN_ALPHA_ENABLED env var — no image redeploy — once the 6/3 canary
+# observe-block confirms the common-mode + skew correction.
+XSEC_DEMEAN_ALPHA_ENABLED = _flag_env_or_yaml(
+    "XSEC_DEMEAN_ALPHA_ENABLED", _level_neut_cfg.get("enabled", False)
+)
+
+# ── Challenger-first promotion (L4469) ──────────────────────────────────────
+# When False (default), a training run that PASSES the promotion gate does NOT
+# overwrite the live champion — it is registered as a CHALLENGER (shadow +
+# scored), and the operator promotes the best to champion via
+# `python -m model.registry promote` after the leaderboard shows realized OOS
+# edge. This closes the auto-ship-a-broken-model hole (the 5/30 8-model
+# auto-promoted on an inflated in-sample IC and flushed the book to SPY). Set
+# True (yaml or env) only to restore legacy auto-promote. Env-overridable.
+_promote_cfg = _cfg.get("training", {})
+TRAINING_AUTO_PROMOTE_ENABLED = _flag_env_or_yaml(
+    "TRAINING_AUTO_PROMOTE_ENABLED", _promote_cfg.get("auto_promote_enabled", False)
+)
 
 # ── Champion/challenger Phase 1 shadow runner (L4469) ───────────────────────
 # After the live (champion) inference writes predictions/{date}.json, the

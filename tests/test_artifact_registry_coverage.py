@@ -42,7 +42,7 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     "health_status.py": 2,
     "inference/s3_io.py": 2,
     "inference/stages/shadow_versions.py": 1,  # predictions_shadow/{vid}/{date}.json — observe-only, best-effort, no freshness SLA (L4469 Phase 1)
-    "model/registry.py": 2,  # _lineage.json write + promote-in-place stage patch (L4469; copy_object not counted)
+    "model/registry.py": 3,  # lineage write + promote-in-place patch + _patch_stage (L4469; copy_object not counted)
     "monitoring/drift_detector.py": 1,
     "regime/retrospective_eval_handler.py": 2,
     "regime/substrate.py": 2,

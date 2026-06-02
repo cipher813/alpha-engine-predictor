@@ -210,30 +210,126 @@ def list_versions(
     return out
 
 
+def _patch_stage(s3, bucket: str, dest: str, stage: str) -> None:
+    """Read ``{dest}_lineage.json``, set its ``stage``, re-put. Best-effort on a
+    missing lineage (logs nothing here — caller decides)."""
+    raw = s3.get_object(Bucket=bucket, Key=f"{dest}_lineage.json")["Body"].read()
+    lineage = json.loads(raw)
+    lineage["stage"] = stage
+    s3.put_object(
+        Bucket=bucket, Key=f"{dest}_lineage.json",
+        Body=json.dumps(lineage, indent=2).encode(), ContentType="application/json",
+    )
+
+
+def promote_to_champion(
+    s3,
+    bucket: str,
+    version_id: str,
+    *,
+    registry_prefix: str = DEFAULT_REGISTRY_PREFIX,
+    live_prefix: str = DEFAULT_SOURCE_PREFIX,
+) -> dict:
+    """Promote a registered version to the live champion (L4469, operator step).
+
+    Copies the version's immutable bundle into the live weights prefix (so
+    inference loads it), demotes any prior champion to ``archived``, and marks
+    this version ``champion`` in its lineage. This is the DELIBERATE, operator-
+    gated promotion that replaces training auto-promote (challenger-first): a
+    challenger earns champion only after the leaderboard shows realized OOS edge.
+
+    Refuses (``RegistryError``) if the bundle is missing or incomplete — never
+    point live inference at an unreproducible contract. Returns a summary dict.
+    NOTE: also update MODEL_REGISTRY.yaml (the doc SoT) to match — printed by
+    the CLI for the operator to commit.
+    """
+    src = f"{registry_prefix}{version_id}/"
+    try:
+        json.loads(s3.get_object(Bucket=bucket, Key=f"{src}_lineage.json")["Body"].read())
+    except Exception as e:
+        raise RegistryError(
+            f"cannot promote {version_id!r}: no registry bundle / _lineage.json ({e})"
+        )
+
+    contract = [
+        k for k in _list_contract_keys(s3, bucket, src)
+        if k.rsplit("/", 1)[-1] != "_lineage.json"
+    ]
+    names = {k.rsplit("/", 1)[-1] for k in contract}
+    missing = [f for f in REQUIRED_CONTRACT_FILES if f not in names]
+    if missing:
+        raise RegistryError(
+            f"refusing to promote {version_id!r} — incomplete bundle, missing "
+            f"{missing}; live inference must never run an unreproducible contract."
+        )
+
+    for k in contract:
+        fname = k.rsplit("/", 1)[-1]
+        s3.copy_object(
+            Bucket=bucket, Key=f"{live_prefix}{fname}",
+            CopySource={"Bucket": bucket, "Key": k},
+        )
+
+    # Demote any prior champion(s), then mark this one champion (exactly one).
+    for other in list_versions(s3, bucket, stage="champion", registry_prefix=registry_prefix):
+        ovid = other.get("version_id")
+        if ovid and ovid != version_id:
+            _patch_stage(s3, bucket, f"{registry_prefix}{ovid}/", "archived")
+    _patch_stage(s3, bucket, src, "champion")
+
+    return {
+        "version_id": version_id,
+        "files_copied": sorted(names),
+        "live_prefix": live_prefix,
+    }
+
+
 def _cli() -> None:
-    """Backfill CLI: snapshot the current live model (or any prefix) into the
-    registry. Usage: ``python -m model.registry --bucket B --model-version V
-    --date YYYY-MM-DD [--source-prefix P]``.
+    """Model registry CLI — snapshot / promote / list (L4469).
+
+    Snapshot (backfill):
+        python -m model.registry --bucket B --model-version V --date YYYY-MM-DD [--source-prefix P]
+    Promote a challenger to the live champion (operator step):
+        python -m model.registry --bucket B --promote VERSION_ID
+    List registered versions:
+        python -m model.registry --bucket B --list [--stage challenger]
     """
     import argparse
 
     import boto3
 
-    p = argparse.ArgumentParser(description="Snapshot a model contract into the registry.")
+    p = argparse.ArgumentParser(description="Model registry: snapshot / promote / list.")
     p.add_argument("--bucket", required=True)
-    p.add_argument("--model-version", required=True)
-    p.add_argument("--date", required=True)
+    p.add_argument("--model-version", default=None)
+    p.add_argument("--date", default=None)
     p.add_argument("--source-prefix", default=DEFAULT_SOURCE_PREFIX)
     p.add_argument("--code-sha", default=None)
+    p.add_argument("--promote", default=None, metavar="VERSION_ID",
+                   help="Promote this registered version to the live champion.")
+    p.add_argument("--list", action="store_true", help="List registered versions.")
+    p.add_argument("--stage", default=None, help="Filter --list by stage.")
     args = p.parse_args()
+    s3 = boto3.client("s3")
 
+    if args.list:
+        for v in list_versions(s3, args.bucket, stage=args.stage):
+            print(f"{(v.get('stage') or '?'):10s} {v.get('version_id')}  ({v.get('date')})")
+        return
+
+    if args.promote:
+        result = promote_to_champion(s3, args.bucket, args.promote)
+        print(f"PROMOTED {result['version_id']} → live champion "
+              f"({len(result['files_copied'])} files copied to {result['live_prefix']}).")
+        print("NEXT: update MODEL_REGISTRY.yaml — set this version stage: champion, "
+              "prior champion → archived (the doc SoT).")
+        return
+
+    if not (args.model_version and args.date):
+        p.error("snapshot requires --model-version and --date (or use --promote / --list)")
     vid = snapshot_to_registry(
-        boto3.client("s3"),
-        args.bucket,
-        model_version=args.model_version,
-        date=args.date,
-        source_prefix=args.source_prefix,
-        code_sha=args.code_sha,
+        s3, args.bucket,
+        model_version=args.model_version, date=args.date,
+        source_prefix=args.source_prefix, code_sha=args.code_sha,
     )
     print(f"registry snapshot: predictor/registry/{vid}/")
 
