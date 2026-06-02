@@ -75,7 +75,9 @@ class TestProducerSourceContract:
         # Schema per ROADMAP spec: trained_at, version, l2_features,
         # l1_features { momentum, volatility, research_calibrator }.
         assert '"trained_at": date_str' in src
-        assert '"version": "v3.0-meta"' in src
+        # L4488c: the version label is spec-driven (model_zoo sets
+        # MODEL_VERSION_LABEL per variant) but defaults to the base "v3.0-meta".
+        assert '"version": getattr(cfg, "MODEL_VERSION_LABEL", "v3.0-meta")' in src
         assert '"momentum":' in src
         assert '"volatility": list(cfg.VOLATILITY_FEATURES)' in src
         assert (
