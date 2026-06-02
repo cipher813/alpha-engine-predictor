@@ -359,6 +359,22 @@ WF_EARLY_STOPPING = _wf_cfg.get("wf_early_stopping", None)  # None → use GBM_E
 # code ships before alpha-engine-config's predictor.yaml carries the section.
 _resid_mom_cfg = _cfg.get("residual_momentum", {})
 RESIDUAL_MOMENTUM_ENABLED = _resid_mom_cfg.get("enabled", False)
+
+# ── Cross-sectional level-neutralization of predicted_alpha (L4487) ─────────
+# The meta-L2's macro features are common-mode across the daily cross-section,
+# so an adverse-macro day shifts the ENTIRE predicted-alpha vector negative →
+# the optimizer (which anchors at SPY=0) flushes the book + gbm_veto + the
+# distribution-gate skew the same way. Canonical alpha is market-relative, so
+# the cross-section mean SHOULD be ~0; centering removes the common-mode so the
+# real cross-sectional skill drives direction/veto/allocation. When False
+# (default) the inference path is byte-identical and the level_neutralization
+# observe block in predictions.json/metrics.json just records what centering
+# WOULD do (mean removed, direction flips, skew before/after). Flip to True
+# (via predictor.yaml) only AFTER 2-3 firings confirm a consistent common-mode
+# mean + skew-correction (observe-before-cutover). Producer-side single source
+# of truth — the executor optimizer + gbm_veto inherit the centered value.
+_level_neut_cfg = _cfg.get("level_neutralization", {})
+XSEC_DEMEAN_ALPHA_ENABLED = _level_neut_cfg.get("enabled", False)
 RESID_MOM_BETA_WINDOW = _resid_mom_cfg.get("beta_window", 60)
 RESID_MOM_WINDOW = _resid_mom_cfg.get("window", 252)
 RESID_MOM_SKIP_DAYS = _resid_mom_cfg.get("skip_days", 21)

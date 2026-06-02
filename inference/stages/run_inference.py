@@ -15,6 +15,7 @@ import numpy as np
 import pandas as pd
 
 import config as cfg
+from inference.level_neutralization import apply_cross_sectional_neutralization
 from inference.pipeline import PipelineContext, PipelineAbort
 from model.momentum_scorer import predict_dict as _momentum_scorer_predict_dict
 from model.stance_classifier import classify_stance
@@ -955,6 +956,7 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
         p["combined_rank"] = i + 1
 
     _rescale_cross_sectional(ctx)
+    _apply_level_neutralization(ctx)
     log.info(
         "Meta-inference complete: %d predictions, %d skipped, "
         "%d tickers had NaN meta-features (neutral-imputed)",
@@ -1074,5 +1076,35 @@ def _rescale_cross_sectional(ctx: "PipelineContext") -> None:
         p["p_down"] = round(p_down, 4)
         p["predicted_direction"] = direction
         p["prediction_confidence"] = round(confidence, 4)
+
+
+def _apply_level_neutralization(ctx: "PipelineContext") -> None:
+    """Cross-sectional level-neutralization of predicted_alpha (L4487).
+
+    Runs after rank + confidence are finalized (combined_rank is invariant
+    under a constant shift, so centering here doesn't perturb ranking). Stamps
+    the observe block on ``ctx.level_neutralization`` for write_output to emit.
+    Best-effort: a failure degrades to the raw (today's) behavior with a loud
+    WARN rather than killing inference — when the flag is off this is pure
+    observability, and when on the executor's hold-book safeguard remains the
+    backstop. Never raises.
+    """
+    try:
+        enabled = bool(getattr(cfg, "XSEC_DEMEAN_ALPHA_ENABLED", False))
+        label_clip = getattr(cfg, "LABEL_CLIP", 0.15)
+        ctx.level_neutralization = apply_cross_sectional_neutralization(
+            ctx.predictions,
+            enabled=enabled,
+            calibrator=getattr(ctx, "calibrator", None),
+            label_clip=label_clip,
+        )
+    except Exception:  # noqa: BLE001 — observe transform must not kill inference
+        log.warning(
+            "Level-neutralization (L4487) raised — degrading to raw predicted_"
+            "alpha for this batch. Live fields untouched.",
+            exc_info=True,
+        )
+        ctx.level_neutralization = {"enabled": False, "applied": False,
+                                    "reason": "exception"}
 
 

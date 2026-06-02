@@ -178,6 +178,14 @@ residual_momentum:
   vol_window: 20                 # residual-return volatility window (vol scaling)
   change_window: 21              # momentum-change (acceleration) window
 
+# ── Cross-sectional level-neutralization of predicted_alpha (L4487) ───────────
+# Removes the common-mode (cross-sectional mean) from predicted_alpha so an
+# adverse-macro day can't flush the whole book to SPY. Observe-gated: when
+# false, inference is byte-identical and the level_neutralization observe block
+# just records what centering WOULD do. Flip to true only after 2-3 firings.
+level_neutralization:
+  enabled: false                 # observe gate — producer-side single source of truth
+
 # ── Feature engineering parameters ────────────────────────────────────────────
 features:
   rsi_period: 14                   # RSI lookback period

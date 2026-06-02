@@ -124,6 +124,15 @@ class PipelineContext:
     drawdown_effective_regime: Optional[str] = None
     drawdown_protective_severity: Optional[int] = None
 
+    # ── Cross-sectional level-neutralization (set by run_inference; L4487) ───
+    # Observe block from inference.level_neutralization: {enabled, applied,
+    # xsec_mean_removed, n_direction_flips, direction_skew_raw/_centered}.
+    # Emitted into metrics.json + predictions.json by write_output. None until
+    # the neutralization pass runs. Observe-gated by cfg.XSEC_DEMEAN_ALPHA_
+    # ENABLED — when False, live fields are byte-identical and this just
+    # records what centering WOULD do.
+    level_neutralization: Optional[dict] = None
+
     def near_timeout(self) -> bool:
         """Check if we're nearing the Lambda soft timeout."""
         elapsed = _time.monotonic() - self.start_ts

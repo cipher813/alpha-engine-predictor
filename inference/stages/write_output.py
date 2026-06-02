@@ -368,6 +368,7 @@ def write_predictions(
     dry_run: bool = False,
     veto_threshold: float | None = None,
     fd=None,
+    level_neutralization: dict | None = None,
 ) -> None:
     """
     Write predictions JSON to S3 at both the dated key and latest.json.
@@ -447,6 +448,11 @@ def write_predictions(
         # strongly-biased batch (passed=False) must not drive an optimizer
         # rotation — the executor holds the current book instead.
         "output_distribution_gate": gate_block,
+        # Cross-sectional level-neutralization observe block (L4487). Additive;
+        # records the common-mode mean removed + the raw-vs-centered direction
+        # diff. When its `applied` is True the predictions' predicted_alpha is
+        # already centered (the optimizer + gbm_veto inherit it).
+        "level_neutralization": level_neutralization,
         "predictions": predictions,
     }
 
@@ -462,6 +468,9 @@ def write_predictions(
         # saturation_rate, stdev_p_up, direction_skew) regardless of
         # whether the gate was in blocking mode this run.
         "output_distribution_gate": gate_block,
+        # Cross-sectional level-neutralization observe block (L4487) — forensic
+        # trail alongside the gate (the two share the same skew→flush root).
+        "level_neutralization": level_neutralization,
     }
 
     predictions_json = json.dumps(output, indent=2)
@@ -1226,7 +1235,8 @@ def run(ctx: PipelineContext) -> None:
 
     # ── Write predictions ────────────────────────────────────────────────────
     write_predictions(ctx.predictions, ctx.date_str, ctx.bucket, metrics,
-                      dry_run=ctx.dry_run, veto_threshold=veto_thresh, fd=ctx.fd)
+                      dry_run=ctx.dry_run, veto_threshold=veto_thresh, fd=ctx.fd,
+                      level_neutralization=getattr(ctx, "level_neutralization", None))
 
     # ── Send email ───────────────────────────────────────────────────────────
     # Goal: exactly one morning briefing per day, reflecting the final merged
