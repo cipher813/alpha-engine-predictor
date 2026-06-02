@@ -33,22 +33,6 @@ training:
   # to restore legacy auto-promote. Env override: TRAINING_AUTO_PROMOTE_ENABLED.
   auto_promote_enabled: false
   batch_size: 256                  # training batch size
-# ── Model zoo (L4488c) — declarative variant specs for champion/challenger ───
-# Each spec is a config OVERLAY trained via `python -m training.model_zoo
-# --spec <id>` → registers a CHALLENGER (challenger-first; never overwrites the
-# champion). `overrides` keys must be in the model_zoo allowlist (FORWARD_DAYS /
-# RESIDUAL_MOMENTUM_ENABLED / XSEC_DEMEAN_ALPHA_ENABLED / MODEL_VERSION_LABEL).
-# Empty by default; L4488d seeds the first real variants. Example:
-# model_specs:
-#   - id: residual-momentum
-#     model_version_label: spec-residual-mom
-#     status: active                 # active | retired
-#     overrides: {RESIDUAL_MOMENTUM_ENABLED: true}
-#   - id: horizon-60d
-#     model_version_label: spec-60d
-#     status: active
-#     overrides: {FORWARD_DAYS: 60}
-model_version_label: v3.0-meta     # base label; a spec overrides it per-run
   learning_rate: 1.0e-3            # AdamW learning rate
   weight_decay: 1.0e-5             # L2 regularization
   max_epochs: 50                   # max training epochs
@@ -218,6 +202,23 @@ level_neutralization:
 shadow_versions:
   enabled: true                  # observe-only (challengers never trade)
   max_n: 3                       # max challengers shadowed per inference run
+
+# ── Model zoo (L4488c) — declarative variant specs for champion/challenger ───
+# Each spec is a config OVERLAY trained via `python -m training.model_zoo
+# --spec <id>` → registers a CHALLENGER (challenger-first; never overwrites the
+# champion). `overrides` keys must be in the model_zoo allowlist (FORWARD_DAYS /
+# RESIDUAL_MOMENTUM_ENABLED / XSEC_DEMEAN_ALPHA_ENABLED / MODEL_VERSION_LABEL).
+# Empty by default; L4488d seeds the first real variants. Example:
+# model_specs:
+#   - id: residual-momentum
+#     model_version_label: spec-residual-mom
+#     status: active                 # active | retired
+#     overrides: {RESIDUAL_MOMENTUM_ENABLED: true}
+#   - id: horizon-60d
+#     model_version_label: spec-60d
+#     status: active
+#     overrides: {FORWARD_DAYS: 60}
+model_version_label: v3.0-meta     # base label; a spec overrides it per-run
 
 # ── Feature engineering parameters ────────────────────────────────────────────
 features:
