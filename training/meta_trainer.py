@@ -3521,7 +3521,10 @@ def run_meta_training(
             # Write manifest
             manifest = {
                 "date": date_str,
-                "version": "v3.0-meta",
+                # L4488c: the model-zoo spec sets MODEL_VERSION_LABEL so each
+                # variant registers under its own version_id ({label}-{date}-{fp})
+                # — distinct challengers on the leaderboard. Default = base label.
+                "version": getattr(cfg, "MODEL_VERSION_LABEL", "v3.0-meta"),
                 "peak_rss_mb": peak_rss_mb,
                 # Per-regime empirical up-rate of REALIZED canonical alpha
                 # (independent of calibrator) — observability for the
@@ -3810,7 +3813,7 @@ def run_meta_training(
             # subscription list.
             feature_list = {
                 "trained_at": date_str,
-                "version": "v3.0-meta",
+                "version": getattr(cfg, "MODEL_VERSION_LABEL", "v3.0-meta"),  # L4488c spec label
                 # W2: reflect the ACTUAL L2 feature set the Ridge was fit on
                 # (identical to META_FEATURES while the observe gate is closed).
                 "l2_features": list(TRAIN_META_FEATURES),
@@ -3947,7 +3950,7 @@ def run_meta_training(
     )
 
     return {
-        "model_version": "v3.0-meta",
+        "model_version": getattr(cfg, "MODEL_VERSION_LABEL", "v3.0-meta"),  # L4488c spec label
         "promoted": promoted,
         "promoted_mode": "meta" if promoted else None,
         "elapsed_s": round(elapsed_s, 1),

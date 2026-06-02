@@ -411,6 +411,18 @@ TRAINING_AUTO_PROMOTE_ENABLED = _flag_env_or_yaml(
     "TRAINING_AUTO_PROMOTE_ENABLED", _promote_cfg.get("auto_promote_enabled", False)
 )
 
+# ── Model zoo (L4488c) ──────────────────────────────────────────────────────
+# Declarative variant specs for champion/challenger rotation. Each spec is a
+# config OVERLAY over the existing training knobs — the model zoo runs a spec
+# via `python -m training.model_zoo --spec <id>` (challenger-first, so it
+# registers a challenger, never overwrites the champion). MODEL_VERSION_LABEL
+# is the per-run label the spec sets so each variant gets its own registry
+# version_id ({label}-{date}-{fingerprint}); default = the base label. See
+# training/model_zoo.py for the override allowlist + the runtime override is
+# applied around the train call, not persisted.
+MODEL_SPECS = _cfg.get("model_specs", []) or []
+MODEL_VERSION_LABEL = _cfg.get("model_version_label", "v3.0-meta")
+
 # ── Champion/challenger Phase 1 shadow runner (L4469) ───────────────────────
 # After the live (champion) inference writes predictions/{date}.json, the
 # shadow runner re-scores the SAME prices/universe with each registered
