@@ -16,9 +16,12 @@ not bound-at-import), so mutating them here is how a spec takes effect without
 threading a config object through the whole trainer.
 
 Specs are declared in ``predictor.yaml`` under ``model_specs:``. Run one with
-``python -m training.model_zoo --bucket B --spec <id>`` or every active spec
-with ``--all-active`` (sequential — each is ~one full training run, so pace them
-as experiments allow rather than all in one Saturday SF).
+``python -m training.model_zoo --bucket B --spec <id>``; every active spec with
+``--all-active`` (sequential); or the bounded weekly cadence with
+``--weekly-rotation`` (L4488g) — trains only the ``MODEL_ZOO_WEEKLY_BUDGET``
+(default 3) STALEST active specs so the zoo refreshes round-robin without
+running every spec every week. Each spec is ~one full training run, so the
+rotation is how the zoo stays current on a tenable compute budget.
 
 Limitation (documented): the override only affects knobs read via ``cfg.X`` at
 call time. A horizon change (``FORWARD_DAYS``) additionally needs any
@@ -144,6 +147,105 @@ def train_all_active(
     return results
 
 
+def _resolve_label(spec: dict) -> str:
+    """The registry ``model_version`` a spec's trained versions carry.
+
+    Mirrors ``train_spec`` EXACTLY: a ``MODEL_VERSION_LABEL`` in the spec's own
+    ``overrides`` wins (it's applied verbatim and `setdefault` won't replace it),
+    else the spec's declared ``model_version_label``, else ``spec-<id>``. The
+    trainer writes this as ``manifest["version"]`` → the registry's
+    ``model_version`` (verified meta_trainer.py:3537), so it's how the rotation
+    maps a registered version back to its spec.
+    """
+    ov = spec.get("overrides", {})
+    if "MODEL_VERSION_LABEL" in ov:
+        return ov["MODEL_VERSION_LABEL"]
+    return spec.get("model_version_label", f"spec-{spec.get('id')}")
+
+
+def select_rotation_specs(
+    specs: list, registered_versions: list, budget: int,
+) -> list[str]:
+    """Pick the ``budget`` STALEST active spec ids for a weekly rotation.
+
+    Staleness = the date of a spec's NEWEST registered version (via the registry
+    lineage, grouped by ``model_version``). A spec with NO registered version is
+    maximally stale (never trained → trained first). Ties break on spec id for
+    deterministic, reproducible selection. Pure (registry list injected) so the
+    policy is unit-testable without S3.
+    """
+    active = [s for s in specs
+              if s.get("status", "active") == "active" and s.get("id")]
+    newest: dict[str, str] = {}
+    for v in registered_versions:
+        mv, d = v.get("model_version"), v.get("date")
+        if mv and d and d > newest.get(mv, ""):
+            newest[mv] = d
+
+    def _key(s: dict):
+        last = newest.get(_resolve_label(s))
+        # never-registered (last is None) sorts first; then oldest date first.
+        return (last is not None, last or "", s["id"])
+
+    return [s["id"] for s in sorted(active, key=_key)[:max(0, budget)]]
+
+
+def _list_registry_versions(bucket: str) -> list:
+    """Best-effort registry enumeration for the rotation. A registry read
+    failure must not block training — return [] (every spec then looks
+    never-trained, so the scheduler still trains the first ``budget`` by id)."""
+    try:
+        import boto3
+
+        from model.registry import list_versions
+        return list_versions(boto3.client("s3"), bucket)
+    except Exception:  # noqa: BLE001 — staleness is best-effort, never fatal
+        log.warning(
+            "model_zoo rotation: could not read registry — falling back to "
+            "id-ordered selection (staleness unavailable).", exc_info=True,
+        )
+        return []
+
+
+def train_weekly_rotation(
+    bucket: str,
+    *,
+    budget: int | None = None,
+    date_str: str | None = None,
+    dry_run: bool = False,
+    specs: list | None = None,
+    train_fn=None,
+    registered_versions: list | None = None,
+) -> dict:
+    """Train the ``budget`` stalest active specs (the weekly rotation). Bounds
+    compute vs ``train_all_active`` while refreshing the whole zoo round-robin.
+    ``registered_versions`` is injectable for tests; otherwise read best-effort
+    from the registry. One spec's failure never aborts the rest."""
+    specs = specs if specs is not None else getattr(cfg, "MODEL_SPECS", [])
+    if budget is None:
+        budget = int(getattr(cfg, "MODEL_ZOO_WEEKLY_BUDGET", 3))
+    if registered_versions is None:
+        registered_versions = _list_registry_versions(bucket)
+    selected = select_rotation_specs(specs, registered_versions, budget)
+    n_active = sum(1 for s in specs
+                   if s.get("status", "active") == "active" and s.get("id"))
+    log.info(
+        "model_zoo rotation: budget=%d → training %d/%d active spec(s): %s",
+        budget, len(selected), n_active, selected,
+    )
+    results: dict = {}
+    for sid in selected:
+        try:
+            results[sid] = train_spec(
+                sid, bucket, date_str=date_str, dry_run=dry_run,
+                specs=specs, train_fn=train_fn,
+            )
+        except Exception as exc:  # noqa: BLE001 — one variant must not block the rest
+            log.warning("model_zoo: spec %s failed (continuing): %s", sid, exc, exc_info=True)
+            results[sid] = {"status": "error", "error": str(exc)}
+    return results
+
+
 def _cli() -> None:
     p = argparse.ArgumentParser(
         description="Model zoo: train a declared variant spec as a challenger (L4488c)."
@@ -151,6 +253,11 @@ def _cli() -> None:
     p.add_argument("--bucket", required=True)
     p.add_argument("--spec", default=None, help="Spec id to train.")
     p.add_argument("--all-active", action="store_true", help="Train every active spec (sequential).")
+    p.add_argument("--weekly-rotation", action="store_true",
+                   help="Train the N stalest active specs (N=--budget or "
+                        "MODEL_ZOO_WEEKLY_BUDGET) — the bounded weekly cadence (L4488g).")
+    p.add_argument("--budget", type=int, default=None,
+                   help="Override the rotation budget (default MODEL_ZOO_WEEKLY_BUDGET).")
     p.add_argument("--date", default=None)
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--list", action="store_true", help="List declared specs and exit.")
@@ -160,12 +267,16 @@ def _cli() -> None:
         for s in getattr(cfg, "MODEL_SPECS", []):
             print(f"{s.get('status', 'active'):8s} {s.get('id')}  overrides={s.get('overrides', {})}")
         return
-    if args.all_active:
+    if args.weekly_rotation:
+        train_weekly_rotation(
+            args.bucket, budget=args.budget, date_str=args.date, dry_run=args.dry_run,
+        )
+    elif args.all_active:
         train_all_active(args.bucket, date_str=args.date, dry_run=args.dry_run)
     elif args.spec:
         train_spec(args.spec, args.bucket, date_str=args.date, dry_run=args.dry_run)
     else:
-        p.error("provide --spec <id>, --all-active, or --list")
+        p.error("provide --spec <id>, --all-active, --weekly-rotation, or --list")
 
 
 if __name__ == "__main__":

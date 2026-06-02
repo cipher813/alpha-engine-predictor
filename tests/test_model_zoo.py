@@ -120,3 +120,72 @@ def test_train_all_active_skips_retired_and_continues_on_failure():
     assert results["resid"]["status"] == "ok"
     assert results["h60"]["status"] == "error"  # failure captured, didn't abort
     assert "old" not in results
+
+
+# ── L4488g: weekly rotation ──────────────────────────────────────────────────
+
+
+def test_resolve_label_overrides_then_declared_then_default():
+    # overrides.MODEL_VERSION_LABEL wins (train_spec applies it verbatim)…
+    assert mz._resolve_label(
+        {"id": "x", "overrides": {"MODEL_VERSION_LABEL": "spec-custom"}}
+    ) == "spec-custom"
+    # …else the declared model_version_label…
+    assert mz._resolve_label({"id": "h60", "model_version_label": "spec-60d"}) == "spec-60d"
+    # …else spec-<id>.
+    assert mz._resolve_label({"id": "resid"}) == "spec-resid"
+
+
+def test_select_rotation_never_trained_first_then_id_tiebreak():
+    # No registry history → both active specs are maximally stale; id tiebreak.
+    sel = mz.select_rotation_specs(_SPECS, [], budget=1)
+    assert sel == ["h60"]                       # "h60" < "resid"
+    assert mz.select_rotation_specs(_SPECS, [], budget=5) == ["h60", "resid"]
+    # Retired spec never selected.
+    assert "old" not in mz.select_rotation_specs(_SPECS, [], budget=5)
+
+
+def test_select_rotation_prefers_never_trained_over_trained():
+    # resid trained recently, h60 never → h60 (never-trained) is stalest.
+    reg = [{"model_version": "spec-resid", "date": "2026-06-01"}]
+    assert mz.select_rotation_specs(_SPECS, reg, budget=1) == ["h60"]
+
+
+def test_select_rotation_oldest_version_first_using_newest_per_spec():
+    # Both trained; resid's NEWEST version is older than h60's → resid first.
+    reg = [
+        {"model_version": "spec-resid", "date": "2026-05-01"},
+        {"model_version": "spec-resid", "date": "2026-05-20"},  # newest for resid
+        {"model_version": "spec-60d", "date": "2026-06-01"},
+    ]
+    assert mz.select_rotation_specs(_SPECS, reg, budget=1) == ["resid"]
+    assert mz.select_rotation_specs(_SPECS, reg, budget=2) == ["resid", "h60"]
+
+
+def test_train_weekly_rotation_trains_only_budget_stalest():
+    trained = []
+
+    def _fake_train(bucket, *, date_str=None, dry_run=False):
+        trained.append(cfg.MODEL_VERSION_LABEL)
+        return {"status": "ok"}
+
+    reg = [{"model_version": "spec-60d", "date": "2026-06-01"}]  # h60 fresh, resid never
+    results = mz.train_weekly_rotation(
+        "bkt", budget=1, specs=_SPECS, train_fn=_fake_train, registered_versions=reg,
+    )
+    # Budget=1 → only the stalest (resid, never trained) runs.
+    assert set(results) == {"resid"}
+    assert trained == ["spec-resid"]
+
+
+def test_train_weekly_rotation_continues_past_failure():
+    def _fake_train(bucket, *, date_str=None, dry_run=False):
+        if cfg.FORWARD_DAYS == 60:
+            raise RuntimeError("h60 boom")
+        return {"status": "ok"}
+
+    results = mz.train_weekly_rotation(
+        "bkt", budget=5, specs=_SPECS, train_fn=_fake_train, registered_versions=[],
+    )
+    assert results["h60"]["status"] == "error"
+    assert results["resid"]["status"] == "ok"
