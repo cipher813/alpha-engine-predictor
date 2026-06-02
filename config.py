@@ -422,6 +422,13 @@ TRAINING_AUTO_PROMOTE_ENABLED = _flag_env_or_yaml(
 # applied around the train call, not persisted.
 MODEL_SPECS = _cfg.get("model_specs", []) or []
 MODEL_VERSION_LABEL = _cfg.get("model_version_label", "v3.0-meta")
+# L4488g: weekly model-zoo ROTATION budget — how many challenger specs the
+# rotation scheduler (`model_zoo --weekly-rotation`) trains per run. Bounds
+# Saturday compute (each spec is ~one full train); the scheduler picks the N
+# STALEST active specs (oldest/absent registered version) so the whole zoo is
+# refreshed round-robin over ~ceil(len(active)/N) weeks. The champion retrain
+# is separate + always-on; this budget is the challenger zoo on top of it.
+MODEL_ZOO_WEEKLY_BUDGET = int(_cfg.get("model_zoo_weekly_budget", 3))
 
 # ── Champion/challenger Phase 1 shadow runner (L4469) ───────────────────────
 # After the live (champion) inference writes predictions/{date}.json, the

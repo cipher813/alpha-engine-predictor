@@ -219,6 +219,9 @@ shadow_versions:
 #     status: active
 #     overrides: {FORWARD_DAYS: 60}
 model_version_label: v3.0-meta     # base label; a spec overrides it per-run
+# L4488g: weekly rotation budget — `model_zoo --weekly-rotation` trains only the
+# N stalest active specs per run (round-robin refresh) to bound Saturday compute.
+model_zoo_weekly_budget: 3
 
 # ── Feature engineering parameters ────────────────────────────────────────────
 features:
