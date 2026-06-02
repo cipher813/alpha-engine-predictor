@@ -156,7 +156,11 @@ walk_forward:
   test_window_trading_days: 126  # ~6 calendar months of trading days per fold
   min_train_days: 504            # ~2 years minimum training (trading days)
   purge_days: 21                 # matches forward_days (prevent label leakage)
-  embargo_days: 0                # W1.1b (L4469) post-test embargo; 0=current (no-op in forward-WF), W1.4 raises to ~ceil(0.01*T) with the CPCV cutover
+  # L4488a post-test embargo (López de Prado). Leave UNSET → auto = the label
+  # horizon (forward_days / per-horizon h), the correct overlapping-label embargo
+  # that closes the CPCV after-test-boundary leak. Set an explicit int only to
+  # override (e.g. 0 reproduces the legacy leaky behavior for comparison).
+  # embargo_days: 21
   cpcv_n_groups: 6               # W1.2 (L4469) combinatorial purged CV — date groups; C(6,2)=15 OOS fits/run
   cpcv_k_test: 2                 # W1.2 (L4469) test groups per CPCV combination
   dsr_n_trials: 10               # W1.3 (L4469) Deflated-Sharpe trial count (placeholder until cumulative trial tracking — W1.3b)

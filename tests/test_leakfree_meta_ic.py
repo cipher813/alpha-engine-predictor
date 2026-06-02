@@ -86,6 +86,29 @@ def test_embargo_drops_post_test_train_dates():
         assert len(tr1) <= len(tr0)
 
 
+def test_embargo_none_auto_resolves_to_horizon():
+    """L4488a: embargo_days=None (the new default) auto-resolves to the label
+    horizon (forward_days) — the correct overlapping-label embargo — while an
+    explicit int (incl. 0) still overrides. Verified via the emitted value."""
+    X, y, dates = _make_panel(n_dates=200, n_names=20, signal=0.3, seed=1)
+    auto = leakfree_meta_oos_ic(
+        X, y, dates, fit_predict_fn=_ridge_fit_predict,
+        forward_days=21, embargo_days=None, n_folds=4, min_test=10,
+    )
+    assert auto["embargo_days"] == 21  # None → forward_days
+    explicit0 = leakfree_meta_oos_ic(
+        X, y, dates, fit_predict_fn=_ridge_fit_predict,
+        forward_days=21, embargo_days=0, n_folds=4, min_test=10,
+    )
+    assert explicit0["embargo_days"] == 0  # explicit override honored
+
+    cpcv_auto = cpcv_meta_oos_ic(
+        X, y, dates, fit_predict_fn=_ridge_fit_predict,
+        forward_days=21, embargo_days=None, n_groups=6, k_test=2,
+    )
+    assert cpcv_auto["embargo_days"] == 21
+
+
 # ── leakfree_meta_oos_ic: the headline leak-free behavior ─────────────────
 
 

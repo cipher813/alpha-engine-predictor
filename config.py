@@ -284,15 +284,20 @@ WF_TEST_WINDOW_DAYS = _wf_cfg.get(
 )
 WF_MIN_TRAIN_DAYS = _wf_cfg.get("min_train_days", 504)
 WF_PURGE_DAYS = _wf_cfg.get("purge_days", 5)
-# W1.1b (ROADMAP L4469): post-test embargo (López de Prado). Trading-day count
-# dropped from training AFTER each test block. STRUCTURALLY A NO-OP in the
-# current expanding-forward walk-forward (train is always strictly before the
-# test block, so there is no train-after-test within a fold) — it becomes
-# load-bearing in W1.2 (combinatorial purged CV, which interleaves test
-# groups). Read by the leak-free-meta-IC diagnostic (training/leakfree_meta_ic)
-# and the future CPCV path. Default 0 = current behavior; W1.4 raises it to
-# ~ceil(0.01·T) alongside the CPCV cutover.
-WF_EMBARGO_DAYS = _wf_cfg.get("embargo_days", 0)
+# W1.1b / L4488a (ROADMAP): post-test embargo (López de Prado). Trading-day
+# count dropped from training AFTER each test block. A no-op in the single-path
+# expanding-forward walk-forward (train is always before test) but LOAD-BEARING
+# in CPCV (W1.2), which interleaves test groups → train rows sit just AFTER an
+# interior test block and leak via OVERLAPPING LABELS (a train row at b+k has a
+# forward label that overlaps the test's late-obs labels for k ≤ horizon).
+# Default is now **None = auto = the label horizon** (forward_days / the
+# per-horizon h) — the correct overlapping-label embargo that makes the CPCV
+# exclusion symmetric. (The old default 0 left that boundary open, inflating the
+# leak-free reads — more at longer horizons, a confound for the 60d-vs-21d call;
+# the prior "~0.01·T" target was only the residual serial-correlation buffer,
+# undersized for overlapping labels.) An explicit integer in predictor.yaml
+# still overrides (e.g. 0 to reproduce the legacy leaky behavior).
+WF_EMBARGO_DAYS = _wf_cfg.get("embargo_days", None)
 # W1.2 (ROADMAP L4469): combinatorial purged CV (López de Prado Ch. 12). The
 # meta rows' unique dates split into WF_CPCV_N_GROUPS contiguous groups; every
 # combination of WF_CPCV_K_TEST test groups yields one purged+embargoed OOS fit

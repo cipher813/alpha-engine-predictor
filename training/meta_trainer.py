@@ -1992,7 +1992,8 @@ def run_meta_training(
             "overfit": _rm_overfit,
             "enabled_in_stack": _resid_mom_enabled,
             "forward_days": cfg.FORWARD_DAYS,
-            "embargo_days": int(getattr(cfg, "WF_EMBARGO_DAYS", 0)),
+            # L4488a: WF_EMBARGO_DAYS default is now None (=auto=horizon); record the effective value.
+            "embargo_days": int(cfg.WF_EMBARGO_DAYS if getattr(cfg, "WF_EMBARGO_DAYS", None) is not None else cfg.FORWARD_DAYS),
         }
         log.info(
             "W2 residual-momentum L1 leak-free read (OBSERVE, NOT gated): "
@@ -2270,7 +2271,8 @@ def run_meta_training(
                 "downside": _fm_down,
                 "overfit": _fm_over,
                 "forward_days": cfg.FORWARD_DAYS,
-                "embargo_days": int(getattr(cfg, "WF_EMBARGO_DAYS", 0)),
+                # L4488a: WF_EMBARGO_DAYS default is now None (=auto=horizon); record the effective value.
+                "embargo_days": int(cfg.WF_EMBARGO_DAYS if getattr(cfg, "WF_EMBARGO_DAYS", None) is not None else cfg.FORWARD_DAYS),
             }
             # Add-one-in marginal read: append factor_momentum_ratio to meta_X
             # (NaN→0 neutral, matching the scorer posture) and run the SAME

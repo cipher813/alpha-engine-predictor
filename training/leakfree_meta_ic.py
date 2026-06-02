@@ -92,6 +92,8 @@ def expanding_wf_folds(
     test), wired here for parity with the W1.2 CPCV path that interleaves
     test groups.
     """
+    if embargo_days is None:  # L4488a: auto = label horizon (overlapping-label embargo)
+        embargo_days = forward_days
     n = len(sorted_dates)
     # Shrink n_folds if the OOS span is too short to honor min_test per fold.
     if n < (n_folds + 1) * max(min_test, 1):
@@ -123,7 +125,7 @@ def leakfree_meta_oos_ic(
     *,
     fit_predict_fn: Callable,
     forward_days: int,
-    embargo_days: int = 0,
+    embargo_days: int | None = None,
     n_folds: int = 5,
     min_test: int = 21,
     bootstrap_fn: Callable | None = None,
@@ -145,6 +147,10 @@ def leakfree_meta_oos_ic(
     are numpy arrays (NOT JSON-serializable) — the caller must ``pop`` them
     before the dict reaches the manifest.
     """
+    # L4488a: embargo defaults to the label horizon (the correct overlapping-
+    # label embargo). None = auto; an explicit int (incl. 0) still overrides.
+    if embargo_days is None:
+        embargo_days = forward_days
     meta_X = np.asarray(meta_X, dtype=float)
     meta_y = np.asarray(meta_y, dtype=float)
     row_dates = np.asarray(row_dates)
@@ -252,7 +258,7 @@ def cpcv_meta_oos_ic(
     *,
     fit_predict_fn: Callable,
     forward_days: int,
-    embargo_days: int = 0,
+    embargo_days: int | None = None,
     n_groups: int = 6,
     k_test: int = 2,
     min_train: int = 50,
@@ -272,6 +278,12 @@ def cpcv_meta_oos_ic(
     tests one easily-overfit path; CPCV gives a distribution, which is the input
     to W1.3's Deflated-Sharpe / PBO promotion gate. OBSERVE ONLY.
     """
+    # L4488a: embargo defaults to the label horizon — the overlapping-label
+    # embargo that closes the after-test-boundary leak for interior test groups
+    # (with embargo<forward_days, train rows at b+1..b+forward_days leak into
+    # the test's late-obs labels). None = auto; explicit int (incl. 0) overrides.
+    if embargo_days is None:
+        embargo_days = forward_days
     meta_X = np.asarray(meta_X, dtype=float)
     meta_y = np.asarray(meta_y, dtype=float)
     row_dates = np.asarray(row_dates)
@@ -357,7 +369,7 @@ def leakfree_horizon_ic_curve(
     row_dates,
     *,
     fit_predict_fn: Callable,
-    embargo_days: int = 0,
+    embargo_days: int | None = None,
     **kwargs,
 ) -> dict:
     """W3.2 (L4469): leak-free cross-sectional IC at each horizon.
@@ -379,7 +391,10 @@ def leakfree_horizon_ic_curve(
         aligned row-for-row to ``meta_X``. Non-finite rows are masked inside.
     row_dates : per-row dates (for the cross-sectional / purge folds).
     fit_predict_fn : the injected L2 estimator (refit per fold).
-    embargo_days : post-test embargo (López de Prado); 0 = current forward-WF.
+    embargo_days : post-test embargo (López de Prado). None (default) → auto =
+        each horizon's own ``h`` (the overlapping-label embargo) — resolved
+        per-horizon inside ``leakfree_meta_oos_ic`` since ``forward_days=h`` is
+        passed below; an explicit int overrides for all horizons (L4488a).
 
     Returns ``{f"{h}d": <leakfree_meta_oos_ic dict>}`` — observe-only; gates
     nothing. Extra kwargs pass through to ``leakfree_meta_oos_ic``.
