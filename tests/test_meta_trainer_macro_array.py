@@ -23,6 +23,7 @@ import sys
 
 import numpy as np
 import pandas as pd
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -115,15 +116,17 @@ class TestBuildMacroArray:
         assert X.shape == (10, 2)
         assert np.isnan(X).all()
 
-    def test_output_dtype_is_float64(self):
+    def test_output_dtype_is_float32(self):
         unique_dates = pd.date_range("2018-01-01", periods=10, freq="B")
         macro_features = ["spy_20d_return"]
         regime_df = _build_synthetic_regime_df(unique_dates, macro_features)
         all_dates = list(unique_dates)
         X = _build_macro_array(all_dates, regime_df, macro_features)
-        # float64 (not float32) so the downstream z-score normalization
-        # can compute high-precision rolling stats. Caller can downcast.
-        assert X.dtype == np.float64
+        # float32 (not float64): the only consumer is the z-score normalize
+        # (itself float32) then concat with the float32 X_vol block, so
+        # float64 precision is wasted and doubles a 2M-row macro array's
+        # RSS on the 4 GB training spot (Step 4b OOM, 2026-06-01).
+        assert X.dtype == np.float32
 
     def test_subset_macro_features(self):
         # regime_df has 6 columns; caller only requests 2.
@@ -154,6 +157,7 @@ class TestBuildMacroArray:
         X = _build_macro_array(reversed_dates, regime_df, macro_features)
 
         # Each row's value should match the regime_df value for that date
+        # (float32 tolerance — the array is now float32 per the OOM fix).
         for i, d in enumerate(reversed_dates):
             expected = float(regime_df.at[d, "spy_20d_return"])
-            assert X[i, 0] == expected
+            assert X[i, 0] == pytest.approx(expected, rel=1e-6)

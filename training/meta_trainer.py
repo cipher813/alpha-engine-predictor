@@ -16,6 +16,7 @@ Layer 2:
 
 from __future__ import annotations
 
+import gc
 import json
 import logging
 import tempfile
@@ -553,11 +554,16 @@ def _build_macro_array(
             order. The output array preserves this column order.
 
     Returns:
-        (N, n_macros) float64 array.
+        (N, n_macros) float32 array. float32 (not float64) because the
+        only consumer is ``time_series_zscore_normalize`` (which itself
+        returns float32) and then concatenation with the float32 X_vol
+        block (Step 7e) — float64 precision is wasted here and doubles a
+        2M-row macro array's RSS on the training box (OOM hotspot at
+        Step 4b on the 4 GB spot, 2026-06-01).
     """
     n = len(all_dates)
     n_macros = len(macro_features)
-    X_macro = np.full((n, n_macros), np.nan, dtype=np.float64)
+    X_macro = np.full((n, n_macros), np.nan, dtype=np.float32)
 
     if regime_features_df.empty:
         return X_macro
@@ -565,7 +571,7 @@ def _build_macro_array(
     macro_subset = regime_features_df[macro_features]
     for i, d in enumerate(all_dates):
         if d in macro_subset.index:
-            X_macro[i] = macro_subset.loc[d].to_numpy(dtype=np.float64)
+            X_macro[i] = macro_subset.loc[d].to_numpy(dtype=np.float32)
 
     return X_macro
 
@@ -1053,6 +1059,14 @@ def run_meta_training(
     del y_fwd_unsorted, y_fwd_horizons_unsorted, y_fwd_tb_unsorted
     del y_fwd_tb_touch_unsorted, X_resid_mom_unsorted, factor_mom_unsorted
 
+    # Force a collection so the just-freed unsorted arrays (~2M rows each)
+    # are reclaimed before the regime-feature build + macro-array
+    # allocation in Step 4b — the OOM hotspot on the 4 GB spot
+    # (2026-06-01). del alone marks them collectable; gc.collect() returns
+    # the pages so peak RSS doesn't stack the sorted arrays on top of the
+    # not-yet-reclaimed unsorted ones.
+    gc.collect()
+
     # Winsorize
     if cfg.LABEL_CLIP:
         y_fwd = np.clip(y_fwd, -cfg.LABEL_CLIP, cfg.LABEL_CLIP)
@@ -1179,6 +1193,10 @@ def run_meta_training(
     X_macro_zscored = time_series_zscore_normalize(
         X_macro_raw, all_dates, window=cfg.MACRO_NORM_WINDOW,
     )
+    # X_macro_raw's only consumer is the z-score above; release the raw
+    # 2M-row macro array immediately so it doesn't linger through the
+    # research-calibrator load + walk-forward loop (Step 4b OOM hotspot).
+    del X_macro_raw
     log.info(
         "Macro feature array (Stage 1b): %d rows × %d cols, "
         "rolling z-score window=%d, finite_pct=%.2f",
