@@ -5,7 +5,10 @@
 # (root file used by training EC2 + local dev; this file used by the
 # Dockerfile in the Lambda image). Drift between them shipped a stale
 # lib to prod on 2026-05-07.
-alpha-engine-lib[arcticdb,flow_doctor] @ git+https://github.com/cipher813/alpha-engine-lib@v0.42.0
+# Inference Lambda does NOT import risk_model (factor_risk_xs / [quant-xs]) — that
+# runs only in PredictorTraining on EC2 — so this keeps the leaner extras; the
+# lockstep test compares only the version tag, which must match requirements.txt.
+alpha-engine-lib[arcticdb,flow_doctor] @ git+https://github.com/cipher813/alpha-engine-lib@v0.47.0
 numpy>=1.24.0,<2
 pandas>=2.0.0
 pyarrow>=14.0.0
