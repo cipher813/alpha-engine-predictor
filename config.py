@@ -379,11 +379,21 @@ RESIDUAL_MOMENTUM_ENABLED = _resid_mom_cfg.get("enabled", False)
 # mean + skew-correction (observe-before-cutover). Producer-side single source
 # of truth — the executor optimizer + gbm_veto inherit the centered value.
 def _flag_env_or_yaml(env_name: str, yaml_value: bool) -> bool:
-    """Boolean flag with an env-var override (live-toggle, no redeploy) falling
-    back to the predictor.yaml value. An explicit env value (1/true/yes/on or
-    0/false/no/off) wins; unset/blank → the yaml/default. Lets an operator flip
-    a gate via `aws lambda update-function-configuration --environment` without
-    rebuilding the container image."""
+    """Boolean flag with an env-var override falling back to the predictor.yaml
+    value. An explicit env value (1/true/yes/on or 0/false/no/off) wins;
+    unset/blank → the yaml/default. Lets an operator flip a gate via the
+    Lambda's environment without rebuilding the container image.
+
+    ⚠️ L4497 — env-flag flips on an ALIAS-PINNED Lambda are NOT a bare
+    `update-function-configuration`. `alpha-engine-predictor-inference` is
+    invoked at the `live` alias pinned to a PUBLISHED version, and a published
+    version's env is FROZEN — `update-function-configuration` only mutates
+    `$LATEST`, so it is a SILENT no-op on the alias. The correct (and revert)
+    procedure is `update-function-configuration ($LATEST) → publish-version →
+    update-alias live→<new version>` (revert = `update-alias live→<prior
+    version>`). "No redeploy" means "no container rebuild," NOT "env change
+    takes effect on the alias immediately." See OBSERVATION_REGISTRY
+    `predictor_xsec_level_neutralization` + ROADMAP L4497."""
     raw = os.environ.get(env_name)
     if raw is not None and raw.strip() != "":
         return raw.strip().lower() in ("1", "true", "yes", "on")
@@ -391,9 +401,13 @@ def _flag_env_or_yaml(env_name: str, yaml_value: bool) -> bool:
 
 
 _level_neut_cfg = _cfg.get("level_neutralization", {})
-# Env-overridable (L4469): flip the level fix live via the inference Lambda's
-# XSEC_DEMEAN_ALPHA_ENABLED env var — no image redeploy — once the 6/3 canary
-# observe-block confirms the common-mode + skew correction.
+# Env-overridable (L4469): flip the level fix via the inference Lambda's
+# XSEC_DEMEAN_ALPHA_ENABLED env var (no container rebuild) once the 6/3 canary
+# observe-block confirms the common-mode + skew correction. FLIPPED 2026-06-03
+# (live alias → v234). NB (L4497): the `live` alias is version-pinned, so the
+# flip required update-function-configuration → publish-version → update-alias
+# live→234 (a bare update-function-configuration is a silent no-op); revert =
+# update-alias live→233. See _flag_env_or_yaml above.
 XSEC_DEMEAN_ALPHA_ENABLED = _flag_env_or_yaml(
     "XSEC_DEMEAN_ALPHA_ENABLED", _level_neut_cfg.get("enabled", False)
 )
