@@ -31,7 +31,7 @@
 #   - config/predictor.yaml present locally (gitignored — staged to S3).
 #
 # The script will:
-#   1. Request a spot instance (c5.large, ~$0.03/hr)
+#   1. Request a spot instance (r5.large ≈ $0.04/hr spot; ≥8 GiB RAM)
 #   2. Wait for the SSM agent to register (no SSH)
 #   3. Stage config/predictor.yaml to S3; spot bootstraps + fetches it
 #   4. Run smoke (dry_run=True), then full training (dry_run=False)
@@ -60,10 +60,21 @@ S3_BUCKET="${S3_BUCKET:-alpha-engine-research}"
 BRANCH="${BRANCH:-main}"
 # Capacity-resilient instance-type fallback set (2026-05-22 incident:
 # spot launches in single-AZ subnet-e07166ec/us-east-1f hit
-# InsufficientInstanceCapacity). All 2 vCPU / 4-8 GB RAM — equivalent
-# for the meta-trainer (steady-state ~1-1.5 GB). Order = preference;
-# the lib CLI tries each in turn until one launches.
-INSTANCE_TYPES="${INSTANCE_TYPES:-c5.large,m5.large,c6i.large,c5a.large}"
+# InsufficientInstanceCapacity). Order = preference; the lib CLI tries
+# each in turn until one launches.
+#
+# 2026-06-06 — memory-optimized (≥8 GiB, all 2 vCPU). The prior set
+# (c5.large/c6i.large/c5a.large = 4 GiB) OOM-killed full-training on the
+# Saturday SF: the meta-trainer's peak RSS now exceeds 4 GiB (universe +
+# history growth plus the observe-only canonical-alpha matrix), so the
+# rotation picked c5.large (4 GiB) and the kernel SIGKILL'd the process
+# right after regime-data load. This is the SECOND OOM on a 4 GiB box
+# (first: 2026-04-28, addressed by the meta_trainer.py streaming refactor;
+# data growth since re-crossed 4 GiB). Lead with r5.large (16 GiB) for
+# ~4× headroom over the failing footprint; m5.large (8 GiB) is the
+# last-resort capacity fallback. The old "steady-state ~1-1.5 GB" note
+# was stale — see test_meta_trainer_streaming.py for the peak-RSS context.
+INSTANCE_TYPES="${INSTANCE_TYPES:-r5.large,r5a.large,r6i.large,m5.large}"
 INSTANCE_TYPE=""  # backward-compat: --instance-type X collapses INSTANCE_TYPES to single value
 AMI_ID="ami-0c421724a94bba6d6"  # Amazon Linux 2023 x86_64 (Python 3.12, SSM agent preinstalled)
 # Spot-side watchdog budget: meta-trainer typically completes 40-70 min;
