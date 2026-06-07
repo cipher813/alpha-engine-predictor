@@ -27,11 +27,23 @@ model:
 
 # ── Training hyperparameters (NN) ─────────────────────────────────────────────
 training:
-  # Challenger-first (L4469): when false (default), a gate-passing retrain does
-  # NOT overwrite the live champion — it registers as a challenger; the operator
-  # promotes via `python -m model.registry --promote <version_id>`. Set true only
-  # to restore legacy auto-promote. Env override: TRAINING_AUTO_PROMOTE_ENABLED.
-  auto_promote_enabled: false
+  # Auto-promote: when true, a gate-passing retrain overwrites the live
+  # champion directly; when false (challenger-first, L4469) it registers as a
+  # challenger and the operator promotes via `python -m model.registry
+  # --promote <version_id>`. Env override: TRAINING_AUTO_PROMOTE_ENABLED.
+  #
+  # ENABLED in production 2026-06-07 (operator decision, ROADMAP L4541-C):
+  # challenger-first had silently become "never promote" — no Phase-2
+  # realized-edge leaderboard fed the manual gate (L4539), so the fleet was
+  # frozen on a stale, underperforming champion. Auto-promote is now made
+  # SAFE by a LAYERED defense, not by the promote gate alone:
+  #   • executor turnover governor (alpha-engine #237) — caps any large book
+  #     move a freshly-promoted model requests (no single-day book flush, the
+  #     2026-05-30 failure mode);
+  #   • Phase-2 realized-edge leaderboard (L4539, in build) — measures whether
+  #     a promoted model actually earns its keep, enabling auto-DEMOTE later.
+  # New environments that lack the turnover governor should keep this false.
+  auto_promote_enabled: true
   batch_size: 256                  # training batch size
   learning_rate: 1.0e-3            # AdamW learning rate
   weight_decay: 1.0e-5             # L2 regularization
