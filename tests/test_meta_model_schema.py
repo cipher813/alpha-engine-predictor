@@ -144,3 +144,63 @@ def test_importance_empty_on_tiny_dataset(tmp_path):
     y = np.random.default_rng(1).normal(size=10)
     mm = MetaModel(alpha=1.0).fit(X, y, feature_names=["a", "b", "c"])
     assert mm._importance == {}
+
+def test_feature_names_embedded_in_pickle(tmp_path):
+    """L4543: save() embeds feature_names IN the pickle (schema v2) so the
+    load-bearing column order travels with the immutable model bytes."""
+    X, y = _synth_training_data(META_FEATURES)
+    mm = MetaModel(alpha=1.0).fit(X, y, feature_names=META_FEATURES)
+    pkl_path = tmp_path / "mm.pkl"
+    mm.save(pkl_path)
+
+    with open(pkl_path, "rb") as f:
+        payload = pickle.load(f)
+    assert isinstance(payload, dict), "v2 pickle must be a schema dict, not a bare estimator"
+    assert payload["_meta_model_schema"] >= 2
+    assert payload["feature_names"] == list(META_FEATURES)
+
+
+def test_stale_sidecar_cannot_corrupt_embedded_feature_names(tmp_path):
+    """THE landmine fix (L4543): a registry promote can leave a PRIOR version's
+    .pkl.meta.json sidecar next to the NEW model's .pkl. With feature_names
+    embedded, load MUST use the embedded (authoritative) order and ignore the
+    stale/mismatched sidecar — otherwise features feed in the wrong order →
+    garbage predictions."""
+    X, y = _synth_training_data(META_FEATURES)
+    mm = MetaModel(alpha=1.0).fit(X, y, feature_names=META_FEATURES)
+    pkl_path = tmp_path / "mm.pkl"
+    mm.save(pkl_path)
+
+    # Simulate a stale sidecar from a different model: SCRAMBLED feature order
+    # + bogus reporting values.
+    meta_path = Path(str(pkl_path) + ".meta.json")
+    meta = json.loads(meta_path.read_text())
+    meta["feature_names"] = list(reversed(META_FEATURES))  # wrong order!
+    meta["val_ic"] = 0.999  # bogus
+    meta_path.write_text(json.dumps(meta))
+
+    mm2 = MetaModel.load(pkl_path)
+    # feature order comes from the pickle, NOT the scrambled sidecar
+    assert mm2._feature_names == list(META_FEATURES)
+    # reporting fields still read from the sidecar (cosmetic, non-load-bearing)
+    assert mm2._val_ic == 0.999
+
+
+def test_legacy_raw_model_pickle_falls_back_to_sidecar(tmp_path):
+    """Backward-compat: a pre-v2 pickle is a BARE estimator (no embedded names);
+    load must still source feature_names from the sidecar."""
+    legacy_features = [f"legacy_feat_{i}" for i in range(6)]
+    X, y = _synth_training_data(legacy_features)
+    mm = MetaModel(alpha=1.0).fit(X, y, feature_names=legacy_features)
+
+    # Write a LEGACY-format pickle: the bare estimator only (pre-L4543 save).
+    pkl_path = tmp_path / "legacy_raw.pkl"
+    with open(pkl_path, "wb") as f:
+        pickle.dump(mm._model, f)
+    # ...plus a sidecar that carries the feature_names (the legacy contract).
+    Path(str(pkl_path) + ".meta.json").write_text(
+        json.dumps({"feature_names": legacy_features, "val_ic": 0.05, "coefficients": {}})
+    )
+
+    mm2 = MetaModel.load(pkl_path)
+    assert mm2._feature_names == legacy_features
