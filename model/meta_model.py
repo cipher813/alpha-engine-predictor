@@ -354,11 +354,28 @@ class MetaModel:
             ),
         }
 
+    # Pickle payload schema. v2 (L4543) embeds the load-bearing feature_names
+    # alongside the estimator so the input-matrix column ORDER travels WITH the
+    # immutable model bytes — load no longer depends on the `.pkl.meta.json`
+    # sidecar for correctness. This closes the registry-promote landmine: a
+    # promote that copies the `.pkl` but leaves a PRIOR version's sidecar in the
+    # live prefix would otherwise feed features in the wrong order → garbage
+    # predictions. The sidecar remains for human-readable reporting (val_ic,
+    # coefficients, importance), but is no longer correctness-critical.
+    _PICKLE_SCHEMA = 2
+
     def save(self, path: str | Path) -> None:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "wb") as f:
-            pickle.dump(self._model, f)
+            pickle.dump(
+                {
+                    "_meta_model_schema": self._PICKLE_SCHEMA,
+                    "model": self._model,
+                    "feature_names": list(self._feature_names),
+                },
+                f,
+            )
         meta = self.metrics()
         Path(str(path) + ".meta.json").write_text(json.dumps(meta, indent=2))
         log.info("MetaModel saved to %s (IC=%.4f)", path, self._val_ic)
@@ -368,7 +385,17 @@ class MetaModel:
         path = Path(path)
         mm = cls()
         with open(path, "rb") as f:
-            mm._model = pickle.load(f)
+            obj = pickle.load(f)
+        # v2+ payload: feature_names embedded with the estimator (load-bearing,
+        # sidecar-independent). Legacy payload: a bare estimator → feature_names
+        # come from the sidecar / coefficients fallback below.
+        embedded_names = False
+        if isinstance(obj, dict) and obj.get("_meta_model_schema"):
+            mm._model = obj["model"]
+            mm._feature_names = list(obj.get("feature_names") or [])
+            embedded_names = bool(mm._feature_names)
+        else:
+            mm._model = obj
         mm._fitted = True
         meta_path = Path(str(path) + ".meta.json")
         if meta_path.exists():
@@ -377,7 +404,11 @@ class MetaModel:
             mm._val_ic = meta.get("val_ic", 0.0)
             mm.alpha = meta.get("alpha", 1.0)
             mm._coefficients = meta.get("coefficients", {})
-            mm._feature_names = meta.get("feature_names", []) or []
+            # Sidecar feature_names is the source ONLY for legacy pickles that
+            # didn't embed them — never override the embedded (authoritative)
+            # order, which is what makes a stale/mismatched sidecar harmless.
+            if not embedded_names:
+                mm._feature_names = meta.get("feature_names", []) or []
             mm._importance = meta.get("importance", {}) or {}
             mm._learned_alpha = meta.get("learned_alpha_noise_precision")
             mm._learned_lambda = meta.get("learned_lambda_weight_precision")
@@ -389,7 +420,7 @@ class MetaModel:
         if not mm._feature_names and mm._coefficients:
             mm._feature_names = [k for k in mm._coefficients.keys() if k != "intercept"]
         log.info(
-            "MetaModel loaded from %s (IC=%.4f, n_features=%d)",
-            path, mm._val_ic, len(mm._feature_names),
+            "MetaModel loaded from %s (IC=%.4f, n_features=%d, embedded_names=%s)",
+            path, mm._val_ic, len(mm._feature_names), embedded_names,
         )
         return mm
