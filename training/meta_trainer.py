@@ -2208,6 +2208,18 @@ def run_meta_training(
     # `meta_model_oos_ic_leakfree.xsec_ic` is apples-to-apples). Tells us whether
     # the next move is "better L1s" or "nonlinear meta." OBSERVE; gates nothing.
     meta_oos_ic_leakfree_nonlinear: dict = {"status": "not_run"}
+    # W4.1b: the CPCV twin of the nonlinear shadow. The single-path WF read above
+    # is canonical-coverage-STARVED (n_folds=0 until ~Aug, exactly like the linear
+    # `meta_model_oos_ic_leakfree`), so it cannot yet tell us whether a nonlinear
+    # blender beats the linear L2. CPCV is combinatorially sample-efficient and
+    # DOES produce a distribution on today's young canonical data (it is the read
+    # that yields the live `meta_model_oos_ic_cpcv` ≈ 0.058). Running the blender
+    # through the SAME cpcv_meta_oos_ic as the linear meta gives the apples-to-
+    # apples nonlinear-vs-linear comparison NOW — the read that un-parks (or kills)
+    # the nonlinear-L2 lever (L4488e) without waiting for canonical maturation.
+    # OBSERVE; gates nothing; own try so neither nonlinear read can take the other
+    # (or training) down.
+    meta_oos_ic_cpcv_nonlinear: dict = {"status": "not_run"}
     try:
         from training.leakfree_meta_ic import (
             gbm_blender_fit_predict,
@@ -2235,6 +2247,38 @@ def run_meta_training(
     except Exception as _e:  # observe-only diagnostic must never fail training
         log.warning("W4.1 nonlinear-L2 shadow failed (OBSERVE, non-fatal): %s", _e)
         meta_oos_ic_leakfree_nonlinear = {"status": "error", "error": str(_e)}
+
+    try:
+        from training.leakfree_meta_ic import (
+            cpcv_meta_oos_ic as _nl_cpcv,
+            gbm_blender_fit_predict as _nl_blender,
+        )
+
+        _nlc_dates = [
+            r.get("date")
+            for r, _m in zip(oos_meta_rows, canonical_finite_mask) if _m
+        ]
+        meta_oos_ic_cpcv_nonlinear = _nl_cpcv(
+            meta_X, meta_y, _nlc_dates,
+            fit_predict_fn=_nl_blender(),
+            forward_days=cfg.FORWARD_DAYS,
+            embargo_days=getattr(cfg, "WF_EMBARGO_DAYS", 0),
+            n_groups=getattr(cfg, "WF_CPCV_N_GROUPS", 6),
+            k_test=getattr(cfg, "WF_CPCV_K_TEST", 2),
+        )
+        log.info(
+            "W4.1b nonlinear-L2 CPCV meta IC (OBSERVE, NOT gated): nonlinear "
+            "mean=%s [p50=%s frac_pos=%s] vs linear CPCV mean=%s. The "
+            "canonical-coverage-robust read of whether a nonlinear blender beats "
+            "the BayesianRidge L2 on the SAME L1s — un-parks the L4488e lever.",
+            meta_oos_ic_cpcv_nonlinear.get("mean_ic"),
+            meta_oos_ic_cpcv_nonlinear.get("p50_ic"),
+            meta_oos_ic_cpcv_nonlinear.get("frac_positive"),
+            cpcv_meta_ic.get("mean_ic") if isinstance(cpcv_meta_ic, dict) else None,
+        )
+    except Exception as _e:  # observe-only diagnostic must never fail training
+        log.warning("W4.1b nonlinear-L2 CPCV failed (OBSERVE, non-fatal): %s", _e)
+        meta_oos_ic_cpcv_nonlinear = {"status": "error", "error": str(_e)}
 
     # ── W2.3 + observe trio (L4469, OBSERVE) ─────────────────────────────────
     # Four more leak-free reads, all reusing the W1 machinery, all gating
@@ -3761,6 +3805,7 @@ def run_meta_training(
                 "meta_oos_ic_leakfree_post2020": meta_oos_ic_leakfree_post2020,
                 # W4.1 (OBSERVE): nonlinear-L2 shadow leak-free meta IC.
                 "meta_oos_ic_leakfree_nonlinear": meta_oos_ic_leakfree_nonlinear,
+                "meta_oos_ic_cpcv_nonlinear": meta_oos_ic_cpcv_nonlinear,
                 "meta_model_oos_ic_cpcv": cpcv_meta_ic,
                 "meta_model_promotion_stats": promotion_stats,
                 "meta_coefficients": meta_model._coefficients,
@@ -4066,6 +4111,7 @@ def run_meta_training(
         # W4.1 (OBSERVE): nonlinear-L2 shadow leak-free meta IC — vs the linear
         # meta_model_oos_ic_leakfree on the SAME folds. Additive per S3 contract.
         "meta_oos_ic_leakfree_nonlinear": meta_oos_ic_leakfree_nonlinear,
+        "meta_oos_ic_cpcv_nonlinear": meta_oos_ic_cpcv_nonlinear,
         # W2.3 (L4469, OBSERVE): factor_momentum_ratio candidate-factor reads —
         # standalone univariate cross-sectional rank IC (+ downside/DSR legs)
         # and the add-one-in marginal leak-free meta ΔIC. NOT folded into the

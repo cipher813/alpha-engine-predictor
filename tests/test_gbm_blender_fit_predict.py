@@ -13,7 +13,11 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from training.leakfree_meta_ic import gbm_blender_fit_predict, leakfree_meta_oos_ic
+from training.leakfree_meta_ic import (
+    cpcv_meta_oos_ic,
+    gbm_blender_fit_predict,
+    leakfree_meta_oos_ic,
+)
 
 
 def test_factory_returns_callable_with_correct_shape():
@@ -43,3 +47,27 @@ def test_nonlinear_blender_recovers_interaction_signal_via_leakfree():
     )
     assert res["status"] == "ok"
     assert res["xsec_ic"] > 0.2  # nonlinear meta recovers the interaction signal
+
+
+def test_blender_drops_into_cpcv_and_yields_distribution():
+    # W4.1b: the blender must drop into cpcv_meta_oos_ic identically to the
+    # BayesianRidge fit_predict_fn. CPCV is the canonical-coverage-robust read —
+    # it produces a distribution of leak-free ICs on a date count where the
+    # single-path WF would starve (n_folds=0) — so this is the read that lets us
+    # compare a nonlinear vs linear L2 on today's young canonical data.
+    rng = np.random.default_rng(5)
+    n_dates, n_names = 48, 30  # short history — single-path WF would starve here
+    dates = np.repeat(np.arange(n_dates), n_names)
+    X = rng.normal(0, 1, (n_dates * n_names, 3))
+    y = np.sign(X[:, 0]) * np.abs(X[:, 1]) + (X[:, 2] > 0.5) * 1.5 + rng.normal(
+        0, 0.3, X.shape[0]
+    )
+    res = cpcv_meta_oos_ic(
+        X, y, dates,
+        fit_predict_fn=gbm_blender_fit_predict(n_estimators=60),
+        forward_days=21, embargo_days=0, n_groups=6, k_test=2,
+    )
+    assert res["status"] == "ok"
+    assert res["n_combos"] >= 1            # CPCV formed combinations…
+    assert np.isfinite(res["mean_ic"])     # …and produced a finite distribution
+    assert "frac_positive" in res
