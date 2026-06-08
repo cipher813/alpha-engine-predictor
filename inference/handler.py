@@ -115,7 +115,9 @@ def handler(event: dict, context) -> dict:
     _bucket = os.environ.get("S3_BUCKET", "alpha-engine-research")
     _action = event.get("action", "predict")
     _pf = PredictorPreflight(bucket=_bucket)
-    if _action == "check_deploy_drift":
+    if _action in ("check_deploy_drift", "check_lib_pin_drift"):
+        # Both are lightweight pre-spend SF gates (GitHub reads only) — run the
+        # minimal preflight, not the full predictor bootstrap.
         _pf.run_for_drift_gate()
     else:
         _pf.run()
@@ -172,6 +174,17 @@ def handler(event: dict, context) -> dict:
             (result["upstream_sha"] or "?")[:12],
             (result["sf_sha"] or "missing")[:12], result["sf_drift"],
             (result["stack_sha"] or "missing")[:12], result["cf_drift"],
+        )
+        return result
+
+    # ── Lib-pin drift check (Saturday SF early state, L4517) ────────────────
+    if action == "check_lib_pin_drift":
+        from inference.lib_pin_drift import check_lib_pin_drift
+        result = check_lib_pin_drift()
+        log.info(
+            "Lib-pin drift check: has_drift=%s reason=%s pins=%s%s",
+            result["has_drift"], result["reason"], result["pins"],
+            (" offenders=" + "; ".join(result["offenders"])) if result["offenders"] else "",
         )
         return result
 
