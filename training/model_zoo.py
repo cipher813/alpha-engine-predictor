@@ -177,9 +177,16 @@ def select_rotation_specs(
 
     Staleness = the date of a spec's NEWEST registered version (via the registry
     lineage, grouped by ``model_version``). A spec with NO registered version is
-    maximally stale (never trained → trained first). Ties break on spec id for
-    deterministic, reproducible selection. Pure (registry list injected) so the
-    policy is unit-testable without S3.
+    maximally stale (never trained → trained first). Staleness ALWAYS dominates;
+    within an equal-staleness bucket an optional integer ``priority`` (default 0,
+    higher = picked first) breaks the tie ahead of the spec id. Priority is a
+    WITHIN-bucket tiebreak ONLY — it never overrides staleness, so a high-priority
+    spec cannot starve the others out of the round-robin: once it has a fresh
+    registered version the never-registered specs are more stale and sort ahead
+    of it. Use it to steer the COLD START (all never-registered) toward the one
+    promote-eligible / highest-value variant first. Ties after priority break on
+    spec id for deterministic, reproducible selection. Pure (registry list
+    injected) so the policy is unit-testable without S3.
     """
     active = [s for s in specs
               if s.get("status", "active") == "active" and s.get("id")]
@@ -191,8 +198,9 @@ def select_rotation_specs(
 
     def _key(s: dict):
         last = newest.get(_resolve_label(s))
-        # never-registered (last is None) sorts first; then oldest date first.
-        return (last is not None, last or "", s["id"])
+        # never-registered (last is None) sorts first; then oldest date first;
+        # then higher `priority` first (negated so larger sorts earlier); then id.
+        return (last is not None, last or "", -int(s.get("priority", 0)), s["id"])
 
     return [s["id"] for s in sorted(active, key=_key)[:max(0, budget)]]
 

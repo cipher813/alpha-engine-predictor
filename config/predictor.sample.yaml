@@ -236,10 +236,17 @@ shadow_versions:
 # RESIDUAL_MOMENTUM_ENABLED / MOMENTUM_L1_IN_META / XSEC_DEMEAN_ALPHA_ENABLED /
 # MODEL_VERSION_LABEL).
 # Empty by default; L4488d seeds the first real variants. Example:
+# `priority` (int, default 0; higher = picked first) is an OPTIONAL within-
+# staleness tiebreak for the weekly rotation: it only breaks ties among equally-
+# stale specs (e.g. the cold start where all are never-trained), so it steers the
+# first rotation toward the highest-value / only-promote-eligible spec without
+# ever starving the round-robin (a freshly-trained high-priority spec is less
+# stale than a never-trained one and sorts behind it).
 # model_specs:
 #   - id: residual-momentum            # W2+W4.2 SWAP: residual-mom IN, dead raw-mom OUT
 #     model_version_label: spec-residual-mom
 #     status: active                 # active | retired
+#     priority: 10                   # train first at cold start (only promote-eligible spec)
 #     overrides: {RESIDUAL_MOMENTUM_ENABLED: true, MOMENTUM_L1_IN_META: false}
 #   - id: horizon-60d
 #     model_version_label: spec-60d

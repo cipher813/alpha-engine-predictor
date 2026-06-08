@@ -164,6 +164,42 @@ def test_select_rotation_oldest_version_first_using_newest_per_spec():
     assert mz.select_rotation_specs(_SPECS, reg, budget=2) == ["resid", "h60"]
 
 
+def test_select_rotation_priority_steers_cold_start():
+    # All never-registered (equal staleness) → priority breaks the tie ahead of
+    # the id alphabetical fallback. resid would lose the id tiebreak ("h60" <
+    # "resid") but priority 10 pulls it first — the cold-start steer toward the
+    # one promote-eligible variant.
+    specs = [
+        {"id": "resid", "status": "active", "priority": 10,
+         "overrides": {"RESIDUAL_MOMENTUM_ENABLED": True}},
+        {"id": "h60", "status": "active", "overrides": {"FORWARD_DAYS": 60}},
+        {"id": "h90", "status": "active", "overrides": {"FORWARD_DAYS": 90}},
+    ]
+    assert mz.select_rotation_specs(specs, [], budget=1) == ["resid"]
+    # Full cold-start order: resid (priority), then the two zero-priority
+    # horizons by id.
+    assert mz.select_rotation_specs(specs, [], budget=3) == ["resid", "h60", "h90"]
+
+
+def test_select_rotation_priority_never_overrides_staleness():
+    # resid has priority 10 AND a fresh version; the horizons are never-trained.
+    # Staleness dominates → a never-trained horizon is picked before the fresh
+    # high-priority resid, so priority cannot starve the round-robin.
+    specs = [
+        {"id": "resid", "status": "active", "priority": 10,
+         "overrides": {"RESIDUAL_MOMENTUM_ENABLED": True}},
+        {"id": "h60", "status": "active", "overrides": {"FORWARD_DAYS": 60}},
+    ]
+    reg = [{"model_version": "spec-resid", "date": "2026-06-13"}]
+    assert mz.select_rotation_specs(specs, reg, budget=1) == ["h60"]
+
+
+def test_select_rotation_default_priority_preserves_id_tiebreak():
+    # No priority field anywhere → behavior is byte-identical to the pre-priority
+    # id tiebreak (back-compat).
+    assert mz.select_rotation_specs(_SPECS, [], budget=2) == ["h60", "resid"]
+
+
 def test_train_weekly_rotation_trains_only_budget_stalest():
     trained = []
 
