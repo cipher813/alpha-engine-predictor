@@ -463,19 +463,34 @@ from model.residual_momentum_scorer import RESIDUAL_MOMENTUM_FEATURES
 from data.residual_momentum_features import compute_residual_momentum_features
 
 
-def build_train_meta_features(resid_mom_enabled: bool) -> list[str]:
-    """W2 (L4469) observe gate: the L2 training-time meta-feature list.
+def build_train_meta_features(
+    resid_mom_enabled: bool, momentum_l1_in_meta: bool = True
+) -> list[str]:
+    """W2/W4.2 (L4469) observe gates: the L2 training-time meta-feature list.
 
-    IDENTICAL to ``META_FEATURES`` unless the residual-momentum L1 is enabled,
-    in which case ``residual_momentum_score`` is appended. NEVER mutates the
-    ``META_FEATURES`` module constant — inference imports it, and the persisted
-    ``meta_model._feature_names`` must stay byte-identical when the gate is
-    closed so the live prediction path is unchanged. Promotion = flip the flag.
+    Starts from ``META_FEATURES`` and applies two independent, flag-gated
+    deltas, NEVER mutating the ``META_FEATURES`` module constant (inference
+    imports it, and the persisted ``meta_model._feature_names`` must stay
+    byte-identical to today when BOTH gates are at their defaults so the live
+    prediction path is unchanged):
+
+    - ``resid_mom_enabled`` (W2) appends ``residual_momentum_score``.
+    - ``momentum_l1_in_meta`` (W4.2) — when False, drops the dead raw-momentum
+      ``momentum_score`` column from the meta vector (the L1 still trains and
+      still emits ``momentum_score`` for the executor veto; this only removes it
+      from the L2 input). Together (resid on + momentum off) this is the SWAP.
+
+    Promotion of either delta = flip its flag (default-on for momentum so today
+    is byte-identical; default-off for residual-momentum, both observe-gated).
     """
     from model.meta_model import META_FEATURES
-    return list(META_FEATURES) + (
-        ["residual_momentum_score"] if resid_mom_enabled else []
-    )
+    feats = [
+        f for f in META_FEATURES
+        if momentum_l1_in_meta or f != "momentum_score"
+    ]
+    if resid_mom_enabled:
+        feats.append("residual_momentum_score")
+    return feats
 
 
 def _load_signals_history(s3, bucket: str) -> dict[str, dict]:
@@ -1761,17 +1776,24 @@ def run_meta_training(
     # full meta_X is preserved as `meta_X_all` for downstream diagnostics
     # that span all rows; the Ridge fit + isotonic + per-regime stack all
     # consume the canonical-finite subset.
-    # W2 (L4469) OBSERVE gate: the residual-momentum column enters the L2 stack
-    # ONLY when cfg.RESIDUAL_MOMENTUM_ENABLED. When False, TRAIN_META_FEATURES is
-    # IDENTICAL to META_FEATURES → meta_X columns, the fitted/persisted
-    # meta_model._feature_names, and the inference path are all byte-identical to
-    # the pre-W2 trainer. We never mutate the META_FEATURES module constant
-    # (inference imports it). Promotion = flip the flag after 2-3 observe firings.
+    # W2/W4.2 (L4469) OBSERVE gates: the residual-momentum column enters the L2
+    # stack ONLY when cfg.RESIDUAL_MOMENTUM_ENABLED, and the dead raw-momentum
+    # column is dropped from the L2 stack ONLY when cfg.MOMENTUM_L1_IN_META is
+    # False (the swap). With BOTH at their defaults (resid off / momentum in),
+    # TRAIN_META_FEATURES is IDENTICAL to META_FEATURES → meta_X columns, the
+    # fitted/persisted meta_model._feature_names, and the inference path are all
+    # byte-identical to the pre-W2 trainer. We never mutate the META_FEATURES
+    # module constant (inference imports it). Promotion = flip the flag(s) after
+    # 2-3 observe firings (the model-zoo `residual-momentum` spec sets both).
     _resid_mom_enabled = bool(getattr(cfg, "RESIDUAL_MOMENTUM_ENABLED", False))
-    TRAIN_META_FEATURES = build_train_meta_features(_resid_mom_enabled)
+    _momentum_l1_in_meta = bool(getattr(cfg, "MOMENTUM_L1_IN_META", True))
+    TRAIN_META_FEATURES = build_train_meta_features(
+        _resid_mom_enabled, _momentum_l1_in_meta
+    )
     log.info(
-        "Training meta-model on %d OOS rows... (residual_momentum L1 in stack: %s)",
-        len(oos_meta_rows), _resid_mom_enabled,
+        "Training meta-model on %d OOS rows... "
+        "(residual_momentum L1 in stack: %s; raw momentum_score in meta: %s)",
+        len(oos_meta_rows), _resid_mom_enabled, _momentum_l1_in_meta,
     )
     meta_X_all = np.array([[r[f] for f in TRAIN_META_FEATURES] for r in oos_meta_rows])
     meta_y_all = np.array([r["actual_fwd"] for r in oos_meta_rows])  # legacy, kept for diagnostics

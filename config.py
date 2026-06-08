@@ -365,6 +365,25 @@ WF_EARLY_STOPPING = _wf_cfg.get("wf_early_stopping", None)  # None → use GBM_E
 _resid_mom_cfg = _cfg.get("residual_momentum", {})
 RESIDUAL_MOMENTUM_ENABLED = _resid_mom_cfg.get("enabled", False)
 
+# ── Raw-momentum L1 → meta-L2 inclusion gate (W4.2, L4469) ──────────────────
+# Whether the raw-momentum L1's ``momentum_score`` column feeds the meta-L2
+# input vector. The 2026-06-06 manifest shows ``momentum_score`` is a DEAD L1
+# input — standalone leak-free xsec-IC ≈ 0.025 and an L2 coefficient of
+# ≈ -0.045 (the BayesianRidge has already shrunk it to ~0) — while the
+# residual-momentum L1 it is meant to replace scores xsec-IC ≈ 0.18 and clears
+# both the downside (Sortino 3.33) and overfit (DSR 1.0) gates. Setting this
+# False is the meta-L2 half of the residual-for-raw momentum SWAP: it drops
+# ``momentum_score`` from the meta feature vector ONLY. The momentum L1 itself
+# still trains and still emits ``momentum_score`` into predictions.json, so the
+# executor's momentum-veto / reversal-confirmation gate (which read that field)
+# are unaffected. Default True ⇒ the live meta feature set + persisted
+# ``meta_model._feature_names`` + inference path are byte-identical to today;
+# the swap is exercised only by the model-zoo ``residual-momentum`` spec
+# (observe-first, CPCV-scored, never auto-promoted until the cutover flag).
+# ``.get`` with a default so the code ships before predictor.yaml carries it.
+_meta_stack_cfg = _cfg.get("meta_stack", {})
+MOMENTUM_L1_IN_META = _meta_stack_cfg.get("momentum_l1_in_meta", True)
+
 # ── Cross-sectional level-neutralization of predicted_alpha (L4487) ─────────
 # The meta-L2's macro features are common-mode across the daily cross-section,
 # so an adverse-macro day shifts the ENTIRE predicted-alpha vector negative →

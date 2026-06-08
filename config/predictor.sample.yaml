@@ -199,6 +199,20 @@ residual_momentum:
   vol_window: 20                 # residual-return volatility window (vol scaling)
   change_window: 21              # momentum-change (acceleration) window
 
+# ── Meta-L2 stack composition (W4.2, L4469) ───────────────────────────────────
+# Which L1 outputs feed the meta-L2 input vector. The 2026-06-06 manifest shows
+# the raw-momentum L1's `momentum_score` is a DEAD input (standalone leak-free
+# xsec-IC ≈ 0.025, L2 coef ≈ -0.045 — already shrunk to ~0 by the BayesianRidge)
+# while residual-momentum (above) scores ≈ 0.18 and clears both gates. Setting
+# momentum_l1_in_meta=false drops `momentum_score` from the meta vector ONLY —
+# the momentum L1 still trains + still emits `momentum_score` to predictions.json
+# so the executor momentum-veto / reversal-confirmation gate are unaffected.
+# Default true ⇒ meta feature set + persisted _feature_names + inference path are
+# byte-identical to today; the SWAP (resid on + momentum off) is exercised by the
+# model-zoo `residual-momentum` spec below, observe-first / CPCV-scored.
+meta_stack:
+  momentum_l1_in_meta: true      # include the dead raw-momentum L1 in the meta L2
+
 # ── Cross-sectional level-neutralization of predicted_alpha (L4487) ───────────
 # Removes the common-mode (cross-sectional mean) from predicted_alpha so an
 # adverse-macro day can't flush the whole book to SPY. Observe-gated: when
@@ -219,13 +233,14 @@ shadow_versions:
 # Each spec is a config OVERLAY trained via `python -m training.model_zoo
 # --spec <id>` → registers a CHALLENGER (challenger-first; never overwrites the
 # champion). `overrides` keys must be in the model_zoo allowlist (FORWARD_DAYS /
-# RESIDUAL_MOMENTUM_ENABLED / XSEC_DEMEAN_ALPHA_ENABLED / MODEL_VERSION_LABEL).
+# RESIDUAL_MOMENTUM_ENABLED / MOMENTUM_L1_IN_META / XSEC_DEMEAN_ALPHA_ENABLED /
+# MODEL_VERSION_LABEL).
 # Empty by default; L4488d seeds the first real variants. Example:
 # model_specs:
-#   - id: residual-momentum
+#   - id: residual-momentum            # W2+W4.2 SWAP: residual-mom IN, dead raw-mom OUT
 #     model_version_label: spec-residual-mom
 #     status: active                 # active | retired
-#     overrides: {RESIDUAL_MOMENTUM_ENABLED: true}
+#     overrides: {RESIDUAL_MOMENTUM_ENABLED: true, MOMENTUM_L1_IN_META: false}
 #   - id: horizon-60d
 #     model_version_label: spec-60d
 #     status: active
