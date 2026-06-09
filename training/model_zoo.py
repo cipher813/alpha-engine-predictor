@@ -439,6 +439,39 @@ def _resolve_trained_versions(s3, bucket: str, results: dict, *, specs: list | N
     ]
 
 
+def _resolve_base_champion_version(s3, bucket: str, date_str: str | None) -> dict | None:
+    """L4571: the base champion-ARCHITECTURE retrain (the ``--full-only``
+    PredictorTraining state that runs BEFORE the zoo on Saturday) registers
+    itself as a ``stage="challenger"`` version with ``model_version`` =
+    ``cfg.MODEL_VERSION_LABEL`` ("v3.0-meta") when auto-promote is off. It is the
+    champion architecture on the CURRENT data vintage — so it must compete in the
+    same pool, not sit outside it (else select_winner only ranks rotated variants
+    against a stale serving manifest, and a fresh-data retrain can never win).
+
+    Returns the newest such challenger for ``date_str`` (or the newest overall if
+    none carries today's date) as a ``trained``-shaped row labelled
+    ``spec_id="champion-arch"``, or None if none is registered / on read failure.
+    """
+    base_label = getattr(cfg, "MODEL_VERSION_LABEL", "v3.0-meta")
+    try:
+        from model.registry import list_versions
+        versions = list_versions(s3, bucket, stage="challenger")
+    except Exception:  # noqa: BLE001 — best-effort; base just won't be ranked
+        log.warning("model_zoo select: could not list challengers for base-arch", exc_info=True)
+        return None
+    mine = [v for v in versions if v.get("model_version") == base_label]
+    if not mine:
+        return None
+    # Prefer today's vintage; list_versions is already newest-first by (date,
+    # created_utc), so the first today-dated row (else the first overall) wins.
+    today = [v for v in mine if date_str and v.get("date") == date_str]
+    chosen = (today or mine)[0]
+    vid = chosen.get("version_id")
+    if not vid:
+        return None
+    return {"spec_id": "champion-arch", "model_version": base_label, "version_id": vid}
+
+
 def select_winner(s3, bucket: str, *, trained: list[dict], margin: float | None = None) -> dict:
     """Rank freshly-trained challengers by gated CPCV mean IC and pick a winner
     that beats the live champion by ``margin``. Promotion-eligible iff
@@ -506,6 +539,83 @@ def _write_leaderboard(s3, bucket: str, date_str: str | None, leaderboard: dict)
         log.warning("model_zoo: could not write leaderboard to %s", key, exc_info=True)
 
 
+def _current_champion_version_id(s3, bucket: str) -> str | None:
+    """The registry version_id of the currently-SERVING champion (the model the
+    next auto-promote will demote). Used to build an exact revert command. The
+    bundle is only demoted to ``archived`` on promote (never deleted), so this id
+    stays valid for `--promote <id>` indefinitely. Best-effort → None."""
+    try:
+        from model.registry import list_versions
+        champs = list_versions(s3, bucket, stage="champion")
+    except Exception:  # noqa: BLE001
+        return None
+    return champs[0].get("version_id") if champs else None
+
+
+def _candidate_by_vid(leaderboard: dict, vid: str) -> dict:
+    for c in leaderboard.get("candidates", []):
+        if c.get("version_id") == vid:
+            return c
+    return {}
+
+
+def _alert_promotion(bucket, date_str, leaderboard, winner_vid, prior_vid) -> None:
+    """L4571: a champion auto-promotion changes the model that trades capital —
+    it MUST announce itself (fail-loud; the realized-edge auto-demote L4539 isn't
+    live, so revert is MANUAL and depends on the operator SEEING this). Telegram +
+    SNS via the fleet alerts chokepoint; never raises (observability off a path
+    that already promoted)."""
+    try:
+        win = _candidate_by_vid(leaderboard, winner_vid)
+        champ_ic = (leaderboard.get("champion") or {}).get("cpcv_mean_ic")
+        new_ic = win.get("cpcv_mean_ic")
+        spec = win.get("spec_id", "?")
+        revert = (
+            f"python -m model.registry --bucket {bucket} --promote {prior_vid}"
+            if prior_vid else "(prior champion version_id unavailable — see predictor/registry/)"
+        )
+        msg = (
+            f"[predictor] Model-zoo AUTO-PROMOTED a new champion ({date_str}).\n"
+            f"  {prior_vid or '?'}  →  {winner_vid}  (spec: {spec})\n"
+            f"  CPCV mean IC: {champ_ic}  →  {new_ic}  (margin {leaderboard.get('margin')})\n"
+            f"  Inference serves the new champion from the next run; the #237 turnover "
+            f"governor caps the first-day book move.\n"
+            f"  REVERT (if it misbehaves): {revert}"
+        )
+        from alpha_engine_lib import alerts as _alerts
+        _alerts.publish(
+            message=msg, severity="warning",
+            source="alpha-engine-predictor/training/model_zoo.py::run_rotation_and_select",
+            dedup_key=f"model_zoo_promote_{date_str}",
+        )
+    except Exception:  # noqa: BLE001 — alert failure must not fail the SF
+        log.warning("model_zoo: promotion alert failed", exc_info=True)
+
+
+def _alert_observe_recommendation(bucket, date_str, leaderboard, winner_vid) -> None:
+    """Observe-mode: a challenger beat the champion but auto-promote is OFF — a
+    low-priority (info) heads-up so the operator reviews the leaderboard + can
+    promote manually. Telegram silent-tier; never raises."""
+    try:
+        win = _candidate_by_vid(leaderboard, winner_vid)
+        champ_ic = (leaderboard.get("champion") or {}).get("cpcv_mean_ic")
+        msg = (
+            f"[predictor] Model-zoo OBSERVE ({date_str}): challenger {winner_vid} "
+            f"(spec {win.get('spec_id','?')}) beat the champion "
+            f"(CPCV {champ_ic} → {win.get('cpcv_mean_ic')}) but auto-promote is OFF — "
+            f"review predictor/model_zoo/leaderboard/{date_str}.json; promote with "
+            f"`python -m model.registry --bucket {bucket} --promote {winner_vid}`."
+        )
+        from alpha_engine_lib import alerts as _alerts
+        _alerts.publish(
+            message=msg, severity="info",
+            source="alpha-engine-predictor/training/model_zoo.py::run_rotation_and_select",
+            dedup_key=f"model_zoo_observe_{date_str}",
+        )
+    except Exception:  # noqa: BLE001
+        log.warning("model_zoo: observe alert failed", exc_info=True)
+
+
 def run_rotation_and_select(
     bucket: str,
     *,
@@ -548,6 +658,14 @@ def run_rotation_and_select(
         return leaderboard
 
     trained = _resolve_trained_versions(s3, bucket, results, specs=specs)
+    # L4571: the base champion-arch retrain competes in the SAME pool.
+    base = _resolve_base_champion_version(s3, bucket, date_str)
+    if base and base["version_id"] not in {t.get("version_id") for t in trained}:
+        trained.append(base)
+        log.info("model_zoo select: base champion-arch %s in the pool", base["version_id"])
+    # Capture the OUTGOING champion's registry version BEFORE any promote so the
+    # operator alert can carry an exact, copy-pasteable revert command.
+    _prior_champ_vid = _current_champion_version_id(s3, bucket)
     leaderboard = select_winner(s3, bucket, trained=trained)
     leaderboard["date"] = date_str
     leaderboard["mode"] = mode
@@ -558,7 +676,9 @@ def run_rotation_and_select(
             from model.registry import promote_to_champion
             promote_to_champion(s3, bucket, winner_vid)
             leaderboard["promoted"] = winner_vid
+            leaderboard["reverted_from"] = _prior_champ_vid
             log.info("model_zoo CUTOVER: promoted challenger %s to champion", winner_vid)
+            _alert_promotion(bucket, date_str, leaderboard, winner_vid, _prior_champ_vid)
         except Exception as exc:  # noqa: BLE001 — a promote failure must not fail the SF
             leaderboard["promoted"] = None
             leaderboard["promote_error"] = str(exc)
@@ -570,6 +690,7 @@ def run_rotation_and_select(
                 "model_zoo OBSERVE: recommended promotion %s — NOT executed "
                 "(MODEL_ZOO_AUTO_PROMOTE_WINNER off; flip after soak)", winner_vid,
             )
+            _alert_observe_recommendation(bucket, date_str, leaderboard, winner_vid)
         else:
             log.info("model_zoo: no eligible challenger beat the champion this rotation")
 
