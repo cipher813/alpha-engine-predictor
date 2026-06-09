@@ -33,3 +33,21 @@ def _isolate_secrets_from_ssm(monkeypatch):
     clear_cache()
     yield
     clear_cache()
+
+
+@pytest.fixture(autouse=True)
+def _block_real_alert_publish(monkeypatch):
+    """Stub ``alpha_engine_lib.alerts.publish`` so NO predictor test fans out a
+    real SNS / Telegram operator alert (L4571 added a promotion alert to the
+    model-zoo cutover path). Mirrors the alpha-engine executor conftest; the
+    lib's own ``PYTEST_CURRENT_TEST`` guard is the backup. See
+    [[reference_alpha_engine_tests_alerts_publish_autostubbed]].
+    """
+    try:
+        from unittest.mock import MagicMock
+        from alpha_engine_lib import alerts
+    except ImportError:
+        yield
+        return
+    monkeypatch.setattr(alerts, "publish", MagicMock(name="alerts.publish"))
+    yield
