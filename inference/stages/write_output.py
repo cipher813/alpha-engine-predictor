@@ -1350,13 +1350,24 @@ def _load_gbm_meta(ctx: PipelineContext) -> dict:
         if ctx.inference_mode == "meta":
             _resp = _s3.get_object(Bucket=ctx.bucket, Key=cfg.META_MANIFEST_KEY)
             manifest = json.loads(_resp["Body"].read())
-            log.info("Meta manifest loaded: date=%s  promoted=%s  meta_ic=%s",
-                     manifest.get("date"), manifest.get("promoted"),
-                     manifest.get("models", {}).get("meta_model", {}).get("ic"))
+            # L4540 part 2: the manifest's top-level `date` is the LATEST TRAINING
+            # RUN (the manifest refreshes every Saturday for the freshness SLA,
+            # promoted or not). The SERVED model's "last trained" date is
+            # `served_date` — equal to `date` on a promoting run, carried forward
+            # to the prior champion on a non-promoting run — so a non-promoting
+            # run no longer reports its own date over stale served weights. Fall
+            # back to `date` for older manifests written before this field.
+            _served_date = manifest.get("served_date") or manifest.get("date")
+            log.info(
+                "Meta manifest loaded: run_date=%s  served_date=%s  promoted=%s  meta_ic=%s",
+                manifest.get("date"), _served_date, manifest.get("promoted"),
+                manifest.get("models", {}).get("meta_model", {}).get("ic"))
             mm = manifest.get("models", {})
             iso = mm.get("isotonic_calibrator", {})
             return {
-                "trained_date": manifest.get("date"),
+                "trained_date": _served_date,
+                "run_date": manifest.get("date"),
+                "served_version": manifest.get("served_version") or manifest.get("version"),
                 "promoted": manifest.get("promoted"),
                 "manifest_version": manifest.get("version"),
                 "meta_val_ic": mm.get("meta_model", {}).get("ic"),

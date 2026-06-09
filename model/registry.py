@@ -249,7 +249,9 @@ def promote_to_champion(
     """
     src = f"{registry_prefix}{version_id}/"
     try:
-        json.loads(s3.get_object(Bucket=bucket, Key=f"{src}_lineage.json")["Body"].read())
+        lineage = json.loads(
+            s3.get_object(Bucket=bucket, Key=f"{src}_lineage.json")["Body"].read()
+        )
     except Exception as e:
         raise RegistryError(
             f"cannot promote {version_id!r}: no registry bundle / _lineage.json ({e})"
@@ -273,6 +275,29 @@ def promote_to_champion(
             Bucket=bucket, Key=f"{live_prefix}{fname}",
             CopySource={"Bucket": bucket, "Key": k},
         )
+
+    # L4540 part 2: the copied bundle's manifest.json is the challenger's
+    # TRAINING-run record — its `date` is the challenger's train date and its
+    # served_*/promoted fields are from registration time (when it was NOT yet
+    # served). Now that this version IS the live champion, restamp the live
+    # manifest's SERVED identity so inference's "last trained" surface reflects
+    # the model actually served. Best-effort: a failed restamp must not fail the
+    # promotion (the weights are already live + correct).
+    try:
+        _live_manifest_key = f"{live_prefix}manifest.json"
+        _m = json.loads(
+            s3.get_object(Bucket=bucket, Key=_live_manifest_key)["Body"].read()
+        )
+        _m["served_version"] = version_id
+        _m["served_date"] = lineage.get("date") or _m.get("date")
+        _m["promoted"] = True  # this version is now the served champion
+        s3.put_object(
+            Bucket=bucket, Key=_live_manifest_key,
+            Body=json.dumps(_m, indent=2).encode(),
+            ContentType="application/json",
+        )
+    except Exception:  # noqa: BLE001 — observability restamp, never blocks promote
+        pass
 
     # Demote any prior champion(s), then mark this one champion (exactly one).
     for other in list_versions(s3, bucket, stage="champion", registry_prefix=registry_prefix):

@@ -493,6 +493,36 @@ def build_train_meta_features(
     return feats
 
 
+def _read_live_served_identity(s3, bucket: str, manifest_key: str) -> tuple:
+    """L4540 part 2: read the SERVED champion's identity from the current live
+    manifest, for carry-forward on a non-promoting run.
+
+    Returns ``(served_version, served_date)``. Prefers the explicit
+    ``served_version``/``served_date`` fields (new format); for an older manifest
+    that lacks them, the prior ``version``/``date`` is the served identity ONLY if
+    that prior run itself promoted (else the prior manifest was a non-promoting
+    run that overwrote `date` without changing the live weights — exactly the bug
+    this fixes — so we cannot trust it and return ``None``). Best-effort: any
+    error (no prior manifest, unreadable) returns ``(None, None)`` so the
+    consumer falls back to the run `date`.
+    """
+    try:
+        prior = json.loads(
+            s3.get_object(Bucket=bucket, Key=manifest_key)["Body"].read()
+        )
+    except Exception as _e:
+        log.info("No readable prior live manifest for served carry-forward: %s", _e)
+        return (None, None)
+    prior_promoted = bool(prior.get("promoted"))
+    served_version = prior.get("served_version") or (
+        prior.get("version") if prior_promoted else None
+    )
+    served_date = prior.get("served_date") or (
+        prior.get("date") if prior_promoted else None
+    )
+    return (served_version, served_date)
+
+
 def _load_signals_history(s3, bucket: str) -> dict[str, dict]:
     """Load every ``signals/{date}/signals.json`` snapshot from S3.
 
@@ -3594,6 +3624,30 @@ def run_meta_training(
             # is observable BEFORE it OOMs the spot.
             peak_rss_mb = max(peak_rss_mb, _log_rss("end of training (pre-manifest-write)"))
             log.info("Peak training RSS: %d MB", peak_rss_mb)
+
+            # L4540 part 2: the live manifest is the LATEST-RUN record (it must
+            # refresh every Saturday for the artifact-freshness SLA), so its
+            # top-level `date` is THIS run's date even when the run did not
+            # promote. Inference/email previously read that `date` as the served
+            # model's "last trained" date → on a non-promoting run it reported a
+            # date for weights that were never swapped in (the 2026-06-06 symptom).
+            # Record the SERVED champion's identity explicitly: this run if it
+            # promoted, else carry forward whatever the live prefix already serves
+            # (read from the prior live manifest; fall back to the prior `date`
+            # only if that prior run itself promoted). Inference reads
+            # `served_date`/`served_version`; the manual `promote_to_champion`
+            # path restamps these on the live manifest after it copies a bundle.
+            _this_version = getattr(cfg, "MODEL_VERSION_LABEL", "v3.0-meta")
+            if promoted:
+                served_version, served_date = _this_version, date_str
+            else:
+                served_version, served_date = _read_live_served_identity(
+                    s3_up, bucket, cfg.META_MANIFEST_KEY
+                )
+            log.info(
+                "Served champion identity for manifest: version=%s date=%s "
+                "(this run promoted=%s)", served_version, served_date, promoted,
+            )
             # Write manifest
             manifest = {
                 "date": date_str,
@@ -3633,6 +3687,14 @@ def run_meta_training(
                     if cfg.TRAIN_START_DATE is not None else None
                 ),
                 "promoted": promoted,
+                # L4540 part 2: the SERVED champion's identity (the model
+                # actually in the live weights prefix), distinct from this run's
+                # `date`/`version` above. Equal to this run on a promoting run;
+                # carried forward from the prior champion on a non-promoting run.
+                # Inference reads these for the "last trained" surface so a
+                # non-promoting run never reports its own date over stale weights.
+                "served_version": served_version,
+                "served_date": served_date,
                 # Challenger-first forensic trail (L4469): gate_passed = the
                 # promotion gate's verdict; auto_promote_enabled = whether
                 # training is allowed to overwrite the live champion. When
