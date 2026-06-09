@@ -501,6 +501,37 @@ def build_train_meta_features(
     return feats
 
 
+def _select_promotion_ic_series(cpcv_meta_ic, leakfree_meta_ic) -> tuple[list, str]:
+    """L4565c: choose the IC distribution that feeds the W1.3 promotion battery
+    (downside-Sortino + overfit-DSR), preferring the CPCV per-combo `ics`.
+
+    The downside/overfit gates (read by ``model_zoo.select_winner._gate_pass``)
+    were fed the EXPANDING-WALK-FORWARD ``ic_series``, which is structurally
+    ``insufficient_folds`` at the 21d horizon — only ~45 OOS meta-dates exist and
+    a single fold needs ~42 purged dates of history before its test block, so the
+    series comes back EMPTY → ``downside_ic_stats``/``deflated_sharpe_ratio``
+    report ``status=insufficient`` → ``passes_*_gate=False`` for every model →
+    select_winner can never promote anything (a degenerate freeze, not a verdict).
+
+    The CPCV read (``cpcv_meta_oos_ic``) DOES populate at 21d (status=ok, ~15
+    purged combinations) and is the institutionally-correct input for DSR /
+    Sortino-of-IC / CVaR (an order-independent distribution of leak-free OOS ICs,
+    López de Prado), harmonizing with the already-CPCV-derived ``n_trials``.
+
+    Prefer the CPCV ``ics``; fall back to the expanding-WF ``ic_series`` only when
+    CPCV is empty/absent (e.g. a future even-shorter-history run). Returns
+    ``(ic_series, source)`` where source is ``"cpcv"`` or ``"expanding_wf"``.
+    """
+    cpcv_ics = cpcv_meta_ic.get("ics", []) if isinstance(cpcv_meta_ic, dict) else []
+    wf_series = (
+        leakfree_meta_ic.get("ic_series", [])
+        if isinstance(leakfree_meta_ic, dict) else []
+    )
+    if cpcv_ics:
+        return list(cpcv_ics), "cpcv"
+    return list(wf_series), "expanding_wf"
+
+
 def _read_live_served_identity(s3, bucket: str, manifest_key: str) -> tuple:
     """L4540 part 2: read the SERVED champion's identity from the current live
     manifest, for carry-forward on a non-promoting run.
@@ -1967,9 +1998,12 @@ def run_meta_training(
             deflated_sharpe_ratio,
             downside_ic_stats,
         )
-        _ic_series = (
-            leakfree_meta_ic.get("ic_series", [])
-            if isinstance(leakfree_meta_ic, dict) else []
+        # L4565c: source the robustness battery's IC distribution from the CPCV
+        # per-combo `ics` (see _select_promotion_ic_series). The expanding-WF
+        # `ic_series` is structurally empty at 21d → it froze the downside/overfit
+        # gates at passes=False → select_winner rejected every candidate.
+        _ic_series, _ic_series_source = _select_promotion_ic_series(
+            cpcv_meta_ic, leakfree_meta_ic
         )
         # n_trials: the CPCV combination count is a conservative within-run
         # trial proxy until cumulative cross-week trial-count tracking lands
@@ -1993,14 +2027,17 @@ def run_meta_training(
             "status": _overfit.get("status"),
             "downside": _downside,
             "overfit": _overfit,
+            "ic_series_source": _ic_series_source,  # L4565c: cpcv | expanding_wf
+            "n_ic": len(_ic_series),
         }
         log.info(
-            "W1.3 promotion battery (OBSERVE, NOT gated) — DOWNSIDE "
+            "W1.3 promotion battery (ic_series_source=%s, n=%d) — DOWNSIDE "
             "(skilled-risk basket): Sortino-of-IC=%s CVaR%s%%-of-IC=%s "
             "frac_neg_IC=%s worst=%s | OVERFIT (significance): PSR(0)=%s DSR=%s "
             "(n_trials=%s) | passes_downside=%s passes_overfit=%s. W1.4 gates "
             "on BOTH; Sortino/CVaR are the house metrics, IC-IR is symmetric "
             "significance only.",
+            _ic_series_source, len(_ic_series),
             _downside.get("sortino_of_ic"), _downside.get("cvar_pct"),
             _downside.get("cvar_of_ic"), _downside.get("frac_negative_ic"),
             _downside.get("worst_ic"), _overfit.get("psr_vs_zero"),

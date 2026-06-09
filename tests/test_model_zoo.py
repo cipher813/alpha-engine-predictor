@@ -318,6 +318,23 @@ def test_select_winner_horizon_gate_and_margin(monkeypatch):
     assert reasons["resid"] == "eligible"
 
 
+def test_select_winner_nan_cpcv_is_no_cpcv_not_below_margin(monkeypatch):
+    # L4565c: a date-starved CPCV reports mean_ic=NaN. float('nan') is not None
+    # and slips past `ic is None`, then `ic < champ+margin` is False (NaN cmp) —
+    # mislabeling the candidate `below_champion_plus_margin`. _cpcv_mean must
+    # collapse NaN→None so it's correctly `no_cpcv` and never wins.
+    monkeypatch.setattr(cfg, "FORWARD_DAYS", 21, raising=False)
+    s3 = _FakeS3({
+        cfg.META_MANIFEST_KEY: _mk_manifest(21, 0.10, True),                     # champion
+        "predictor/registry/nan-v/manifest.json": _mk_manifest(21, float("nan"), True),
+    })
+    trained = [{"spec_id": "nan", "version_id": "nan-v", "model_version": "spec-nan"}]
+    board = mz.select_winner(s3, "bkt", trained=trained, margin=0.01)
+    reasons = {c["spec_id"]: c["reason"] for c in board["candidates"]}
+    assert reasons["nan"] == "no_cpcv"
+    assert board["winner_version_id"] is None
+
+
 def _run_select_fixture(monkeypatch, *, auto_promote):
     import model.registry as reg
     monkeypatch.setattr(cfg, "FORWARD_DAYS", 21, raising=False)

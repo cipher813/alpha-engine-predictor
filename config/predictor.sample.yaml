@@ -173,7 +173,9 @@ walk_forward:
   # that closes the CPCV after-test-boundary leak. Set an explicit int only to
   # override (e.g. 0 reproduces the legacy leaky behavior for comparison).
   # embargo_days: 21
-  cpcv_n_groups: 6               # W1.2 (L4469) combinatorial purged CV — date groups; C(6,2)=15 OOS fits/run
+  cpcv_n_groups: 10              # W1.2 (L4469) combinatorial purged CV — date groups. L4565c: 6→10 so enough
+                                 # purged+embargoed combos clear the train-size guard at ~45 OOS dates to lift
+                                 # the IC distribution over the downside/overfit battery's n≥5 floor (6→~4, 10→~12).
   cpcv_k_test: 2                 # W1.2 (L4469) test groups per CPCV combination
   dsr_n_trials: 10               # W1.3 (L4469) Deflated-Sharpe trial count (placeholder until cumulative trial tracking — W1.3b)
   dsr_threshold: 0.95            # W1.3 (L4469) DSR significance bar (overfit leg) once W1.4 makes it gating (observe-only today)

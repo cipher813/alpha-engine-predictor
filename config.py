@@ -301,10 +301,17 @@ WF_EMBARGO_DAYS = _wf_cfg.get("embargo_days", None)
 # W1.2 (ROADMAP L4469): combinatorial purged CV (López de Prado Ch. 12). The
 # meta rows' unique dates split into WF_CPCV_N_GROUPS contiguous groups; every
 # combination of WF_CPCV_K_TEST test groups yields one purged+embargoed OOS fit
-# → a DISTRIBUTION of cross-sectional ICs (vs the single-path WF). C(N,k)
-# combinations: (6,2)=15 fits/run (trivial). OBSERVE diagnostic only; the
+# → a DISTRIBUTION of cross-sectional ICs (vs the single-path WF). The
 # distribution feeds the W1.3 DSR/PBO promotion gate.
-WF_CPCV_N_GROUPS = _wf_cfg.get("cpcv_n_groups", 6)
+# L4565c: default raised 6 → 10. At the 21d horizon with ~45 OOS meta-dates,
+# each test combo's 21d purge + 21d overlapping-label embargo consumes ~42
+# dates, so at n_groups=6 only ~4 combos leave a usable train block — BELOW the
+# downside/overfit battery's n≥5 floor, so the gate reported `insufficient` and
+# select_winner could never promote. More groups → more (purged+embargoed —
+# leak protection UNCHANGED) combinations clear the train-size guard (validated:
+# 6→~4, 10→~12 valid combos on a 45-date shape), lifting the distribution over
+# the n≥5 floor. The combos remain edge-dominated until more dates accumulate.
+WF_CPCV_N_GROUPS = _wf_cfg.get("cpcv_n_groups", 10)
 WF_CPCV_K_TEST = _wf_cfg.get("cpcv_k_test", 2)
 # W1.3 (ROADMAP L4469): Deflated Sharpe Ratio gate params (Bailey-LdP). The
 # Deflated Sharpe deflates the IC-IR's significance for the number of trials

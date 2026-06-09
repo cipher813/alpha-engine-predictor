@@ -34,6 +34,7 @@ import argparse
 import contextlib
 import json
 import logging
+import math
 
 import config as cfg
 
@@ -367,13 +368,25 @@ def train_weekly_rotation(
 
 
 def _cpcv_mean(manifest: dict | None):
-    """Leak-free CPCV mean IC from a manifest, or None if absent/unusable."""
+    """Leak-free CPCV mean IC from a manifest, or None if absent/unusable.
+
+    L4565c: a date-starved CPCV run reports ``mean_ic = NaN`` (status
+    ``no_valid_combos``). ``float('nan')`` is not None and silently slips
+    past an ``ic is None`` eligibility check, then every NaN comparison
+    evaluates False — so the candidate is mislabeled ``below_champion_plus_margin``
+    instead of ``no_cpcv``. Collapse non-finite to None here (the single
+    chokepoint — also used for the incumbent ``champ_ic``) so the caller's
+    ``ic is None`` branch catches it correctly.
+    """
     cpcv = (manifest or {}).get("meta_model_oos_ic_cpcv") or {}
     v = cpcv.get("mean_ic")
     try:
-        return float(v) if v is not None else None
+        f = float(v) if v is not None else None
     except (TypeError, ValueError):
         return None
+    if f is not None and not math.isfinite(f):
+        return None
+    return f
 
 
 def _gate_pass(manifest: dict | None) -> bool:
