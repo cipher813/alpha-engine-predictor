@@ -53,6 +53,7 @@ import logging
 import smtplib
 import tempfile
 import time
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -72,6 +73,7 @@ from alpha_engine_lib.secrets import get_secret
 # exclude_patterns starts empty by deliberate convention; add patterns
 # only after observing real ERROR-level noise during training runs.
 from alpha_engine_lib.logging import setup_logging, guard_entrypoint
+from alpha_engine_lib.phase_registry import PhaseRegistry
 _FLOW_DOCTOR_EXCLUDE_PATTERNS: list[str] = []
 _FLOW_DOCTOR_YAML = str(
     Path(__file__).resolve().parent.parent / "flow-doctor-training.yaml"
@@ -923,10 +925,129 @@ def send_training_email(result: dict, date_str: str) -> bool:
 
 # ── Orchestrator ───────────────────────────────────────────────────────────────
 
+_TRAINING_SUMMARY_KEY = "predictor/metrics/training_summary_{date}.json"
+
+
+def _build_registry(
+    bucket: str,
+    date_str: str,
+    dry_run: bool,
+    *,
+    skip_phases: str = "",
+    force_phases: str = "",
+    force: bool = False,
+) -> "PhaseRegistry | None":
+    """Construct the training :class:`PhaseRegistry` (markers under
+    ``predictor/{date}/.phases/`` + watchdog), or ``None`` in dry-run.
+
+    Predictor is the 3rd consumer of the lib phase framework (after the
+    backtester + alpha-engine-data). Dry-run returns None so the smoke pass
+    (``spot_train.sh`` calls ``main(dry_run=True)``) writes no markers. Recovery
+    controls come from explicit args OR, on the spot, the ``PREDICTOR_SKIP_PHASES``
+    / ``PREDICTOR_FORCE_PHASES`` / ``PREDICTOR_FORCE`` env vars (args win).
+    Watchdog caps read from ``config.FULL_RUN_HARD_CAPS_SECONDS`` — best-effort,
+    so a dev/CI run with no ``predictor.yaml`` degrades to an unwatchdogged
+    registry (logged) rather than failing the import.
+    """
+    if dry_run:
+        return None
+    import os as _os
+
+    def _csv(s: str) -> list[str]:
+        return [p.strip() for p in (s or "").split(",") if p.strip()]
+
+    skip = _csv(skip_phases) or _csv(_os.environ.get("PREDICTOR_SKIP_PHASES", ""))
+    fphases = _csv(force_phases) or _csv(_os.environ.get("PREDICTOR_FORCE_PHASES", ""))
+    force_all = bool(force) or _os.environ.get("PREDICTOR_FORCE", "").lower() in ("1", "true", "yes")
+    try:
+        import config as _cfg
+        hard_caps = getattr(_cfg, "FULL_RUN_HARD_CAPS_SECONDS", {}) or {}
+    except Exception as _cap_err:  # config unreadable (dev/CI w/o predictor.yaml)
+        log.warning("phase watchdog caps unavailable (%s) — running unwatchdogged", _cap_err)
+        hard_caps = {}
+    return PhaseRegistry(
+        date=date_str,
+        bucket=bucket,
+        marker_prefix="predictor",
+        skip_phases=skip,
+        force=force_all,
+        force_phases=fphases,
+        hard_caps=hard_caps,
+    )
+
+
+def _maybe_phase(reg: "PhaseRegistry | None", name: str, **log_ctx):
+    """Marker-only phase wrapper (watchdog + START/END marker, no auto-skip) for
+    stages whose body manages its own hard-fail/best-effort posture inline.
+    Returns :func:`contextlib.nullcontext` in dry-run (reg is None)."""
+    if reg is None:
+        return nullcontext()
+    return reg.phase(name, supports_auto_skip=False, **log_ctx)
+
+
+def _load_training_result(bucket: str, date_str: str) -> "dict | None":
+    """Reload a prior run's ``result`` dict from the persisted training summary
+    so a recovery that AUTO-SKIPS the ~90-min ``meta_training`` phase can still
+    drive the downstream summary/risk-model/gate/email/health stages. The summary
+    (``predictor/metrics/training_summary_{date}.json``) IS the json-serialized
+    ``result`` and is the meta_training phase's recorded artifact — so L4524 only
+    auto-skips when it exists, and this reload then succeeds. Mirrors the
+    backtester's ``_load_predictor_artifacts``. 404 → None (caller refuses to
+    proceed on a half-trained state); any other S3 error → raise (fail loud)."""
+    import boto3
+    from botocore.exceptions import ClientError
+
+    key = _TRAINING_SUMMARY_KEY.format(date=date_str)
+    try:
+        obj = boto3.client("s3").get_object(Bucket=bucket, Key=key)
+        return json.loads(obj["Body"].read())
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if code in ("NoSuchKey", "404", "NoSuchBucket", "NotFound"):
+            log.warning(
+                "meta_training auto-skip: training summary s3://%s/%s absent — "
+                "cannot reload result", bucket, key,
+            )
+            return None
+        raise
+
+
+def _write_training_summary(result: dict, bucket: str, date_str: str) -> None:
+    """Annotate + persist the training ``result`` to S3 (dated + latest). Extracted
+    from the inline Step-2d block so the ``meta_training`` phase can record the
+    dated summary as its L4524 artifact (the reload source). Non-blocking: a write
+    failure logs a WARN — the training itself already succeeded."""
+    try:
+        import boto3 as _b3_sum
+        _s3_sum = _b3_sum.client("s3")
+        # Annotate subsample-noise-floor BEFORE the write — reads the PRIOR
+        # cycle's latest.json so the percent-change reference is genuinely
+        # prior-cycle rather than this-cycle.
+        _annotate_subsample_noise_floor(result, _s3_sum, bucket)
+        _sum_body = json.dumps(result, indent=2, default=str).encode()
+        _s3_sum.put_object(
+            Bucket=bucket,
+            Key=_TRAINING_SUMMARY_KEY.format(date=date_str),
+            Body=_sum_body, ContentType="application/json",
+        )
+        _s3_sum.put_object(
+            Bucket=bucket,
+            Key="predictor/metrics/training_summary_latest.json",
+            Body=_sum_body, ContentType="application/json",
+        )
+        log.info("Training summary written to S3 (dated + latest)")
+    except Exception as _sum_err:
+        log.warning("Training summary write failed (non-blocking): %s", _sum_err)
+
+
 def main(
     bucket: str,
     date_str: Optional[str] = None,
     dry_run: bool = False,
+    *,
+    skip_phases: str = "",
+    force_phases: str = "",
+    force: bool = False,
 ) -> dict:
     """Top-level training entrypoint.
 
@@ -940,13 +1061,20 @@ def main(
     here is the true top-level entrypoint.
     """
     with guard_entrypoint():
-        return _main_impl(bucket, date_str=date_str, dry_run=dry_run)
+        return _main_impl(
+            bucket, date_str=date_str, dry_run=dry_run,
+            skip_phases=skip_phases, force_phases=force_phases, force=force,
+        )
 
 
 def _main_impl(
     bucket: str,
     date_str: Optional[str] = None,
     dry_run: bool = False,
+    *,
+    skip_phases: str = "",
+    force_phases: str = "",
+    force: bool = False,
 ) -> dict:
     """
     Entry point called from inference/handler.py for the "train" action.
@@ -968,11 +1096,19 @@ def _main_impl(
     # alpha_engine_lib.logging import). Apply standard log level here.
     logging.getLogger().setLevel(logging.INFO)
 
+    # Phase registry: markers under predictor/{date}/.phases/ + watchdog +
+    # meta_training auto-skip-reload (L4528, 3rd lib consumer). None in dry-run.
+    reg = _build_registry(
+        bucket, date_str, dry_run,
+        skip_phases=skip_phases, force_phases=force_phases, force=force,
+    )
+
     # Preflight — fail fast on env / connectivity / ArcticDB staleness
     # before a 90-minute training run commits to stale data. See PR #6
     # and training/preflight.py.
     from training.preflight import TrainingPreflight
-    TrainingPreflight(bucket=bucket).run()
+    with _maybe_phase(reg, "preflight"):
+        TrainingPreflight(bucket=bucket).run()
 
     log.info("GBM training run: date=%s  bucket=%s  dry_run=%s", date_str, bucket, dry_run)
 
@@ -980,63 +1116,69 @@ def _main_impl(
     # fallback — it masked the PR #3 miswiring for a week (same root cause
     # as the inference-path issue fixed in PR #5). Preflight above already
     # verified macro/SPY freshness, so ArcticDB is known reachable here.
+    # supports_auto_skip=False (via _maybe_phase): the cache lands in local
+    # /tmp, which is empty on a fresh recovery spot, so it must always re-run.
     tmp_cache = Path(tempfile.mkdtemp()) / "cache"
     from store.arctic_reader import download_from_arctic
     log.info("[data_source=arcticdb] Loading universe from ArcticDB...")
-    n_files = download_from_arctic(bucket=bucket, local_dir=tmp_cache)
-
-    if n_files == 0:
-        raise RuntimeError(
-            f"ArcticDB returned zero files for training — "
-            f"universe library is empty or unreachable at bucket={bucket}. "
-            "Check Saturday DataPhase1 + weekly backfill ran cleanly."
-        )
+    with _maybe_phase(reg, "data_load"):
+        n_files = download_from_arctic(bucket=bucket, local_dir=tmp_cache)
+        if n_files == 0:
+            raise RuntimeError(
+                f"ArcticDB returned zero files for training — "
+                f"universe library is empty or unreachable at bucket={bucket}. "
+                "Check Saturday DataPhase1 + weekly backfill ran cleanly."
+            )
 
     # Step 1b: Price cache refresh now handled by alpha-engine-data (Phase 1).
     # The data repo runs weekly_collector.py --phase 1 before training,
     # so S3 parquets are already current.
     log.info("Price cache refresh: skipped (handled by alpha-engine-data)")
 
-    # Step 2: Train + upload (v3 meta-model only — v2 single-GBM and
-    # multi-horizon dispatch branches removed 2026-04-13; v2 machinery
-    # itself still in-tree, full rip-out tracked in ROADMAP).
+    # Step 2 (+ 2d): Train + upload (v3 meta-model only — v2 single-GBM and
+    # multi-horizon dispatch branches removed 2026-04-13; v2 machinery itself
+    # still in-tree, full rip-out tracked in ROADMAP) AND the training-summary
+    # write, folded into ONE `meta_training` phase. The dated summary
+    # (predictor/metrics/training_summary_{date}.json) IS this phase's recorded
+    # L4524 artifact AND the reload source — so on a recovery the phase
+    # AUTO-SKIPS only when training fully completed (weights + summary on S3),
+    # and `result` is reloaded from the summary instead of re-running the
+    # ~90-min long pole. A crash between training and the summary write leaves
+    # the artifact absent → the marker is invalid → a clean re-train. The
+    # watchdog hard-cap on this phase converts an OOM (today an opaque SSM
+    # TimedOut, L4511) into a PhaseTimeoutError + faulthandler dump.
     from training.meta_trainer import run_meta_training
-    result = run_meta_training(
-        data_dir=str(tmp_cache),
-        bucket=bucket,
-        date_str=date_str,
-        dry_run=dry_run,
-    )
 
-    # Step 2b: Slim cache write now handled by alpha-engine-data (Phase 1).
-    # The data repo writes price_cache_slim/ from the full cache after refresh.
-    log.info("Slim cache write: skipped (handled by alpha-engine-data)")
+    def _train_and_summarize() -> dict:
+        _r = run_meta_training(
+            data_dir=str(tmp_cache), bucket=bucket, date_str=date_str, dry_run=dry_run,
+        )
+        # Slim cache write + feature-store registry upload are handled by
+        # alpha-engine-data (Phase 1) — nothing to do here.
+        log.info("Slim cache write: skipped (handled by alpha-engine-data)")
+        if not dry_run:
+            _write_training_summary(_r, bucket, date_str)
+        return _r
 
-    # Feature store registry upload removed — alpha-engine-data handles this now.
-
-    # Step 2d: Write training summary to S3 (works for all modes)
-    if not dry_run:
-        try:
-            import boto3 as _b3_sum
-            _s3_sum = _b3_sum.client("s3")
-            # Annotate subsample-noise-floor BEFORE the write — reads the
-            # PRIOR cycle's latest.json so the percent-change reference is
-            # genuinely prior-cycle rather than this-cycle.
-            _annotate_subsample_noise_floor(result, _s3_sum, bucket)
-            _sum_body = json.dumps(result, indent=2, default=str).encode()
-            _s3_sum.put_object(
-                Bucket=bucket,
-                Key=f"predictor/metrics/training_summary_{date_str}.json",
-                Body=_sum_body, ContentType="application/json",
-            )
-            _s3_sum.put_object(
-                Bucket=bucket,
-                Key="predictor/metrics/training_summary_latest.json",
-                Body=_sum_body, ContentType="application/json",
-            )
-            log.info("Training summary written to S3 (dated + latest)")
-        except Exception as _sum_err:
-            log.warning("Training summary write failed (non-blocking): %s", _sum_err)
+    if reg is None:
+        result = _train_and_summarize()
+    else:
+        with reg.phase("meta_training", supports_auto_skip=True) as ctx:
+            if ctx.skipped:
+                result = _load_training_result(bucket, date_str)
+                if result is None:
+                    raise RuntimeError(
+                        "meta_training marker is ok but the training summary is absent "
+                        "— refusing to proceed on a half-trained state. Re-run with "
+                        "--force-phases=meta_training (PREDICTOR_FORCE_PHASES=meta_training)."
+                    )
+                log.info(
+                    "meta_training auto-skipped (%s) — reloaded result from summary",
+                    ctx.skip_reason,
+                )
+            else:
+                result = _train_and_summarize()
+                ctx.record_artifact(_TRAINING_SUMMARY_KEY.format(date=date_str))
 
     # Step 2d2: Factor-risk-model F + D weekly persistence (ROADMAP C.2b).
     # Reads the per-ticker parquets the train_handler already populated
@@ -1061,11 +1203,12 @@ def _main_impl(
             from training.risk_model_persist import (
                 build_and_persist_risk_model,
             )
-            _rm_payload = build_and_persist_risk_model(
-                data_dir=str(tmp_cache),
-                bucket=bucket,
-                date_str=date_str,
-            )
+            with _maybe_phase(reg, "risk_model_persist"):
+                _rm_payload = build_and_persist_risk_model(
+                    data_dir=str(tmp_cache),
+                    bucket=bucket,
+                    date_str=date_str,
+                )
             result["risk_model"] = _rm_payload
             log.info(
                 "risk_model_persist: status=%s",
@@ -1094,13 +1237,14 @@ def _main_impl(
     if not dry_run:
         try:
             from analysis.triple_barrier_cutover_runner import run_gate as _run_tb_gate
-            _gate_payload = _run_tb_gate(
-                bucket=bucket,
-                n_days=42,
-                horizon_days=21,
-                threshold=1.15,
-                write_to_s3=True,
-            )
+            with _maybe_phase(reg, "triple_barrier_gate"):
+                _gate_payload = _run_tb_gate(
+                    bucket=bucket,
+                    n_days=42,
+                    horizon_days=21,
+                    threshold=1.15,
+                    write_to_s3=True,
+                )
             result["triple_barrier_cutover_gate"] = {
                 "passed": _gate_payload.get("passed"),
                 "n_pairs": _gate_payload.get("n_pairs"),

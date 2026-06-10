@@ -100,15 +100,16 @@ class TestTrainHandlerCutoverGateWiring:
         assert '"reason":' in src
 
     def test_gate_runs_after_summary_before_email(self):
-        # Step 2e (gate) must run AFTER step 2d (training summary write)
-        # — gate consumes the freshly-uploaded artifacts — and BEFORE
-        # step 3 (training email send) — email surfaces gate result.
+        # Step 2e (gate) must run AFTER the training-summary write (now folded
+        # into the L4528 `meta_training` phase, "Step 2 (+ 2d)") — the gate
+        # consumes the freshly-uploaded artifacts — and BEFORE step 3 (training
+        # email send), which surfaces the gate result.
         src = _src("training/train_handler.py")
-        summary_idx = src.find("Step 2d: Write training summary to S3")
+        summary_idx = src.find("Step 2 (+ 2d): Train")
         gate_idx = src.find("Step 2e: Triple-barrier cutover gate")
         email_idx = src.find("Step 3: Email")
         assert summary_idx != -1 and gate_idx != -1 and email_idx != -1
         assert summary_idx < gate_idx < email_idx, (
-            "Step 2e (cutover gate) must sit between Step 2d (summary write) "
-            "and Step 3 (email send)"
+            "Step 2e (cutover gate) must sit between the meta_training+summary "
+            "phase and Step 3 (email send)"
         )

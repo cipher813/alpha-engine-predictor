@@ -145,6 +145,15 @@ gates:
   # gate maps to 0.20 under the new convention via new = (old - 0.5) * 2.
   min_confidence: 0.20
 
+# ── Phase-registry watchdog caps (L4528) ──────────────────────────────────────
+# Per-phase hard caps (seconds) for the training spot's phase_registry watchdog
+# (alpha_engine_lib.phase_registry). A phase exceeding its cap trips an
+# all-thread stack dump + PhaseTimeoutError — turning the OOM-prone meta_training
+# long pole's opaque SSM "TimedOut" (L4511) into a clean, attributable failure.
+# Omit the block (or a given phase) to leave that phase unwatchdogged.
+full_run_hard_caps_seconds:
+  meta_training: 6000              # ~100 min — the L1×3 + L2 stack long pole
+
 # ── Training split ────────────────────────────────────────────────────────────
 split:
   train_frac: 0.70                 # fraction of data for training

@@ -38,6 +38,14 @@ def _load() -> dict:
 
 _cfg = _load()
 
+# ── Phase-registry watchdog caps (L4528) ──────────────────────────────────────
+# Per-phase hard caps (seconds) for the training spot's phase_registry watchdog.
+# A phase exceeding its cap trips an all-thread stack dump + PhaseTimeoutError —
+# converting the OOM-prone meta_training's opaque SSM ``TimedOut`` (L4511) into a
+# clean, attributable failure. Absent / empty → watchdog off (no behavior
+# change). The live cap value lands in alpha-engine-config/predictor/predictor.yaml.
+FULL_RUN_HARD_CAPS_SECONDS = _cfg.get("full_run_hard_caps_seconds", {}) or {}
+
 # ── S3 paths ─────────────────────────────────────────────────────────────────
 S3_BUCKET = "alpha-engine-research"
 
