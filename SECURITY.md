@@ -1,6 +1,6 @@
 # Security Policy
 
-Nous Ergon / Alpha Engine is a single-developer portfolio project running paper-account trading. No customer funds, no production user data.
+Nous Ergon / Alpha Engine runs paper-account trading. No customer funds, no production user data.
 
 ## Reporting a vulnerability
 
