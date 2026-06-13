@@ -1,4 +1,12 @@
-"""Tests for monitoring.drift_detector — feature + prediction drift checks."""
+"""Tests for monitoring.drift_detector — feature + prediction drift checks.
+
+check_feature_drift / check_prediction_drift now return a list of STRUCTURED
+alert dicts (``{code, severity, headline, detail, cause, action, line, ...}``)
+so each alert is self-describing (severity + distance-from-threshold + trend +
+cause + action). ``check_drift`` keeps ``alerts`` as a backward-compatible
+list[str] (the rendered ``line`` of each) and adds ``severity``,
+``alert_details`` and ``skipped_checks``.
+"""
 
 import io
 import json
@@ -12,14 +20,31 @@ from monitoring.drift_detector import (
     ALPHA_MIN_STDEV,
     CONFIDENCE_MIN_MEAN,
     CONSECUTIVE_DAYS_THRESHOLD,
+    CRITICAL,
     DIRECTION_CLUSTER_THRESHOLD,
     FEATURE_ZSCORE_THRESHOLD,
+    INFO,
+    WARN,
     _load_json,
     _load_parquet,
+    _max_severity,
     check_drift,
     check_feature_drift,
     check_prediction_drift,
+    format_alert_report,
 )
+
+
+# ── helpers ─────────────────────────────────────────────────────────────────
+
+
+def _lines(alerts):
+    """Rendered ``line`` of each structured alert (what flows to alerts/SNS)."""
+    return [a["line"] for a in alerts]
+
+
+def _codes(alerts):
+    return [a["code"] for a in alerts]
 
 
 # ── S3 helpers ──────────────────────────────────────────────────────────────
@@ -82,6 +107,16 @@ def test_load_parquet_failure_returns_none():
     assert _load_parquet(s3, "bucket", "missing.parquet") is None
 
 
+# ── severity helper ─────────────────────────────────────────────────────────
+
+
+def test_max_severity_orders_correctly():
+    assert _max_severity([INFO, WARN, CRITICAL]) == CRITICAL
+    assert _max_severity([INFO, WARN]) == WARN
+    assert _max_severity([INFO]) == INFO
+    assert _max_severity([]) is None
+
+
 # ── check_feature_drift ────────────────────────────────────────────────────
 
 
@@ -98,7 +133,9 @@ def test_check_feature_drift_missing_snapshot_alerts():
         # no feature snapshot for the date → triggers "Feature snapshot missing"
     })
     alerts = check_feature_drift(s3, "bucket", "2026-04-01")
-    assert any("Feature snapshot missing" in a for a in alerts)
+    assert "feature_snapshot_missing" in _codes(alerts)
+    assert any("Feature snapshot missing" in ln for ln in _lines(alerts))
+    assert alerts[0]["severity"] == WARN
 
 
 def test_check_feature_drift_flags_zscore_above_threshold():
@@ -119,8 +156,23 @@ def test_check_feature_drift_flags_zscore_above_threshold():
     })
     alerts = check_feature_drift(s3, "bucket", "2026-04-01")
     assert len(alerts) == 1
-    assert "rsi_14" in alerts[0]
-    assert "Feature drift" in alerts[0]
+    assert alerts[0]["code"] == "feature_drift"
+    assert "rsi_14" in alerts[0]["line"]
+    assert "Feature drift" in alerts[0]["line"]
+    # z=4 < 5 → WARN (not a hard break)
+    assert alerts[0]["severity"] == WARN
+    assert alerts[0]["max_zscore"] == pytest.approx(4.0, abs=0.01)
+
+
+def test_check_feature_drift_extreme_zscore_is_critical():
+    stats = {"mean": [50.0], "std": [10.0], "features": ["rsi_14"]}
+    snapshot = pd.DataFrame({"rsi_14": [120.0, 120.0, 120.0]})  # z=7 → CRITICAL
+    s3 = _s3_with_routes({
+        "predictor/metrics/training_feature_stats.json": ("json", stats),
+        "features/2026-04-01/technical.parquet": ("parquet", snapshot),
+    })
+    alerts = check_feature_drift(s3, "bucket", "2026-04-01")
+    assert alerts[0]["severity"] == CRITICAL
 
 
 def test_check_feature_drift_skips_constant_features():
@@ -172,7 +224,8 @@ def test_check_prediction_drift_no_recent_alerts():
     s3 = MagicMock()
     s3.get_object.side_effect = RuntimeError("missing")
     alerts = check_prediction_drift(s3, "bucket", "2026-04-15")
-    assert alerts == ["No recent predictions found"]
+    assert _codes(alerts) == ["no_recent_predictions"]
+    assert alerts[0]["severity"] == CRITICAL
 
 
 def test_check_prediction_drift_empty_today_alerts():
@@ -180,47 +233,76 @@ def test_check_prediction_drift_empty_today_alerts():
         "predictor/predictions/2026-04-15.json": ("json", {"predictions": []}),
     })
     alerts = check_prediction_drift(s3, "bucket", "2026-04-15")
-    assert any("empty" in a.lower() for a in alerts)
+    assert _codes(alerts) == ["today_predictions_empty"]
+    assert alerts[0]["severity"] == CRITICAL
+    assert any("empty" in ln.lower() for ln in _lines(alerts))
 
 
 def test_check_prediction_drift_flags_single_day_clustering():
-    """90% UP on today only → single-day cluster alert."""
+    """90% UP on today only → single-day cluster alert (WARN)."""
     preds = _make_preds(directions=["UP"] * 18 + ["DOWN"] * 2)
     s3 = _s3_with_routes({
         "predictor/predictions/2026-04-15.json": ("json", preds),
     })
     alerts = check_prediction_drift(s3, "bucket", "2026-04-15")
-    assert any("Direction clustering" in a and "UP" in a for a in alerts)
+    cluster = [a for a in alerts if a["code"] == "direction_clustering"]
+    assert cluster and cluster[0]["dominant_direction"] == "UP"
+    assert cluster[0]["severity"] == WARN
     # Single day → no persistent cluster
-    assert not any("PERSISTENT" in a for a in alerts)
+    assert "persistent_direction_clustering" not in _codes(alerts)
 
 
 def test_check_prediction_drift_persistent_clustering_alert():
-    """N consecutive trading days all clustered → PERSISTENT alert."""
+    """N consecutive trading days all clustered → PERSISTENT alert (CRITICAL)."""
     clustered_preds = _make_preds(directions=["UP"] * 19 + ["DOWN"] * 1)
 
     routes = {}
-    # Lay down 5 trading-day files going back from 2026-04-15
     days = ["2026-04-15", "2026-04-14", "2026-04-13", "2026-04-12", "2026-04-11"]
     for d in days:
         routes[f"predictor/predictions/{d}.json"] = ("json", clustered_preds)
 
     s3 = _s3_with_routes(routes)
     alerts = check_prediction_drift(s3, "bucket", "2026-04-15")
-    assert any("PERSISTENT" in a for a in alerts)
-    assert any(str(CONSECUTIVE_DAYS_THRESHOLD) in a for a in alerts)
+    persistent = [a for a in alerts if a["code"] == "persistent_direction_clustering"]
+    assert persistent and persistent[0]["severity"] == CRITICAL
+    assert str(CONSECUTIVE_DAYS_THRESHOLD) in persistent[0]["line"]
 
 
-def test_check_prediction_drift_flags_confidence_collapse():
-    preds = _make_preds(
-        directions=["UP", "DOWN", "FLAT"] * 7,  # diversified to avoid clustering
-        confidences=[0.40] * 21,                # below CONFIDENCE_MIN_MEAN
-    )
-    s3 = _s3_with_routes({
-        "predictor/predictions/2026-04-15.json": ("json", preds),
-    })
+def test_confidence_collapse_chronic_is_warn():
+    """Below the floor every recent day → CHRONIC, WARN (standing weak model)."""
+    routes = {}
+    for d in ["2026-04-15", "2026-04-14", "2026-04-13", "2026-04-12", "2026-04-11"]:
+        routes[f"predictor/predictions/{d}.json"] = ("json", _make_preds(
+            directions=["UP", "DOWN", "FLAT"] * 7,  # diversified to avoid clustering
+            confidences=[0.27] * 21,                # chronically below floor
+            n=21,
+        ))
+    s3 = _s3_with_routes(routes)
     alerts = check_prediction_drift(s3, "bucket", "2026-04-15")
-    assert any("Confidence collapse" in a for a in alerts)
+    cc = [a for a in alerts if a["code"] == "confidence_collapse"]
+    assert cc, "expected a confidence_collapse alert"
+    assert cc[0]["trend"] == "chronic"
+    assert cc[0]["severity"] == WARN
+    assert "CHRONIC" in cc[0]["line"]
+    # carries the distance from threshold for triage
+    assert cc[0]["pct_below_threshold"] == pytest.approx((0.45 - 0.27) / 0.45, abs=0.01)
+
+
+def test_confidence_collapse_acute_is_critical():
+    """Healthy prior days, only today collapses → ACUTE, CRITICAL."""
+    routes = {
+        "predictor/predictions/2026-04-15.json": ("json", _make_preds(
+            directions=["UP", "DOWN", "FLAT"] * 7, confidences=[0.20] * 21, n=21)),
+    }
+    for d in ["2026-04-14", "2026-04-13", "2026-04-12"]:
+        routes[f"predictor/predictions/{d}.json"] = ("json", _make_preds(
+            directions=["UP", "DOWN", "FLAT"] * 7, confidences=[0.70] * 21, n=21))
+    s3 = _s3_with_routes(routes)
+    alerts = check_prediction_drift(s3, "bucket", "2026-04-15")
+    cc = [a for a in alerts if a["code"] == "confidence_collapse"]
+    assert cc and cc[0]["trend"] == "acute"
+    assert cc[0]["severity"] == CRITICAL
+    assert "ACUTE" in cc[0]["line"]
 
 
 def test_check_prediction_drift_flags_alpha_degeneration():
@@ -233,7 +315,8 @@ def test_check_prediction_drift_flags_alpha_degeneration():
         "predictor/predictions/2026-04-15.json": ("json", preds),
     })
     alerts = check_prediction_drift(s3, "bucket", "2026-04-15")
-    assert any("Alpha degeneration" in a for a in alerts)
+    deg = [a for a in alerts if a["code"] == "alpha_degeneration"]
+    assert deg and deg[0]["severity"] == CRITICAL
 
 
 def test_check_prediction_drift_clean_no_alerts():
@@ -262,8 +345,7 @@ def test_check_prediction_drift_ignores_none_directions():
         "predictor/predictions/2026-04-15.json": ("json", payload),
     })
     alerts = check_prediction_drift(s3, "bucket", "2026-04-15")
-    # No direction info → no direction-clustering alert, but possible alpha degeneration
-    assert not any("Direction clustering" in a for a in alerts)
+    assert "direction_clustering" not in _codes(alerts)
 
 
 # ── check_drift (top-level orchestrator) ───────────────────────────────────
@@ -279,7 +361,7 @@ def test_check_drift_ok_when_no_alerts():
     )
     fake_s3 = _s3_with_routes({
         "predictor/predictions/2026-04-15.json": ("json", preds),
-        # No training_feature_stats → check_feature_drift returns []
+        # No training_feature_stats → feature drift skipped (recorded, not silent)
     })
     fake_s3.put_object = MagicMock()
     with patch("boto3.client", return_value=fake_s3):
@@ -288,15 +370,18 @@ def test_check_drift_ok_when_no_alerts():
     assert result["status"] == "ok"
     assert result["alerts"] == []
     assert result["n_alerts"] == 0
+    assert result["severity"] is None
     assert result["date"] == "2026-04-15"
-    # Result should be persisted to S3
+    # feature-drift skip is surfaced, not silent
+    assert any(s["check"] == "feature_drift" for s in result["skipped_checks"])
+    # Result persisted to S3
     fake_s3.put_object.assert_called_once()
     args = fake_s3.put_object.call_args.kwargs
     assert args["Key"] == "predictor/metrics/drift_2026-04-15.json"
 
 
-def test_check_drift_alert_status_when_drift_present():
-    preds = _make_preds(directions=["UP"] * 20)  # 100% clustering
+def test_check_drift_alert_status_and_severity():
+    preds = _make_preds(directions=["UP"] * 20)  # 100% clustering → WARN single-day
     fake_s3 = _s3_with_routes({
         "predictor/predictions/2026-04-15.json": ("json", preds),
     })
@@ -306,13 +391,44 @@ def test_check_drift_alert_status_when_drift_present():
 
     assert result["status"] == "alert"
     assert result["n_alerts"] >= 1
+    assert result["severity"] in (WARN, CRITICAL)
     assert any("Direction clustering" in a for a in result["alerts"])
+    # alerts stays a list[str]; structured detail is additive
+    assert all(isinstance(a, str) for a in result["alerts"])
+    assert all("severity" in d for d in result["alert_details"])
+
+
+def test_check_drift_severity_is_max_across_alerts():
+    """A CRITICAL alpha-degeneration outranks a WARN clustering → overall CRITICAL."""
+    preds = _make_preds(directions=["UP"] * 20, alphas=[0.05] * 20)  # cluster WARN + alpha CRITICAL
+    fake_s3 = _s3_with_routes({
+        "predictor/predictions/2026-04-15.json": ("json", preds),
+    })
+    fake_s3.put_object = MagicMock()
+    with patch("boto3.client", return_value=fake_s3):
+        result = check_drift(bucket="bucket", date_str="2026-04-15")
+    assert result["severity"] == CRITICAL
 
 
 def test_check_drift_swallows_put_object_failure():
     fake_s3 = _s3_with_routes({})
     fake_s3.put_object = MagicMock(side_effect=RuntimeError("S3 down"))
     with patch("boto3.client", return_value=fake_s3):
-        # Should not raise even though put_object fails
         result = check_drift(bucket="bucket", date_str="2026-04-15")
     assert result["status"] == "alert"  # missing preds → "No recent predictions"
+
+
+def test_format_alert_report_is_severity_led():
+    preds = _make_preds(directions=["UP"] * 20, alphas=[0.05] * 20)
+    fake_s3 = _s3_with_routes({
+        "predictor/predictions/2026-04-15.json": ("json", preds),
+    })
+    fake_s3.put_object = MagicMock()
+    with patch("boto3.client", return_value=fake_s3):
+        result = check_drift(bucket="bucket", date_str="2026-04-15")
+    report = format_alert_report(result)
+    assert report.startswith("SEVERITY: ")
+    assert "CRITICAL" in report
+    # each alert renders its labeled block
+    assert "Likely cause:" in report
+    assert "Action:" in report
