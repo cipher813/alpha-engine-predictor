@@ -57,6 +57,19 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # ── Configuration ──────────────────────────────────────────────────────────────
 AWS_REGION="${AWS_REGION:-us-east-1}"
 S3_BUCKET="${S3_BUCKET:-alpha-engine-research}"
+# config#1066 — experiment package. config.py searches
+# ~/alpha-engine-config/experiments/$ALPHA_ENGINE_EXPERIMENT_ID/predictor/predictor.yaml
+# FIRST (the 2026-06-12 experiment-package adoption), then the legacy
+# config/predictor.yaml. The spot is a bare predictor clone with NO
+# alpha-engine-config tree, so the experiment path is absent and resolution
+# silently falls through to config/predictor.yaml — a coincidence that was the
+# 6/13 inert-rotation fragility (MODEL_SPECS empty → 0 challengers trained).
+# We pin the id here, EXPORT it into every spot heredoc, and stage the yaml to
+# BOTH the experiment-package path AND config/predictor.yaml on the spot so
+# config.py resolves DETERMINISTICALLY to the staged, MODEL_SPECS-populated yaml
+# via the SAME path it uses on the always-on box. Default "reference" matches
+# config.py's own _EXPERIMENT_ID default.
+ALPHA_ENGINE_EXPERIMENT_ID="${ALPHA_ENGINE_EXPERIMENT_ID:-reference}"
 BRANCH="${BRANCH:-main}"
 # Capacity-resilient instance-type fallback set (2026-05-22 incident:
 # spot launches in single-AZ subnet-e07166ec/us-east-1f hit
@@ -264,7 +277,7 @@ run_ssm() {
 echo "==> Bootstrapping spot (watchdog, python, clone, config)..."
 run_ssm "bootstrap" "$(cat <<BOOTSTRAP
 set -eo pipefail
-export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1 ALPHA_ENGINE_DEPLOYED=1
+export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1 ALPHA_ENGINE_DEPLOYED=1 ALPHA_ENGINE_EXPERIMENT_ID=${ALPHA_ENGINE_EXPERIMENT_ID}
 
 # Spot-side hard-timeout watchdog. The dispatcher-side 'trap cleanup EXIT'
 # only fires if THIS script exits; if the dispatcher is killed/cancelled the
@@ -279,8 +292,14 @@ command -v python3.12 >/dev/null && PY=python3.12 || PY=python3
 echo "Using: \$(\$PY --version)"
 
 git clone --depth 1 --branch ${BRANCH} ${REPO_URL} /home/ec2-user/predictor
+# config#1066 — stage the yaml to BOTH paths config.py searches: the
+# experiment-package path it tries FIRST and the legacy config/predictor.yaml
+# fallback. Both copies are byte-identical from the same staged source, so
+# MODEL_SPECS populates deterministically regardless of which path wins.
+mkdir -p /home/ec2-user/alpha-engine-config/experiments/${ALPHA_ENGINE_EXPERIMENT_ID}/predictor
+aws s3 cp ${S3_STAGING}/predictor.yaml /home/ec2-user/alpha-engine-config/experiments/${ALPHA_ENGINE_EXPERIMENT_ID}/predictor/predictor.yaml --region ${AWS_REGION}
 aws s3 cp ${S3_STAGING}/predictor.yaml /home/ec2-user/predictor/config/predictor.yaml --region ${AWS_REGION}
-echo "Bootstrap complete: repo cloned, predictor.yaml staged from S3."
+echo "Bootstrap complete: repo cloned, predictor.yaml staged to experiment package ${ALPHA_ENGINE_EXPERIMENT_ID} plus config fallback."
 BOOTSTRAP
 )" 600
 
@@ -288,7 +307,7 @@ BOOTSTRAP
 echo "==> Installing Python dependencies..."
 run_ssm "deps" "$(cat <<'DEPS'
 set -eo pipefail
-export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1 ALPHA_ENGINE_DEPLOYED=1
+export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1 ALPHA_ENGINE_DEPLOYED=1 ALPHA_ENGINE_EXPERIMENT_ID=reference
 cd /home/ec2-user/predictor
 command -v python3.12 >/dev/null && PIP="python3.12 -m pip" || PIP="python3 -m pip"
 $PIP install --upgrade pip -q
@@ -326,7 +345,7 @@ if [ "$MODE" = "preflight-only" ]; then
   echo "═══════════════════════════════════════════════════════════════"
   run_ssm "preflight-only" "$(cat <<'PREFLIGHT'
 set -eo pipefail
-export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1 ALPHA_ENGINE_DEPLOYED=1
+export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1 ALPHA_ENGINE_DEPLOYED=1 ALPHA_ENGINE_EXPERIMENT_ID=reference
 cd /home/ec2-user/predictor
 command -v python3.12 >/dev/null && PY=python3.12 || PY=python3
 $PY - <<'PYEOF'
@@ -404,7 +423,7 @@ if [ "$MODE" != "full-only" ] && [ "$MODE" != "model-zoo-weekly" ]; then
   echo "═══════════════════════════════════════════════════════════════"
   run_ssm "smoke" "$(cat <<'SMOKE'
 set -eo pipefail
-export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1 ALPHA_ENGINE_DEPLOYED=1
+export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1 ALPHA_ENGINE_DEPLOYED=1 ALPHA_ENGINE_EXPERIMENT_ID=reference
 cd /home/ec2-user/predictor
 command -v python3.12 >/dev/null && PY=python3.12 || PY=python3
 $PY - <<'PYEOF'
@@ -502,7 +521,13 @@ if [ "$MODE" = "model-zoo-weekly" ]; then
   echo "═══════════════════════════════════════════════════════════════"
   run_ssm "model-zoo-weekly" "$(cat <<'ZOO'
 set -eo pipefail
-export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1 ALPHA_ENGINE_DEPLOYED=1
+# config#1066 — pin ALPHA_ENGINE_EXPERIMENT_ID so config.py loads the staged
+# experiment-package yaml, MODEL_SPECS populates, and the rotation trains
+# challengers. The probe below logs the resolved path + count for diagnosis.
+# NOTE keep this heredoc free of apostrophes and parens: bash 3.2 scans even a
+# quoted heredoc body for the closing paren of the enclosing run_ssm command
+# substitution.
+export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1 ALPHA_ENGINE_DEPLOYED=1 ALPHA_ENGINE_EXPERIMENT_ID=reference
 cd /home/ec2-user/predictor
 command -v python3.12 >/dev/null && PY=python3.12 || PY=python3
 $PY - <<'PYEOF'
@@ -576,7 +601,7 @@ echo "  FULL TRAINING (dry_run=False)"
 echo "═══════════════════════════════════════════════════════════════"
 run_ssm "full-training" "$(cat <<'TRAIN'
 set -eo pipefail
-export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1 ALPHA_ENGINE_DEPLOYED=1
+export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1 ALPHA_ENGINE_DEPLOYED=1 ALPHA_ENGINE_EXPERIMENT_ID=reference
 cd /home/ec2-user/predictor
 command -v python3.12 >/dev/null && PY=python3.12 || PY=python3
 $PY - <<'PYEOF'
