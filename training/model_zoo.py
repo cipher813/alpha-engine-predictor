@@ -371,6 +371,17 @@ def train_weekly_rotation(
 # mean IC (gated by the downside-Sortino + DSR battery) and pick a winner that
 # beats the live champion by a margin. The realized-edge leaderboard (L4539) is
 # the SLOWER confirm/demote layer — this is the immediate training-time selector.
+#
+# DEPTH NOTE (config #671, C — Re-exam: 2026-10-15): the FULL promotion gate
+# (downside + DSR >= WF_DSR_THRESHOLD, default 0.95) is correct but DATA-STARVED.
+# At ~45 dates / 21d horizon there is ≈ 1 independent block, so the 0.95 DSR bar
+# needs an IC-IR ≈ 1.0 — not realistically passable until ~late-2026 once enough
+# independent 21d blocks accrue. The thresholds are DELIBERATELY left un-weakened
+# (operator gate). The principled path while the full gate is too young: a
+# challenger that beats the champion + clears the LOWER registry bar is moved to
+# the SHADOW-ONLY observe tier (Option B), and its REALIZED edge — not training
+# DSR — gates a later observe→champion promotion (Option A / L4539 leaderboard).
+# Re-examine the full-gate floor's reachability on 2026-10-15 (recorded on #671).
 
 
 def _cpcv_mean(manifest: dict | None):
@@ -623,6 +634,12 @@ def select_winner(
         ic = _cpcv_mean(manifest)
         gate = _gate_pass(manifest)
         registry_bar = _registry_bar_pass(manifest)
+        # config #671 — Option B observe-tier signal. A challenger that beats the
+        # champion's CPCV mean IC by ``margin`` (same horizon).
+        beats_champion = (
+            ic is not None
+            and (champ_ic is None or ic >= champ_ic + margin)
+        )
         if fwd != champ_fwd:
             eligible, reason = False, "non_canonical_horizon"
         elif ic is None:
@@ -636,19 +653,45 @@ def select_winner(
             eligible, reason = False, "below_champion_plus_margin"
         else:
             eligible, reason = True, "eligible"
+        # Observe-eligible (config #671 — Option B): clears the LOWER registry bar
+        # AND beats the champion by margin AND is the right horizon, but does NOT
+        # clear the FULL promotion gate (i.e. NOT already promotion-eligible).
+        # Such a challenger is moved to the shadow-only ``observe`` tier so its
+        # REALIZED edge accrues (it never trades capital here). A full-gate-pass
+        # winner is handled by the promotion path, not observe.
+        observe_eligible = bool(
+            fwd == champ_fwd
+            and registry_bar
+            and beats_champion
+            and not eligible
+        )
         # L4582(b): re-deflate this candidate's CPCV IC series by the CUMULATIVE
         # trial count — the honest multiple-testing N once rotations accumulate
         # (the manifest's training-time DSR used the within-run n_combos proxy).
+        # config #671 — A1: feed an EFFECTIVE observation count (n_eff) instead of
+        # the raw CPCV combo count. The LdP backtest-path φ = (k/N)·C(N,k)
+        # (manifest ``meta_model_oos_ic_cpcv.n_backtest_paths``) is the honest
+        # independent-block count on overlapping 21d labels; it TIGHTENS the DSR
+        # (more honest), never loosens it. Surfaced via dsr_selection_n_eff +
+        # the 'needs ~Y' bar so a 'too young' verdict is explicit, not silent.
         dsr_selection = None
-        _ics = ((manifest or {}).get("meta_model_oos_ic_cpcv") or {}).get("ics") or []
+        dsr_selection_n_eff = None
+        ic_ir_needed = None
+        _cpcv = (manifest or {}).get("meta_model_oos_ic_cpcv") or {}
+        _ics = _cpcv.get("ics") or []
+        _n_paths = _cpcv.get("n_backtest_paths")
         if _ics and n_trials_cumulative:
             try:
                 from training.deflated_sharpe import deflated_sharpe_ratio
+                _n_eff = int(_n_paths) if isinstance(_n_paths, (int, float)) and _n_paths else None
                 _d = deflated_sharpe_ratio(
                     _ics, n_trials=int(n_trials_cumulative),
                     threshold=float(getattr(cfg, "WF_DSR_THRESHOLD", 0.95)),
+                    n_eff=_n_eff,
                 )
                 dsr_selection = _d.get("dsr")
+                dsr_selection_n_eff = _d.get("n_used")
+                ic_ir_needed = _d.get("ic_ir_needed_for_threshold")
             except Exception:  # noqa: BLE001 — observe-only stat, never blocks ranking
                 log.warning("model_zoo select: dsr_selection failed for %s", vid, exc_info=True)
         candidates.append({
@@ -656,14 +699,39 @@ def select_winner(
             "model_version": rec.get("model_version"),
             "forward_days": fwd, "cpcv_mean_ic": ic, "passes_gate": gate,
             "registry_bar_pass": registry_bar,
+            "beats_champion_by_margin": beats_champion,
+            "observe_eligible": observe_eligible,
             "dsr_training": _manifest_dsr(manifest),
             "dsr_selection": dsr_selection,
+            # config #671 A1: the effective-N that fed dsr_selection + the IC-IR a
+            # series of that independent length needs to clear the full DSR bar.
+            "dsr_selection_n_eff": dsr_selection_n_eff,
+            "ic_ir_needed_for_full_bar": ic_ir_needed,
             "eligible": eligible, "reason": reason,
         })
 
     eligibles = [c for c in candidates if c["eligible"]]
     winner = max(eligibles, key=lambda c: c["cpcv_mean_ic"], default=None)
+    # config #671 — Option B: observe-eligible challengers that did NOT clear the
+    # full promotion gate (a full-gate winner is promoted, not observed).
+    observe_eligibles = [
+        c for c in candidates if c.get("observe_eligible") and not c["eligible"]
+    ]
     selection_pbo = _selection_pbo(candidates, manifests)
+    # config #671 — A1: surface the effective-N + the IC-IR each candidate would
+    # need to clear the full DSR bar, so a data-starved 'too young' verdict is
+    # explicit rather than a silent gate fail (the full bar is passable only once
+    # enough independent 21d blocks accrue; Re-exam: 2026-10-15 — see #671).
+    for c in candidates:
+        if c.get("dsr_selection_n_eff") is not None:
+            log.info(
+                "model_zoo A1 (config#671): %s n_eff=%s feeds DSR (needs IC-IR~%s "
+                "for the %.2f full bar); dsr_selection=%s, dsr_training=%s",
+                c.get("spec_id"), c.get("dsr_selection_n_eff"),
+                c.get("ic_ir_needed_for_full_bar"),
+                float(getattr(cfg, "WF_DSR_THRESHOLD", 0.95)),
+                c.get("dsr_selection"), c.get("dsr_training"),
+            )
     log.info(
         "model_zoo selection PBO (OBSERVE, L4582): %s pbo=%s (target<%s, pass=%s) "
         "over %s specs / %s splits; n_trials_cumulative=%s",
@@ -677,6 +745,9 @@ def select_winner(
         "margin": margin,
         "candidates": candidates,
         "winner_version_id": winner["version_id"] if winner else None,
+        # config #671 — Option B: challengers to move to the shadow-only observe
+        # tier (beat champ + clear registry bar, but not the full promotion gate).
+        "observe_eligible_version_ids": [c["version_id"] for c in observe_eligibles],
         "selection_pbo": selection_pbo,
         "n_trials_cumulative": n_trials_cumulative,
     }
@@ -841,6 +912,44 @@ def _alert_observe_recommendation(bucket, date_str, leaderboard, winner_vid) -> 
         log.warning("model_zoo: observe alert failed", exc_info=True)
 
 
+def _alert_observe_tier(bucket, date_str, leaderboard, moved_vids) -> None:
+    """config #671 — Option B: challenger(s) moved to the shadow-only observe
+    tier (beat the champion + cleared the registry bar, but not the full DSR
+    promotion bar — which is data-starved until ~late-2026). Info-tier heads-up
+    so the operator knows shadow-live tracking started; it carries ZERO live
+    allocation. Never raises."""
+    try:
+        lines = []
+        for vid in moved_vids:
+            c = _candidate_by_vid(leaderboard, vid)
+            lines.append(
+                f"  {vid} (spec {c.get('spec_id','?')}): CPCV IC {c.get('cpcv_mean_ic')} "
+                f"vs champ {(leaderboard.get('champion') or {}).get('cpcv_mean_ic')}; "
+                f"dsr_training={c.get('dsr_training')} (full bar needs IC-IR~"
+                f"{c.get('ic_ir_needed_for_full_bar')} on n_eff="
+                f"{c.get('dsr_selection_n_eff')})"
+            )
+        msg = (
+            f"[predictor] Model-zoo moved {len(moved_vids)} challenger(s) to the "
+            f"OBSERVE (shadow-live) tier ({date_str}) — config#671 Option B.\n"
+            + "\n".join(lines) + "\n"
+            f"  SHADOW-ONLY: zero live allocation. Realized 21d edge now accrues "
+            f"under predictor/predictions_shadow/<vid>/; the observe leaderboard "
+            f"(predictor/model_zoo/observe_leaderboard/) gates any later "
+            f"observe→champion promotion on REALIZED edge (>=4 weeks / >=20 "
+            f"outcomes), NOT training DSR. The full training-DSR gate stays "
+            f"un-weakened (Re-exam 2026-10-15, #671)."
+        )
+        from alpha_engine_lib import alerts as _alerts
+        _alerts.publish(
+            message=msg, severity="info",
+            source="alpha-engine-predictor/training/model_zoo.py::run_rotation_and_select",
+            dedup_key=f"model_zoo_observe_tier_{date_str}",
+        )
+    except Exception:  # noqa: BLE001 — alert failure must not fail the SF
+        log.warning("model_zoo: observe-tier alert failed", exc_info=True)
+
+
 def run_rotation_and_select(
     bucket: str,
     *,
@@ -969,6 +1078,41 @@ def run_rotation_and_select(
             _alert_observe_recommendation(bucket, date_str, leaderboard, winner_vid)
         else:
             log.info("model_zoo: no eligible challenger beat the champion this rotation")
+
+    # config #671 — Option B (third branch): register observe-eligible challengers
+    # to the SHADOW-ONLY ``observe`` tier. This runs INDEPENDENTLY of auto-promote
+    # (observe carries ZERO live allocation) and ONLY for challengers that beat the
+    # champion + cleared the registry bar but did NOT clear the full promotion gate
+    # (the data-starved DSR>=WF_DSR_THRESHOLD bar, passable ~late-2026 — see #671).
+    # The winner (a full-gate-pass version being promoted) is NOT moved to observe.
+    # Moving a version to observe does NOT promote the champion — it only advances
+    # the version's registry stage so its predictions_shadow/ history keeps
+    # accruing for the realized-edge leaderboard, which gates any later
+    # observe→champion move on REALIZED edge.
+    observe_vids = [
+        v for v in leaderboard.get("observe_eligible_version_ids", [])
+        if v and v != leaderboard.get("promoted")
+    ]
+    moved_to_observe: list[str] = []
+    for _ovid in observe_vids:
+        try:
+            from model.registry import register_to_observe
+            _res = register_to_observe(s3, bucket, _ovid)
+            if _res.get("changed"):
+                moved_to_observe.append(_ovid)
+                log.info(
+                    "model_zoo OBSERVE-TIER (config#671): moved challenger %s → "
+                    "observe (shadow-only, zero live allocation); realized edge "
+                    "now accrues for the observe leaderboard.", _ovid,
+                )
+        except Exception as exc:  # noqa: BLE001 — a stage patch must not fail the SF
+            log.warning(
+                "model_zoo OBSERVE-TIER: failed to move %s to observe: %s",
+                _ovid, exc, exc_info=True,
+            )
+    leaderboard["moved_to_observe"] = moved_to_observe
+    if moved_to_observe:
+        _alert_observe_tier(bucket, date_str, leaderboard, moved_to_observe)
 
     _write_leaderboard(s3, bucket, date_str, leaderboard)
     return leaderboard

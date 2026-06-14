@@ -37,6 +37,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 # Per-file PUT-site counts. Pinning enforces operator attention on
 # every new producer addition. Captured 2026-05-27.
 EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
+    "analysis/observe_leaderboard.py": 2,  # observe_leaderboard/{date}.json + latest.json — realized-edge measurement artifact, observe-only, no freshness SLA (config#671/#702 L4539)
     "analysis/triple_barrier_cutover_runner.py": 2,
     "data/earnings_fetcher.py": 2,
     "health_status.py": 2,
