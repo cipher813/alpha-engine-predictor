@@ -8,12 +8,15 @@ Tunable parameters are loaded from config/predictor.yaml (gitignored).
 Copy config/predictor.sample.yaml to get started.
 """
 
+import logging
 import os
 from pathlib import Path
 
 import yaml
 
 from alpha_engine_lib.secrets import get_secret
+
+_log = logging.getLogger(__name__)
 
 # ── Load predictor config YAML ────────────────────────────────────────────────
 _CONFIG_DIR = Path(__file__).parent / "config"
@@ -505,6 +508,50 @@ MODEL_VERSION_LABEL = _cfg.get("model_version_label", "v3.0-meta")
 # refreshed round-robin over ~ceil(len(active)/N) weeks. The champion retrain
 # is separate + always-on; this budget is the challenger zoo on top of it.
 MODEL_ZOO_WEEKLY_BUDGET = int(_cfg.get("model_zoo_weekly_budget", 3))
+
+# config#1051 (no-silent-fails): an EMPTY ``model_specs`` roster while the
+# rotation budget is >= 1 is never intentional on the rotation box — it means
+# the staged ``predictor.yaml`` failed to parse / the experiment-package search
+# (``_CONFIG_PATH`` above) resolved to the wrong / a spec-less file. The 6/13
+# rotation trained 0 challengers SILENTLY for exactly this reason (MODEL_SPECS
+# empty at runtime → ``select_rotation_specs`` returned []). We WARN at import
+# (every config consumer surfaces it in logs) and expose a hard guard the
+# rotation entrypoint calls before training so the inert state RAISES there
+# rather than degrading to a benign "no eligible challenger" INFO. Import stays
+# non-fatal: inference Lambdas and most tests legitimately don't carry specs.
+if not MODEL_SPECS and MODEL_ZOO_WEEKLY_BUDGET >= 1:
+    _log.warning(
+        "config#1051: MODEL_SPECS is EMPTY while MODEL_ZOO_WEEKLY_BUDGET=%d — the "
+        "model-zoo rotation would train 0 challengers. Resolved config: %s "
+        "(ALPHA_ENGINE_EXPERIMENT_ID=%s). On the rotation box this is a config "
+        "load failure, not an intentional empty roster; the rotation entrypoint "
+        "will RAISE via assert_model_specs_loaded().",
+        MODEL_ZOO_WEEKLY_BUDGET, _CONFIG_PATH, _EXPERIMENT_ID,
+    )
+
+
+class ModelSpecsEmptyError(RuntimeError):
+    """config#1051: the model-zoo rotation roster (``MODEL_SPECS``) is empty
+    while a rotation budget >= 1 is configured — a config-load failure on the
+    rotation box, never an intentional empty roster."""
+
+
+def assert_model_specs_loaded() -> None:
+    """Fail loud if the rotation roster is empty while a budget is set. Called by
+    the model-zoo rotation entrypoint so an empty-spec child spot RAISES at the
+    earliest callsite instead of silently training 0 challengers (config#1051,
+    no-silent-fails). The resolved config path + experiment id are in the message
+    so the next run pins WHICH file loaded empty."""
+    if not MODEL_SPECS and MODEL_ZOO_WEEKLY_BUDGET >= 1:
+        raise ModelSpecsEmptyError(
+            f"config#1051: MODEL_SPECS is EMPTY but MODEL_ZOO_WEEKLY_BUDGET="
+            f"{MODEL_ZOO_WEEKLY_BUDGET} — the rotation cannot train any "
+            f"challenger. Resolved config: {_CONFIG_PATH} "
+            f"(ALPHA_ENGINE_EXPERIMENT_ID={_EXPERIMENT_ID}). The staged "
+            f"predictor.yaml likely failed to parse or the experiment-package "
+            f"search resolved to a spec-less file. See config#1051."
+        )
+
 
 # L4544: model-zoo IMMEDIATE selection — after the weekly rotation trains the
 # challenger variants, the selection step ranks them by leak-free CPCV mean IC

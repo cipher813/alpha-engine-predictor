@@ -516,8 +516,27 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s  %(levelname)-8s  %(
 
 import config as cfg
 from training.model_zoo import run_rotation_and_select
+
+# config#1051 logging probe: pin WHAT the child spot loaded so an empty
+# MODEL_SPECS (the 6/13 inert-rotation root cause) is diagnosable from the log.
+log = logging.getLogger('model_zoo.spot')
+log.info('model_zoo spot probe: MODEL_SPECS=%d  config=%s  ALPHA_ENGINE_EXPERIMENT_ID=%s',
+         len(getattr(cfg, 'MODEL_SPECS', [])),
+         getattr(cfg, '_CONFIG_PATH', '?'),
+         getattr(cfg, '_EXPERIMENT_ID', os.environ.get('ALPHA_ENGINE_EXPERIMENT_ID', 'reference')))
+
+# config#1051: pass a real trading_day so leaderboard / trial_log key on a date,
+# not null (the 6/13 leaderboard had date=null). now_dual is backward-looking.
+try:
+    from alpha_engine_lib.dates import now_dual
+    _td = now_dual().trading_day
+    date_str = _td.isoformat() if hasattr(_td, 'isoformat') else str(_td)
+except Exception:
+    log.warning('model_zoo spot: now_dual unavailable — run_rotation_and_select will self-default', exc_info=True)
+    date_str = None
+
 budget = int(os.environ.get('MODEL_ZOO_WEEKLY_BUDGET', getattr(cfg, 'MODEL_ZOO_WEEKLY_BUDGET', 3)))
-board = run_rotation_and_select(bucket, budget=budget)
+board = run_rotation_and_select(bucket, budget=budget, date_str=date_str)
 
 print()
 print('=' * 60)

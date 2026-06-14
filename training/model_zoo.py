@@ -35,6 +35,7 @@ import contextlib
 import json
 import logging
 import math
+import os
 
 import config as cfg
 
@@ -747,6 +748,75 @@ def _alert_promotion(bucket, date_str, leaderboard, winner_vid, prior_vid) -> No
         log.warning("model_zoo: promotion alert failed", exc_info=True)
 
 
+def _emit_challengers_trained_metric(n_trained: int) -> None:
+    """config#1051: emit ``AlphaEngine/ModelZooChallengersTrained`` so an inert
+    rotation (0 challengers trained) is observable on a dashboard/alarm in
+    addition to the SNS alert. Best-effort — a CloudWatch failure WARNs but never
+    blocks the rotation (the count is already in the inline log + SNS)."""
+    try:
+        import boto3
+        cw = boto3.client("cloudwatch")
+        cw.put_metric_data(
+            Namespace="AlphaEngine",
+            MetricData=[
+                {"MetricName": "ModelZooChallengersTrained",
+                 "Dimensions": [{"Name": "Process", "Value": "predictor-model-zoo"}],
+                 "Value": float(n_trained), "Unit": "Count"},
+            ],
+        )
+    except Exception:  # noqa: BLE001 — observability, never block the rotation
+        log.warning("model_zoo: ModelZooChallengersTrained metric emit failed", exc_info=True)
+
+
+def _count_challengers_trained(results: dict) -> int:
+    """Number of selected specs that produced a usable (non-error) train result.
+    config#1051: distinguishes "0 challengers TRAINED" (inert zoo) from
+    "trained-but-lost-to-champion" (a winner-less leaderboard with candidates)."""
+    return sum(1 for r in (results or {}).values()
+               if isinstance(r, dict) and r.get("status") != "error")
+
+
+def _alert_inert_rotation(bucket, date_str, *, n_active, n_selected, results) -> None:
+    """config#1051 (no-silent-fails): the rotation had >= 1 active spec to train
+    but trained 0 challengers (empty selection, or every selected spec errored /
+    produced no usable result). This is an INERT zoo — distinct from "challengers
+    trained but lost to the champion" — and must announce itself (WARN + named CW
+    metric + SNS), per the no-silent-fails rule. The prime cause is an empty
+    ``MODEL_SPECS`` at runtime on the child spot (config load failure); the alert
+    carries the resolved config path so the operator can pin it. Never raises
+    (alert delivery is observability off a path that already failed loudly via
+    the WARN log + CW metric)."""
+    cfg_path = getattr(cfg, "_CONFIG_PATH", "?")
+    exp_id = getattr(cfg, "_EXPERIMENT_ID", os.environ.get("ALPHA_ENGINE_EXPERIMENT_ID", "?"))
+    errored = sorted(sid for sid, r in (results or {}).items()
+                     if isinstance(r, dict) and r.get("status") == "error")
+    msg = (
+        f"[predictor] Model-zoo rotation trained 0 CHALLENGERS ({date_str}) — the "
+        f"champion/challenger value loop is INERT this run.\n"
+        f"  active specs: {n_active}  selected: {n_selected}  errored: {errored or 'none'}\n"
+        f"  MODEL_SPECS loaded: {len(getattr(cfg, 'MODEL_SPECS', []))} "
+        f"(config: {cfg_path}, ALPHA_ENGINE_EXPERIMENT_ID={exp_id})\n"
+        f"  This is NOT 'challengers ran but lost' — nothing trained. Likely an "
+        f"empty model_specs roster on the child spot (staged predictor.yaml parse "
+        f"/ experiment-package path). See config#1051."
+    )
+    log.warning(
+        "model_zoo config#1051: INERT rotation — %d active spec(s), %d selected, "
+        "0 challengers trained (errored=%s). MODEL_SPECS=%d, config=%s, exp_id=%s",
+        n_active, n_selected, errored, len(getattr(cfg, "MODEL_SPECS", [])),
+        cfg_path, exp_id,
+    )
+    try:
+        from alpha_engine_lib import alerts as _alerts
+        _alerts.publish(
+            message=msg, severity="warning",
+            source="alpha-engine-predictor/training/model_zoo.py::run_rotation_and_select",
+            dedup_key=f"model_zoo_inert_{date_str}",
+        )
+    except Exception:  # noqa: BLE001 — alert failure must not fail the SF
+        log.warning("model_zoo: inert-rotation alert failed", exc_info=True)
+
+
 def _alert_observe_recommendation(bucket, date_str, leaderboard, winner_vid) -> None:
     """Observe-mode: a challenger beat the champion but auto-promote is OFF — a
     low-priority (info) heads-up so the operator reviews the leaderboard + can
@@ -791,6 +861,36 @@ def run_rotation_and_select(
     caps the resulting book move). Returns the leaderboard dict."""
     if auto_promote_winner is None:
         auto_promote_winner = bool(getattr(cfg, "MODEL_ZOO_AUTO_PROMOTE_WINNER", False))
+
+    # config#1051: pin a real trading day so the leaderboard / trial_log key on a
+    # date, not ``null`` (the 6/13 leaderboard had ``date=null`` because the CLI
+    # passed no --date). Backward-looking dual-track per DATE_CONVENTIONS.
+    if date_str is None:
+        try:
+            from alpha_engine_lib.dates import now_dual
+            _td = now_dual().trading_day
+            date_str = _td.isoformat() if hasattr(_td, "isoformat") else str(_td)
+            log.info("model_zoo: no date passed — defaulting to trading_day %s", date_str)
+        except Exception:  # noqa: BLE001 — date defaulting must not block the rotation
+            log.warning("model_zoo: could not resolve trading_day via now_dual", exc_info=True)
+
+    # config#1051 logging probe + fail-loud config guard: the 6/13 rotation
+    # trained 0 challengers because MODEL_SPECS was EMPTY at runtime on the child
+    # spot. Log the loaded spec count + resolved config path + experiment id so
+    # the next run pins the empty-load, then RAISE before training rather than
+    # degrading to a benign "no eligible challenger" INFO downstream.
+    _resolved_specs = specs if specs is not None else getattr(cfg, "MODEL_SPECS", [])
+    log.info(
+        "model_zoo config#1051 probe: MODEL_SPECS=%d, config=%s, "
+        "ALPHA_ENGINE_EXPERIMENT_ID=%s",
+        len(_resolved_specs), getattr(cfg, "_CONFIG_PATH", "?"),
+        getattr(cfg, "_EXPERIMENT_ID", os.environ.get("ALPHA_ENGINE_EXPERIMENT_ID", "?")),
+    )
+    # Only enforce the guard when the roster comes from cfg (the real run); a test
+    # / caller that injects an explicit ``specs`` list owns its own roster.
+    if specs is None and hasattr(cfg, "assert_model_specs_loaded"):
+        cfg.assert_model_specs_loaded()
+
     if s3 is None and not dry_run:
         try:
             import boto3
@@ -802,6 +902,21 @@ def run_rotation_and_select(
         bucket, budget=budget, date_str=date_str, dry_run=dry_run,
         specs=specs, train_fn=train_fn, registered_versions=registered_versions, s3=s3,
     )
+
+    # config#1051 (no-silent-fails): a rotation that had >= 1 active spec to train
+    # but trained 0 challengers is INERT — fail loud (WARN + CW metric + SNS),
+    # distinct from "challengers ran but lost". This catches the empty-selection /
+    # all-errored cases the guard above can't (e.g. every selected spec crashed).
+    # Skipped on a dry run (no real training happened — nothing to alert on).
+    if not dry_run:
+        _n_active = sum(1 for s in _resolved_specs
+                        if s.get("status", "active") == "active" and s.get("id"))
+        _n_trained = _count_challengers_trained(results)
+        _emit_challengers_trained_metric(_n_trained)
+        if _n_active >= 1 and _n_trained == 0:
+            _alert_inert_rotation(
+                bucket, date_str, n_active=_n_active, n_selected=len(results), results=results,
+            )
 
     mode = "cutover" if auto_promote_winner else "observe"
     if dry_run or s3 is None:

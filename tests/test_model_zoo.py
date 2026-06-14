@@ -377,3 +377,163 @@ def test_run_rotation_cutover_promotes_winner(monkeypatch):
     assert board["winner_version_id"] == "resid-v"
     assert board["promoted"] == "resid-v"                   # cutover → executed
     assert promotes == ["resid-v"]                          # promoted exactly the winner
+
+
+# ── config#1051: fail loud on an INERT rotation (0 challengers trained) ───────
+
+
+def test_count_challengers_trained_excludes_errors():
+    results = {
+        "a": {"status": "ok"},
+        "b": {"status": "error", "error": "boom"},
+        "c": {"status": "ok"},
+    }
+    assert mz._count_challengers_trained(results) == 2
+    assert mz._count_challengers_trained({}) == 0
+    assert mz._count_challengers_trained({"x": {"status": "error"}}) == 0
+
+
+def test_inert_rotation_alerts_when_active_specs_but_zero_trained(monkeypatch):
+    """The core config#1051 closes-when #2: ≥1 active promote-eligible spec exists
+    but the rotation trains 0 challengers (empty selection) → WARN + named CW
+    metric + SNS, distinct from 'trained-but-lost'."""
+    from alpha_engine_lib import alerts  # conftest autouse-stubs .publish
+
+    cw_calls = []
+    monkeypatch.setattr(mz, "_emit_challengers_trained_metric", lambda n: cw_calls.append(n))
+    inert_calls = {}
+
+    real_inert = mz._alert_inert_rotation
+
+    def _spy_inert(bucket, date_str, **kw):
+        inert_calls.update(kw)
+        inert_calls["called"] = True
+        return real_inert(bucket, date_str, **kw)
+
+    monkeypatch.setattr(mz, "_alert_inert_rotation", _spy_inert)
+
+    # budget=0 → selection is empty even though _SPECS has 2 active specs, so the
+    # rotation trains nothing (the empty-selection branch of the inert bug).
+    s3 = _FakeS3({
+        cfg.META_MANIFEST_KEY: _mk_manifest(21, 0.10, True),
+        cfg.META_FEATURE_LIST_KEY: {"features": ["a"]},
+    })
+
+    def _fake_train(bucket, *, date_str=None, dry_run=False):  # pragma: no cover
+        raise AssertionError("train_fn must not be called when budget=0")
+
+    board = mz.run_rotation_and_select(
+        "bkt", budget=0, specs=_SPECS, train_fn=_fake_train,
+        registered_versions=[], s3=s3, date_str="2026-06-13",
+    )
+
+    assert inert_calls.get("called") is True
+    assert inert_calls["n_active"] == 2          # resid + h60 are active in _SPECS
+    assert inert_calls["n_selected"] == 0        # budget=0 → trained nothing
+    assert cw_calls == [0]                        # CW metric emitted with value 0
+    # SNS alert fired (severity warning, dedup keyed on the date).
+    assert alerts.publish.called
+    _, kwargs = alerts.publish.call_args
+    assert kwargs["severity"] == "warning"
+    assert kwargs["dedup_key"] == "model_zoo_inert_2026-06-13"
+    assert "0 CHALLENGERS" in kwargs["message"]
+
+
+def test_all_specs_errored_is_inert_and_alerts(monkeypatch):
+    """Even with budget covering the active specs, if EVERY selected spec errors
+    the rotation is inert (0 usable challengers) → alert fires."""
+    monkeypatch.setattr(mz, "_emit_challengers_trained_metric", lambda n: None)
+    alerted = []
+    monkeypatch.setattr(mz, "_alert_inert_rotation",
+                        lambda *a, **k: alerted.append(k))
+
+    s3 = _FakeS3({
+        cfg.META_MANIFEST_KEY: _mk_manifest(21, 0.10, True),
+        cfg.META_FEATURE_LIST_KEY: {"features": ["a"]},
+    })
+
+    def _fake_train(bucket, *, date_str=None, dry_run=False):
+        raise RuntimeError("every train crashes")
+
+    mz.run_rotation_and_select(
+        "bkt", budget=5, specs=_SPECS, train_fn=_fake_train,
+        registered_versions=[], s3=s3, date_str="2026-06-13",
+    )
+    assert len(alerted) == 1
+    assert alerted[0]["n_active"] == 2
+
+
+def test_trained_but_lost_does_not_alert_inert(monkeypatch):
+    """A challenger trained but lost to the champion (winner-less leaderboard,
+    candidates present) is NOT inert — no inert alert, CW metric reports the
+    trained count (>0)."""
+    cw_calls = []
+    monkeypatch.setattr(mz, "_emit_challengers_trained_metric", lambda n: cw_calls.append(n))
+    inert = []
+    monkeypatch.setattr(mz, "_alert_inert_rotation", lambda *a, **k: inert.append(k))
+    monkeypatch.setattr(cfg, "FORWARD_DAYS", 21, raising=False)
+
+    import model.registry as reg
+    # Champion CPCV beats both trained challengers → no winner, but they DID train.
+    s3 = _FakeS3({
+        cfg.META_MANIFEST_KEY: _mk_manifest(21, 0.50, True),
+        cfg.META_FEATURE_LIST_KEY: {"features": ["a"]},
+        "predictor/registry/resid-v/manifest.json": _mk_manifest(21, 0.10, True),
+        "predictor/registry/h60-v/manifest.json": _mk_manifest(60, 0.12, True),
+    })
+    monkeypatch.setattr(reg, "list_versions", lambda s3c, b, stage=None: [
+        {"version_id": "resid-v", "model_version": "spec-resid", "date": "2026-06-13"},
+        {"version_id": "h60-v", "model_version": "spec-60d", "date": "2026-06-13"},
+    ])
+
+    def _fake_train(bucket, *, date_str=None, dry_run=False):
+        return {"status": "ok"}
+
+    board = mz.run_rotation_and_select(
+        "bkt", budget=5, specs=_SPECS, train_fn=_fake_train,
+        registered_versions=[], s3=s3, date_str="2026-06-13",
+    )
+    assert inert == []                       # NOT inert — challengers trained
+    assert cw_calls == [2]                   # both active specs trained
+    assert board["winner_version_id"] is None  # but neither beat the champion
+
+
+def test_date_str_defaults_to_trading_day_when_none(monkeypatch):
+    """config#1051 item 4: a None date_str defaults to now_dual().trading_day so
+    the leaderboard / trial_log never key on null."""
+    monkeypatch.setattr(mz, "_emit_challengers_trained_metric", lambda n: None)
+    monkeypatch.setattr(mz, "_alert_inert_rotation", lambda *a, **k: None)
+
+    def _fake_train(bucket, *, date_str=None, dry_run=False):
+        return {"status": "ok"}
+
+    # dry_run path returns a leaderboard with the resolved date — no S3 needed.
+    board = mz.run_rotation_and_select(
+        "bkt", budget=5, specs=_SPECS, train_fn=_fake_train, dry_run=True,
+    )
+    assert board["date"] is not None
+    # ISO date shape YYYY-MM-DD.
+    assert len(board["date"]) == 10 and board["date"][4] == "-"
+
+
+# ── config#1051: config.py fail-loud guard on an empty spec roster ────────────
+
+
+def test_assert_model_specs_loaded_raises_when_empty(monkeypatch):
+    monkeypatch.setattr(cfg, "MODEL_SPECS", [], raising=False)
+    monkeypatch.setattr(cfg, "MODEL_ZOO_WEEKLY_BUDGET", 1, raising=False)
+    with pytest.raises(cfg.ModelSpecsEmptyError):
+        cfg.assert_model_specs_loaded()
+
+
+def test_assert_model_specs_loaded_ok_when_populated(monkeypatch):
+    monkeypatch.setattr(cfg, "MODEL_SPECS", [{"id": "x", "status": "active"}], raising=False)
+    monkeypatch.setattr(cfg, "MODEL_ZOO_WEEKLY_BUDGET", 1, raising=False)
+    cfg.assert_model_specs_loaded()  # no raise
+
+
+def test_assert_model_specs_loaded_noop_when_budget_zero(monkeypatch):
+    """An empty roster with budget 0 is a legitimately disabled zoo — no raise."""
+    monkeypatch.setattr(cfg, "MODEL_SPECS", [], raising=False)
+    monkeypatch.setattr(cfg, "MODEL_ZOO_WEEKLY_BUDGET", 0, raising=False)
+    cfg.assert_model_specs_loaded()  # no raise
