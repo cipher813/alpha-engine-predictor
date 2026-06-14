@@ -115,13 +115,19 @@ def handler(event: dict, context) -> dict:
     from inference.preflight import PredictorPreflight
     _bucket = os.environ.get("S3_BUCKET", "alpha-engine-research")
     _action = event.get("action", "predict")
+    # dry_run is re-parsed at its canonical site below; read it early here so
+    # the canary (dry_run=true) can skip the deploy-drift assertion. A canary
+    # writes/emails nothing, so drift-vs-main is the wrong invariant and a
+    # false-failure source during merge bursts (config#1073). Production
+    # (dry_run=false) and the SF drift gate below are unaffected.
+    _dry_run = bool(event.get("dry_run", False))
     _pf = PredictorPreflight(bucket=_bucket)
     if _action in ("check_deploy_drift", "check_lib_pin_drift"):
         # Both are lightweight pre-spend SF gates (GitHub reads only) — run the
         # minimal preflight, not the full predictor bootstrap.
         _pf.run_for_drift_gate()
     else:
-        _pf.run()
+        _pf.run(skip_deploy_drift=_dry_run)
 
     fd = None
 

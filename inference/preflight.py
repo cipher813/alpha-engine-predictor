@@ -60,11 +60,30 @@ class PredictorPreflight(BasePreflight):
         self.check_s3_bucket()
         self.check_deploy_drift(_PREDICTOR_REPO)
 
-    def run(self) -> None:
-        """Full preflight for ``action=predict`` + ``action=check_coverage``."""
+    def run(self, *, skip_deploy_drift: bool = False) -> None:
+        """Full preflight for ``action=predict`` + ``action=check_coverage``.
+
+        ``skip_deploy_drift`` — when True, the image-SHA-vs-``origin/main``
+        drift assertion is skipped. Set this for ``dry_run=true`` (canary)
+        invocations. Rationale: deploy-drift protection exists to stop the
+        Lambda *acting on new signals with stale code* — i.e. writing
+        ``predictions/{date}.json`` + sending the morning email. A dry_run
+        canary writes nothing and emails nothing, so comparing its image
+        against live ``main`` HEAD is the wrong invariant. Worse, it is a
+        false-failure source: during a merge burst ``main`` can advance
+        *after* a deploy's image is built but *before* its canary runs, so
+        the canary trips the drift ``RuntimeError`` on a perfectly good
+        freshly-built image and the deploy false-fails (config#1073,
+        2026-06-14). Production protection is unaffected — real runs
+        (``dry_run=false``) still drift-check here, and the Saturday/weekday
+        SF ``DeployDriftCheck`` gate (``action=check_deploy_drift`` →
+        ``run_for_drift_gate``) checks unconditionally before every
+        pipeline.
+        """
         self.check_env_vars("AWS_REGION")
         self.check_s3_bucket()
-        self.check_deploy_drift(_PREDICTOR_REPO)
+        if not skip_deploy_drift:
+            self.check_deploy_drift(_PREDICTOR_REPO)
 
         # Model weights must exist for the Lambda to do anything useful.
         # load_model is the next stage — if weights are missing, let

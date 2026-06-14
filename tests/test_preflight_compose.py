@@ -60,6 +60,37 @@ def test_run_does_not_call_data_freshness_primitives():
     fresh.assert_not_called()
 
 
+def test_run_skips_drift_when_skip_deploy_drift_true():
+    """dry_run=true canary path: env + S3 + weights still run, but the
+    image-SHA-vs-origin/main drift assertion is skipped. A canary writes
+    and emails nothing, so drift-vs-main is the wrong invariant and a
+    false-failure source during merge bursts (config#1073)."""
+    pf = _make()
+    with patch.object(pf, "check_env_vars") as env, \
+         patch.object(pf, "check_s3_bucket") as s3, \
+         patch.object(pf, "check_deploy_drift") as drift, \
+         patch.object(pf, "check_s3_key") as s3_key:
+        pf.run(skip_deploy_drift=True)
+
+    env.assert_called_once_with("AWS_REGION")
+    s3.assert_called_once()
+    drift.assert_not_called()
+    s3_key.assert_called_once()
+
+
+def test_run_checks_drift_by_default():
+    """Production (dry_run=false) default still drift-checks — protection
+    for real runs is unchanged."""
+    pf = _make()
+    with patch.object(pf, "check_env_vars"), \
+         patch.object(pf, "check_s3_bucket"), \
+         patch.object(pf, "check_deploy_drift") as drift, \
+         patch.object(pf, "check_s3_key"):
+        pf.run(skip_deploy_drift=False)
+
+    drift.assert_called_once_with("cipher813/alpha-engine-predictor")
+
+
 def test_run_for_drift_gate_is_strict_subset():
     """The drift gate runs ONLY env + S3 + image-SHA. No model weights,
     no macro reads — those are predict-path concerns and running them on

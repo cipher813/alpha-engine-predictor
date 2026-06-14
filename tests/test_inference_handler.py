@@ -127,8 +127,12 @@ def test_handler_predict_default_path_invokes_main(
     assert call_kwargs["dry_run"] is False
     assert call_kwargs["local"] is False
     assert call_kwargs["explicit_tickers"] == []
-    # Default predict path uses full preflight
+    # Default predict path uses full preflight, drift-check enabled
     stubbed_preflight.return_value.run.assert_called_once()
+    assert (
+        stubbed_preflight.return_value.run.call_args.kwargs["skip_deploy_drift"]
+        is False
+    )
 
 
 def test_handler_predict_supplemental_tickers_split_csv(
@@ -164,5 +168,10 @@ def test_handler_predict_supplemental_tickers_list(
     call_kwargs = fake_daily.main.call_args.kwargs
     assert call_kwargs["explicit_tickers"] == ["AAPL", "MSFT"]
     assert call_kwargs["dry_run"] is True
+    # Canary (dry_run=true) must skip the deploy-drift check (config#1073)
+    assert (
+        stubbed_preflight.return_value.run.call_args.kwargs["skip_deploy_drift"]
+        is True
+    )
 
 
