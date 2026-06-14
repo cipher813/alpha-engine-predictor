@@ -104,13 +104,23 @@ def run(ctx: PipelineContext) -> None:
     try:
         import boto3
 
-        from model.registry import list_versions
+        from model.registry import SHADOW_STAGES, list_versions
 
-        challengers = list_versions(
-            boto3.client("s3"), ctx.bucket, stage="challenger",
-        )
+        s3c = boto3.client("s3")
+        # config #671: shadow BOTH challengers and observe-tier (shadow-live)
+        # versions. Observe-tier versions keep accumulating predictions_shadow/
+        # so the realized-edge leaderboard can score them; they carry zero live
+        # allocation. De-dup by version_id in case a bundle is double-listed.
+        challengers = []
+        _seen: set = set()
+        for _stage in SHADOW_STAGES:
+            for _v in list_versions(s3c, ctx.bucket, stage=_stage):
+                _vid = _v.get("version_id")
+                if _vid and _vid not in _seen:
+                    _seen.add(_vid)
+                    challengers.append(_v)
     except Exception:
-        log.warning("Shadow runner: failed to list challengers — skip.", exc_info=True)
+        log.warning("Shadow runner: failed to list shadow-stage versions — skip.", exc_info=True)
         return
 
     max_n = int(getattr(cfg, "SHADOW_VERSIONS_MAX_N", 3))

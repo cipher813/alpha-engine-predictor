@@ -32,7 +32,26 @@ DEFAULT_REGISTRY_PREFIX = "predictor/registry/"
 
 # The lifecycle stages a registered version can carry. `snapshot_to_registry`
 # records one into the lineage; the CLI validates `--stage` against this set.
-VALID_STAGES = ("champion", "challenger", "archived")
+#
+# Stage ladder (config #671 — Option B observe tier):
+#   challenger → observe → champion → archived
+# ``observe`` (a.k.a. shadow-live) is the SHADOW-ONLY promotion tier between
+# ``challenger`` and ``champion``: a challenger that clears the LOWER registry
+# bar (DSR >= WF_DSR_REGISTRY_THRESHOLD + downside gate) AND beats the incumbent
+# champion's CPCV mean IC by a margin — but does NOT yet clear the FULL promotion
+# bar (the data-starved DSR >= WF_DSR_THRESHOLD, passable ~late-2026 once enough
+# independent 21d blocks accrue). An ``observe`` version carries ZERO live
+# allocation: it is shadow-scored (predictions_shadow/) and its REALIZED edge is
+# tracked by the observe leaderboard, which gates any later observe→champion
+# move. It is shadow-runnable exactly like a challenger (the shadow runner
+# enumerates both stages). It NEVER trades capital — moving observe→champion is
+# a separate, operator-gated promotion driven by REALIZED edge, not training DSR.
+VALID_STAGES = ("champion", "challenger", "observe", "archived")
+
+# Stages the Phase-1 shadow runner re-scores against the live universe. Both
+# challengers and observe-tier versions are shadowed (observe-tier accumulates
+# the same predictions_shadow/ history the leaderboard scores on realized edge).
+SHADOW_STAGES = ("challenger", "observe")
 
 # Files that MUST be present for a snapshot to be a valid, reproducible bundle.
 # feature_list = the feature contract; manifest = lineage/metrics. Without them
@@ -224,6 +243,48 @@ def _patch_stage(s3, bucket: str, dest: str, stage: str) -> None:
         Bucket=bucket, Key=f"{dest}_lineage.json",
         Body=json.dumps(lineage, indent=2).encode(), ContentType="application/json",
     )
+
+
+def register_to_observe(
+    s3,
+    bucket: str,
+    version_id: str,
+    *,
+    registry_prefix: str = DEFAULT_REGISTRY_PREFIX,
+) -> dict:
+    """Move a registered ``challenger`` into the ``observe`` (shadow-live) tier
+    (config #671 — Option B). SHADOW-ONLY: this patches the version's lineage
+    stage to ``observe`` and copies NOTHING into the live weights prefix — the
+    observe tier carries ZERO live allocation. It exists so the version keeps
+    accumulating predictions_shadow/ history that the observe leaderboard scores
+    on REALIZED edge; a later observe→champion move is the separate,
+    operator-gated, realized-edge-driven promotion (``promote_to_champion``).
+
+    Idempotent: re-registering an already-``observe`` version is a no-op patch.
+    A version already ``champion`` is NOT demoted to observe (never demote on
+    this path) — that case returns unchanged. Refuses (``RegistryError``) if the
+    bundle / lineage is missing. Returns a summary dict.
+    """
+    src = f"{registry_prefix}{version_id}/"
+    try:
+        lineage = json.loads(
+            s3.get_object(Bucket=bucket, Key=f"{src}_lineage.json")["Body"].read()
+        )
+    except Exception as e:
+        raise RegistryError(
+            f"cannot move {version_id!r} to observe: no registry bundle / "
+            f"_lineage.json ({e})"
+        )
+    prior = lineage.get("stage")
+    if prior == "champion":
+        # Never demote a live champion onto the shadow tier via this path.
+        return {"version_id": version_id, "stage": prior, "changed": False,
+                "reason": "already champion — observe move skipped"}
+    if prior == "observe":
+        return {"version_id": version_id, "stage": "observe", "changed": False}
+    _patch_stage(s3, bucket, src, "observe")
+    return {"version_id": version_id, "stage": "observe", "changed": True,
+            "prior_stage": prior}
 
 
 def promote_to_champion(

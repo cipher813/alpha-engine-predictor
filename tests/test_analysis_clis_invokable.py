@@ -46,6 +46,7 @@ ANALYSIS_CLIS = [
     "analysis.horizon_battery",
     "analysis.triple_barrier_cutover_runner",
     "analysis.compare_modes",
+    "analysis.observe_leaderboard",
 ]
 
 

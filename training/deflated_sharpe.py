@@ -139,12 +139,31 @@ def expected_max_sharpe(n_trials: int, sr_std: float) -> float:
     return float(sr_std * ((1.0 - _EULER_MASCHERONI) * z1 + _EULER_MASCHERONI * z2))
 
 
+def _ic_ir_for_dsr(ic_ir: float, n: int, n_eff: int | None, threshold: float) -> float:
+    """The IC-IR a series of EFFECTIVE length ``n_eff`` would need to clear the
+    PSR ``threshold`` vs a zero benchmark — a legible 'needs ~Y' surface for the
+    'too young' verdict (config #671 / A1). Returns NaN if it can't be solved.
+
+    Inverts PSR: PSR = Φ(SR·sqrt(m-1)/sqrt(1 - skew·SR + (kurt-1)/4·SR²)). With
+    Gaussian-tail assumptions (skew=0, kurt=3) PSR = Φ(SR·sqrt(m-1)) so the SR
+    needed for PSR=threshold is ``Z⁻¹(threshold) / sqrt(m-1)``. This is the bar
+    a model on this much INDEPENDENT data (m=n_eff) would have to hit — surfaced
+    so 'fails the 0.95 bar' reads as 'needs IC-IR≈Y on m≈X effective obs', not a
+    silent fail."""
+    m = int(n_eff) if (n_eff is not None and n_eff >= 2) else int(n)
+    if m < 2:
+        return float("nan")
+    z = float(norm.ppf(threshold))
+    return float(z / math.sqrt(m - 1))
+
+
 def deflated_sharpe_ratio(
     ic_series,
     *,
     n_trials: int,
     sr_trials_std: float | None = None,
     threshold: float = 0.95,
+    n_eff: int | None = None,
 ) -> dict:
     """IC-IR + its Deflated Sharpe Ratio over the per-date cross-sectional IC
     series (OBSERVE).
@@ -152,31 +171,55 @@ def deflated_sharpe_ratio(
     ``n_trials`` is the number of effective configurations searched to obtain
     this model (a conservative placeholder until cumulative trial-count tracking
     lands — W1.3b). ``sr_trials_std`` is the std of trial Sharpes; when not
-    supplied it falls back to ``1/sqrt(n)`` (the single-path sampling std — a
-    conservative deflation). Returns observe stats incl. ``psr_vs_zero``
-    (trial-count-independent significance), ``dsr`` (deflated), and a
-    ``passes_overfit_gate`` flag at ``threshold``. NOTE: this is the
-    SIGNIFICANCE leg only (is the IC real?), NOT a promotion decision — W1.4
-    composes it with the downside-aware performance lens (``downside_ic_stats``:
-    Sortino-of-IC + CVaR) per the house skilled-risk basket.
+    supplied it falls back to ``1/sqrt(n_used)`` (the single-path sampling std — a
+    conservative deflation).
+
+    ``n_eff`` (config #671 / A1 — effective-observation correction) is the count
+    of INDEPENDENT observations behind the IC series. The raw CPCV/per-date count
+    ``n`` massively OVERSTATES independence on overlapping 21d labels (~45 dates /
+    21d ≈ ~1 independent block), which inflates PSR/DSR confidence (the
+    ``sqrt(n-1)`` width) and shrinks the trial-Sharpe-std fallback. When supplied,
+    ``n_eff`` REPLACES ``n`` in BOTH the PSR confidence width and the
+    ``1/sqrt(·)`` trials-std fallback, so the DSR is a more HONEST (tighter, never
+    looser) significance read. The IC-IR point estimate (mean/std) is unchanged;
+    only the confidence on it tightens. The output carries ``n_used`` (what fed
+    the stat), ``n_obs`` (raw), and ``ic_ir_needed_for_threshold`` (the IC-IR a
+    series of this effective length would need to clear ``threshold``) so a
+    'too young' verdict is explicit, not a silent fail.
+
+    Returns observe stats incl. ``psr_vs_zero`` (trial-count-independent
+    significance), ``dsr`` (deflated), and a ``passes_overfit_gate`` flag at
+    ``threshold``. NOTE: this is the SIGNIFICANCE leg only (is the IC real?), NOT
+    a promotion decision — W1.4 composes it with the downside-aware performance
+    lens (``downside_ic_stats``: Sortino-of-IC + CVaR) per the house skilled-risk
+    basket.
     """
     ic = np.asarray([x for x in np.asarray(ic_series, dtype=float)
                      if np.isfinite(x)], dtype=float)
     n = int(ic.size)
+    # A1: the effective count feeds the significance math; it can only TIGHTEN
+    # (a supplied n_eff is expected <= n on overlapping labels). Guard against a
+    # caller passing an n_eff > n (would loosen) by clamping to n.
+    n_used = n if n_eff is None else max(2, min(int(n_eff), n))
     if n < 5 or ic.std(ddof=1) < 1e-12:
         return {
-            "status": "insufficient", "n": n,
+            "status": "insufficient", "n": n, "n_obs": n, "n_used": n_used,
             "ic_ir": float("nan"), "psr_vs_zero": float("nan"),
             "dsr": float("nan"), "passes_overfit_gate": False,
+            "n_eff": n_eff,
+            "ic_ir_needed_for_threshold": _ic_ir_for_dsr(
+                float("nan"), n, n_eff, threshold),
         }
     sr = float(ic.mean() / ic.std(ddof=1))
     sk = float(_skew(ic))
     ku = float(_kurtosis(ic, fisher=False))  # non-excess (normal == 3)
     if sr_trials_std is None:
-        sr_trials_std = 1.0 / math.sqrt(n)
+        sr_trials_std = 1.0 / math.sqrt(n_used)
     sr_star = expected_max_sharpe(n_trials, sr_trials_std)
-    psr0 = probabilistic_sharpe_ratio(sr, n, sk, ku, 0.0)
-    dsr = probabilistic_sharpe_ratio(sr, n, sk, ku, sr_star)
+    # A1: PSR confidence width uses n_used (effective), not the raw overlapping
+    # per-date count — the honest sample size for the significance read.
+    psr0 = probabilistic_sharpe_ratio(sr, n_used, sk, ku, 0.0)
+    dsr = probabilistic_sharpe_ratio(sr, n_used, sk, ku, sr_star)
 
     def _r(v, p=6):
         return round(float(v), p) if np.isfinite(v) else float("nan")
@@ -184,6 +227,9 @@ def deflated_sharpe_ratio(
     return {
         "status": "ok",
         "n": n,
+        "n_obs": n,
+        "n_used": n_used,
+        "n_eff": n_eff,
         "ic_ir": _r(sr),
         "ic_mean": _r(float(ic.mean())),
         "ic_std": _r(float(ic.std(ddof=1))),
@@ -193,6 +239,7 @@ def deflated_sharpe_ratio(
         "sr_benchmark_maxnull": _r(sr_star),
         "psr_vs_zero": _r(psr0),
         "dsr": _r(dsr),
+        "ic_ir_needed_for_threshold": _r(_ic_ir_for_dsr(sr, n, n_eff, threshold)),
         "threshold": threshold,
         "passes_overfit_gate": bool(np.isfinite(dsr) and dsr >= threshold),
     }
