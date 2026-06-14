@@ -250,7 +250,10 @@ class _FakeS3:
         self.puts[Key] = Body
 
 
-def _mk_manifest(forward_days, cpcv_ic, gate_pass):
+def _mk_manifest(forward_days, cpcv_ic, gate_pass, *, dsr=None):
+    overfit = {"passes_overfit_gate": gate_pass}
+    if dsr is not None:
+        overfit["dsr"] = dsr
     return {
         "forward_days": forward_days,
         "meta_model_oos_ic_cpcv": (
@@ -258,7 +261,7 @@ def _mk_manifest(forward_days, cpcv_ic, gate_pass):
         ),
         "meta_model_promotion_stats": {
             "downside": {"passes_downside_gate": gate_pass},
-            "overfit": {"passes_overfit_gate": gate_pass},
+            "overfit": overfit,
         },
     }
 
@@ -294,28 +297,58 @@ def test_snapshot_and_restore_live_contract_roundtrip():
 # ── L4544: immediate CPCV selection ──────────────────────────────────────────
 
 
-def test_select_winner_horizon_gate_and_margin(monkeypatch):
+def test_select_winner_horizon_floor_and_margin(monkeypatch):
+    # config#671/#673/#1052 RELATIVE-BEST: the DSR/Sortino gate is NO LONGER a
+    # promotion blocker. Eligibility = right horizon AND IC > positive floor AND
+    # IC >= champion + margin. The DSR-gate result is surfaced (dsr_gate_pass),
+    # never blocks.
     monkeypatch.setattr(cfg, "FORWARD_DAYS", 21, raising=False)
+    monkeypatch.setattr(cfg, "MODEL_ZOO_PROMOTE_MIN_IC", 0.0, raising=False)
     s3 = _FakeS3({
         cfg.META_MANIFEST_KEY: _mk_manifest(21, 0.10, True),          # champion baseline
-        "predictor/registry/resid-v/manifest.json": _mk_manifest(21, 0.15, True),  # winner
+        # DSR-gate FAILS (passes_overfit_gate=False, dsr 0.247) but beats champion
+        # by margin → PROMOTES under relative-best (the exact 6/13 scenario).
+        "predictor/registry/dsrfail-v/manifest.json": _mk_manifest(
+            21, 0.20, False, dsr=0.247),
         "predictor/registry/h60-v/manifest.json": _mk_manifest(60, 0.30, True),    # wrong horizon
-        "predictor/registry/bad-v/manifest.json": _mk_manifest(21, 0.20, False),   # gate fail
         "predictor/registry/low-v/manifest.json": _mk_manifest(21, 0.105, True),   # below champ+margin
     })
     trained = [
-        {"spec_id": "resid", "version_id": "resid-v", "model_version": "spec-resid"},
+        {"spec_id": "dsrfail", "version_id": "dsrfail-v", "model_version": "spec-dsrfail"},
         {"spec_id": "h60", "version_id": "h60-v", "model_version": "spec-60d"},
-        {"spec_id": "bad", "version_id": "bad-v", "model_version": "spec-bad"},
         {"spec_id": "low", "version_id": "low-v", "model_version": "spec-low"},
     ]
     board = mz.select_winner(s3, "bkt", trained=trained, margin=0.01)
-    assert board["winner_version_id"] == "resid-v"          # highest gated 21d CPCV > champ+margin
+    # the DSR-gate-failing challenger PROMOTES on relative-best (beats champ+margin)
+    assert board["winner_version_id"] == "dsrfail-v"
     reasons = {c["spec_id"]: c["reason"] for c in board["candidates"]}
-    assert reasons["h60"] == "non_canonical_horizon"        # observe-only, never eligible
-    assert reasons["bad"] == "gate_failed"
+    assert reasons["h60"] == "non_canonical_horizon"        # wrong horizon, never eligible
     assert reasons["low"] == "below_champion_plus_margin"
-    assert reasons["resid"] == "eligible"
+    assert reasons["dsrfail"] == "eligible"
+    # DSR is surfaced for OBSERVABILITY on the winner, but did NOT block promotion.
+    win = next(c for c in board["candidates"] if c["spec_id"] == "dsrfail")
+    assert win["dsr_gate_pass"] is False                    # absolute gate failed
+    assert win["dsr_training"] == 0.247                     # value surfaced
+    assert "promote_min_ic" in board
+    assert "observe_eligible_version_ids" not in board      # observe tier collapsed
+
+
+def test_select_winner_positive_ic_floor_blocks_negative_best_of_n(monkeypatch):
+    # The ONLY absolute floor under relative-best: a best-of-N challenger whose
+    # CPCV mean IC is <= the positive floor is noise, not edge — never promote it,
+    # even though it is the best (and only) candidate and "beats" a None champion.
+    monkeypatch.setattr(cfg, "FORWARD_DAYS", 21, raising=False)
+    monkeypatch.setattr(cfg, "MODEL_ZOO_PROMOTE_MIN_IC", 0.0, raising=False)
+    s3 = _FakeS3({
+        # champion manifest unreadable → champ_ic None; floor must still block.
+        "predictor/registry/neg-v/manifest.json": _mk_manifest(21, -0.05, True),
+    })
+    trained = [{"spec_id": "neg", "version_id": "neg-v", "model_version": "spec-neg"}]
+    board = mz.select_winner(s3, "bkt", trained=trained, margin=0.005)
+    c = board["candidates"][0]
+    assert c["reason"] == "below_floor"
+    assert c["eligible"] is False
+    assert board["winner_version_id"] is None
 
 
 def test_select_winner_nan_cpcv_is_no_cpcv_not_below_margin(monkeypatch):

@@ -9,10 +9,12 @@ Pins the three selection-observability legs added to the promotion-gate stack:
 (b) the cumulative trial ledger (``_record_trials``: dedupe by version_id,
     cumulative count, recorded-not-swallowed failure) and the per-candidate
     ``dsr_selection`` re-deflation it feeds.
-(c) the registry-entry bar below the promotion bar — near-misses labeled
-    ``near_miss_below_promotion_bar`` instead of a flat ``gate_failed``.
+(c) the registry-entry bar + DSR gate are now OBSERVABILITY ONLY (surfaced via
+    ``registry_bar_pass`` / ``dsr_gate_pass`` / ``dsr_training``), NOT promotion
+    blockers — config#671/#673/#1052 relative-best: a beats-champion challenger
+    PROMOTES regardless of DSR (the absolute DSR-0.95 hurdle was dropped).
 
-None of it changes eligibility/promotion behavior — pinned explicitly.
+None of (a)/(b) changes eligibility — pinned explicitly.
 """
 from __future__ import annotations
 
@@ -89,11 +91,16 @@ def _manifest(fwd=21, mean_ic=0.15, *, downside=True, dsr=0.97,
     }
 
 
-# ── (c) two-threshold discipline ─────────────────────────────────────────────
+# ── (c) DSR / registry bar are OBSERVABILITY, not blockers (config#1052) ──────
 
 
-def test_registry_bar_between_bars_is_near_miss(monkeypatch):
+def test_dsr_and_registry_bar_are_observability_not_blockers(monkeypatch):
+    # config#671/#673/#1052: the DSR gate + registry bar no longer block promotion.
+    # All three challengers beat the champion (0.20 > 0.10 + margin) and FAIL the
+    # DSR gate (gate=False) — under relative-best they are ALL eligible. The DSR /
+    # registry-bar results are surfaced for observability, never as a reason.
     monkeypatch.setattr(cfg, "FORWARD_DAYS", 21, raising=False)
+    monkeypatch.setattr(cfg, "MODEL_ZOO_PROMOTE_MIN_IC", 0.0, raising=False)
     monkeypatch.setattr(cfg, "WF_DSR_REGISTRY_THRESHOLD", 0.80, raising=False)
     s3 = _FakeS3({
         cfg.META_MANIFEST_KEY: _manifest(mean_ic=0.10),
@@ -113,20 +120,25 @@ def test_registry_bar_between_bars_is_near_miss(monkeypatch):
         {"spec_id": "down", "version_id": "down-v", "model_version": "m"},
     ], margin=0.01)
     rows = {c["spec_id"]: c for c in board["candidates"]}
-    assert rows["near"]["reason"] == "near_miss_below_promotion_bar"
-    assert rows["near"]["registry_bar_pass"] is True
-    assert rows["near"]["eligible"] is False        # near-miss NEVER promotes
-    assert rows["far"]["reason"] == "gate_failed"
-    assert rows["far"]["registry_bar_pass"] is False
-    assert rows["down"]["reason"] == "gate_failed"
-    assert rows["down"]["registry_bar_pass"] is False
-    assert board["winner_version_id"] is None       # observability ≠ eligibility
+    # all eligible on relative-best, DSR notwithstanding
+    for sid in ("near", "far", "down"):
+        assert rows[sid]["reason"] == "eligible", sid
+        assert rows[sid]["eligible"] is True, sid
+        assert rows[sid]["dsr_gate_pass"] is False, sid      # DSR gate surfaced
+    # registry_bar_pass is still computed for observability
+    assert rows["near"]["registry_bar_pass"] is True         # DSR 0.85 in-band
+    assert rows["far"]["registry_bar_pass"] is False         # DSR 0.40 below
+    assert rows["down"]["registry_bar_pass"] is False        # downside fails
+    # a winner IS selected (highest-IC eligible — all tie at 0.20, one is chosen)
+    assert board["winner_version_id"] in {"near-v", "far-v", "down-v"}
 
 
-def test_legacy_manifest_without_dsr_field_is_gate_failed(monkeypatch):
-    # Pre-L4582 manifests carry no overfit.dsr — must read as plain gate_failed
-    # (never near-miss), not crash.
+def test_legacy_manifest_without_dsr_field_still_promotes_on_relative_best(monkeypatch):
+    # Pre-L4582 manifests carry no overfit.dsr — dsr_training is None (not crash),
+    # dsr_gate_pass reflects the gate flag, and the challenger still PROMOTES on
+    # relative-best (beats champion by margin) since DSR is not a blocker.
     monkeypatch.setattr(cfg, "FORWARD_DAYS", 21, raising=False)
+    monkeypatch.setattr(cfg, "MODEL_ZOO_PROMOTE_MIN_IC", 0.0, raising=False)
     legacy = _manifest(mean_ic=0.20, gate=False)
     del legacy["meta_model_promotion_stats"]["overfit"]["dsr"]
     s3 = _FakeS3({
@@ -136,9 +148,10 @@ def test_legacy_manifest_without_dsr_field_is_gate_failed(monkeypatch):
     board = mz.select_winner(s3, "bkt", trained=[
         {"spec_id": "old", "version_id": "old-v", "model_version": "m"}])
     row = board["candidates"][0]
-    assert row["reason"] == "gate_failed"
-    assert row["registry_bar_pass"] is False
+    assert row["reason"] == "eligible"
+    assert row["dsr_gate_pass"] is False
     assert row["dsr_training"] is None
+    assert board["winner_version_id"] == "old-v"
 
 
 # ── (b) trial ledger + dsr_selection ─────────────────────────────────────────

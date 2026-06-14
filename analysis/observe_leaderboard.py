@@ -1,34 +1,28 @@
 """
-analysis/observe_leaderboard.py — realized-edge leaderboard for the observe tier.
+analysis/observe_leaderboard.py — realized-edge measurement for the model zoo.
 
-config #671 / #702 / L4539 (Phase 2 — the SLOWER confirm layer on top of the
-immediate CPCV selector). Scores every shadow-run model version
-(``predictor/predictions_shadow/{version_id}/{date}.json``) against REALIZED 21d
-sector-neutral alpha over the #702 soak window, alongside the live champion
-(``predictor/predictions/{date}.json``), and emits a leaderboard + a
-"ready-for-full-promotion" verdict per version.
+config#671/#673/#702/#1052/L4539. Originally the SLOWER confirm layer for the
+Option-B observe tier; under the RELATIVE-BEST promotion rule (#1052) that tier is
+retired (a beats-champion challenger PROMOTES, it does not enter an observe soak).
+This module now serves TWO realized-edge reads, both pure MEASUREMENT (never
+promote / demote / allocate):
 
-WHY this is load-bearing (the L4539-P2 piece): the immediate training-time
-selector (``training/model_zoo.py::select_winner``) ranks variants by leak-free
-CPCV mean IC — a TRAINING-time read. The full training-DSR gate is data-starved
-(~late-2026, see #671). The principled interim path moves a beats-the-champion
-challenger to the SHADOW-ONLY observe tier; THIS module is what later gates an
-observe→champion promotion — on REALIZED out-of-sample edge, NOT training DSR.
+1. ``build_champion_realized_monitor`` (the primary, live read) — the
+   NOISE-CHASING MONITOR of the PROMOTED champion. Relative-best promotion accepts
+   the best-of-N challenger over the incumbent each week without an absolute
+   significance gate; the risk is chasing noise. This scores the LIVE champion's
+   own ``predictor/predictions/{date}.json`` vs REALIZED 21d sector-neutral alpha
+   over a trailing window. A weak/negative realized rank-IC ⇒ ``chasing_noise``
+   True — an OBSERVABILITY/alarm signal that we may be over-fitting the selector,
+   NOT a gate. ``training/model_zoo.py::run_rotation_and_select`` calls this each
+   rotation after the promote and stashes the verdict on the leaderboard.
 
-Verdict gate (the #702 GATE-2 pre-registered criterion, ``model-shadow-
-comparison-260601``): a version is ``ready_for_full_promotion`` iff over the soak
-window it has
-
-  - >= ``MIN_SOAK_WEEKS`` weeks of shadow coverage (default 4), AND
-  - >= ``MIN_REALIZED_OUTCOMES`` matured (realized-window-closed) (date, ticker)
-    outcomes (default 20), AND
-  - realized rank-IC (Spearman of predicted_alpha vs realized 21d alpha)
-    >= the champion's realized rank-IC over the SAME matured pairs.
-
-This is a measurement surface, NOT an actuator: it NEVER promotes or allocates.
-A human operator (or a future #702 GATE-2 automation) reads the verdict and runs
-``python -m model.registry --bucket B --promote <version_id>`` when satisfied.
-The full training-DSR gate stays un-weakened (it is a separate operator gate).
+2. ``build_observe_leaderboard`` (retained) — scores any still-shadowed versions
+   (``predictor/predictions_shadow/{version_id}/{date}.json``; the shadow runner
+   still shadows registered CHALLENGER-stage versions) against realized 21d alpha
+   alongside the champion. A diagnostic comparison surface; with the observe tier
+   retired it no longer GATES any promotion (its ``ready_for_full_promotion`` is
+   advisory only). Operator may still read it.
 
 Reuses the realized-alpha machinery from ``analysis/variant_cutover_gate.py``
 (``compute_realized_alpha_for_pairs``) and the S3 price / sector_map loaders from
@@ -38,15 +32,15 @@ implementation, not a parallel shortcut (SOTA mirror, not re-invent).
 S3 layout::
 
     predictor/model_zoo/observe_leaderboard/
-      ├── {trading_day}.json   ← per-run leaderboard (dated)
+      ├── {trading_day}.json   ← per-run leaderboard / champion monitor (dated)
       └── latest.json          ← single-fetch operator UX (mirror)
 
 Both payloads carry ``calendar_date`` + ``trading_day`` per DATE_CONVENTIONS.md.
 
 Usage (programmatic)::
 
-    from analysis.observe_leaderboard import build_observe_leaderboard
-    result = build_observe_leaderboard(bucket="alpha-engine-research", n_days=42)
+    from analysis.observe_leaderboard import build_champion_realized_monitor
+    mon = build_champion_realized_monitor(bucket="alpha-engine-research")
 
 Usage (CLI)::
 
@@ -219,6 +213,144 @@ def _distinct_weeks(dates) -> int:
     return len(weeks)
 
 
+def _write_payload(payload: dict, bucket: str, trading_day: str | None,
+                   *, write_latest: bool, s3_client=None) -> str:
+    """Write a realized-edge payload to ``observe_leaderboard/{trading_day}.json``
+    (+ ``latest.json`` mirror). Single write chokepoint shared by the champion
+    monitor and the (retained) shadow leaderboard — keeps exactly two PUT sites in
+    this file (pinned in tests/test_artifact_registry_coverage.py)."""
+    import boto3
+
+    s3 = s3_client or boto3.client("s3")
+    body = json.dumps(payload, indent=2, default=str).encode("utf-8")
+    key = f"{OUTPUT_PREFIX}/{trading_day or 'latest'}.json"
+    s3.put_object(Bucket=bucket, Key=key, Body=body, ContentType="application/json")
+    log.info("observe_leaderboard written to s3://%s/%s", bucket, key)
+    if write_latest:
+        latest_key = f"{OUTPUT_PREFIX}/latest.json"
+        s3.put_object(Bucket=bucket, Key=latest_key, Body=body, ContentType="application/json")
+        log.info("observe_leaderboard mirrored to s3://%s/%s", bucket, latest_key)
+    return key
+
+
+def build_champion_realized_monitor(
+    bucket: str | None = None,
+    n_days: int = DEFAULT_WINDOW_DAYS,
+    horizon_days: int = DEFAULT_HORIZON,
+    *,
+    date_str: str | None = None,
+    write_to_s3: bool = True,
+    write_latest: bool = True,
+    s3_client=None,
+    live_pairs: list[dict] | None = None,
+    prices_by_ticker: dict | None = None,
+    sector_map: dict | None = None,
+) -> dict:
+    """NOISE-CHASING MONITOR of the PROMOTED champion (config#671/#673/#1052).
+
+    Relative-best promotion accepts the best-of-N challenger over the incumbent
+    every week with no absolute-significance gate; the risk is chasing noise. This
+    scores the LIVE champion's own ``predictor/predictions/{date}.json`` against
+    REALIZED 21d sector-neutral alpha over a trailing window and flags
+    ``chasing_noise`` when the realized rank-IC is non-positive (or unavailable
+    once enough outcomes have matured). Pure OBSERVABILITY — it NEVER promotes,
+    demotes, or allocates; the verdict is an alarm/diagnostic signal only.
+
+    Test-injectable: ``live_pairs`` / ``prices_by_ticker`` / ``sector_map`` bypass
+    S3 when provided.
+    """
+    bucket = bucket or cfg.S3_BUCKET
+    horizon_days = horizon_days or int(getattr(cfg, "FORWARD_DAYS", 21))
+
+    calendar_date = None
+    trading_day = date_str
+    try:
+        from alpha_engine_lib.dates import now_dual
+        dual = now_dual()
+        calendar_date = dual.calendar_date
+        trading_day = trading_day or (
+            dual.trading_day.isoformat() if hasattr(dual.trading_day, "isoformat")
+            else str(dual.trading_day)
+        )
+    except Exception:  # noqa: BLE001 — date resolution must not block the monitor
+        log.warning("champion_monitor: now_dual failed; date fields best-effort", exc_info=True)
+
+    if live_pairs is None:
+        live_pairs = _load_live_pairs(bucket, n_days, s3_client=s3_client)
+
+    if prices_by_ticker is None or sector_map is None:
+        tickers = {p["ticker"] for p in live_pairs if p.get("ticker")}
+        sector_map = sector_map or _load_sector_map_from_s3(bucket, s3_client=s3_client)
+        bench_symbols = set(sector_map.values()) | {"SPY"}
+        prices_by_ticker = prices_by_ticker or _load_prices_from_s3(
+            bucket, tickers | bench_symbols, s3_client=s3_client,
+        )
+
+    compute_realized_alpha_for_pairs(
+        live_pairs, horizon_days=horizon_days,
+        prices_by_ticker=prices_by_ticker, sector_map=sector_map,
+    )
+    champ_ic, champ_n, champ_weeks = _realized_rank_ic(live_pairs)
+
+    # chasing_noise verdict: only assertable once enough outcomes have matured.
+    # Non-positive realized rank-IC on >= MIN_REALIZED_OUTCOMES matured pairs ⇒ the
+    # promoted champion shows no realized predictive edge → likely chasing noise.
+    if champ_ic is None or champ_n < MIN_REALIZED_OUTCOMES:
+        chasing_noise = None
+        verdict_reason = (
+            f"insufficient matured outcomes ({champ_n}; need >= {MIN_REALIZED_OUTCOMES}) "
+            f"to assert a realized-edge verdict"
+        )
+    elif champ_ic <= 0.0:
+        chasing_noise = True
+        verdict_reason = (
+            f"NOISE WATCH: champion realized rank-IC {champ_ic:.4f} <= 0 over "
+            f"{champ_n} matured outcomes / {champ_weeks} weeks — relative-best "
+            f"promotion may be chasing noise (observability, NOT a gate)"
+        )
+    else:
+        chasing_noise = False
+        verdict_reason = (
+            f"healthy: champion realized rank-IC {champ_ic:.4f} > 0 over {champ_n} "
+            f"matured outcomes / {champ_weeks} weeks"
+        )
+
+    payload = {
+        "calendar_date": calendar_date,
+        "trading_day": trading_day,
+        "date": trading_day,
+        "kind": "champion_realized_monitor",
+        "window_days": n_days,
+        "horizon_days": horizon_days,
+        "champion": {
+            "realized_rank_ic": champ_ic,
+            "n_matured_outcomes": champ_n,
+            "n_weeks_coverage": champ_weeks,
+        },
+        "chasing_noise": chasing_noise,
+        "verdict_reason": verdict_reason,
+        "note": (
+            "Relative-best promotion (config#671/#673/#1052): the best-of-N "
+            "challenger beating the champion by margin auto-promotes weekly; DSR is "
+            "observability, not a gate. This monitor flags whether that selection is "
+            "chasing noise via the PROMOTED champion's realized 21d rank-IC. It never "
+            "promotes/demotes/allocates."
+        ),
+    }
+
+    if write_to_s3:
+        payload["s3_key"] = _write_payload(
+            payload, bucket, trading_day, write_latest=write_latest, s3_client=s3_client,
+        )
+
+    log.info(
+        "champion_realized_monitor: realized rank-IC=%s over %d matured / %d weeks; "
+        "chasing_noise=%s",
+        champ_ic, champ_n, champ_weeks, chasing_noise,
+    )
+    return payload
+
+
 def build_observe_leaderboard(
     bucket: str | None = None,
     n_days: int = DEFAULT_WINDOW_DAYS,
@@ -363,18 +495,9 @@ def build_observe_leaderboard(
     }
 
     if write_to_s3:
-        import boto3
-
-        s3 = s3_client or boto3.client("s3")
-        body = json.dumps(payload, indent=2, default=str).encode("utf-8")
-        key = f"{OUTPUT_PREFIX}/{trading_day or 'latest'}.json"
-        s3.put_object(Bucket=bucket, Key=key, Body=body, ContentType="application/json")
-        log.info("observe_leaderboard written to s3://%s/%s", bucket, key)
-        payload["s3_key"] = key
-        if write_latest:
-            latest_key = f"{OUTPUT_PREFIX}/latest.json"
-            s3.put_object(Bucket=bucket, Key=latest_key, Body=body, ContentType="application/json")
-            log.info("observe_leaderboard mirrored to s3://%s/%s", bucket, latest_key)
+        payload["s3_key"] = _write_payload(
+            payload, bucket, trading_day, write_latest=write_latest, s3_client=s3_client,
+        )
 
     log.info(
         "observe_leaderboard: %d version(s) scored; %d ready-for-full-promotion "

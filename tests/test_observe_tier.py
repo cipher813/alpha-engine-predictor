@@ -1,15 +1,15 @@
-"""Tests for the observe tier (config #671 / #673 / #702 — Option B + A1 + C).
+"""Tests for the DORMANT observe-tier infrastructure + A1 effective-N DSR.
 
-Pins:
-  - registry ``observe`` stage + ``register_to_observe`` (challenger→observe is a
-    stage-only patch, NEVER copies into the live weights prefix, never demotes a
-    champion);
-  - shadow runner enumerates BOTH challenger + observe stages;
-  - ``select_winner`` ``observe_eligible`` logic (clears registry bar + beats
-    champion + right horizon, but NOT full-gate);
-  - ``run_rotation_and_select`` registers observe-eligibles to observe WITHOUT
-    promoting the champion (independent of auto-promote);
-  - A1 effective-N TIGHTENS DSR (never loosens) + surfaces the 'needs ~Y' bar.
+config#671/#673/#702/#1052. The Option-B promote-to-observe tier is RETIRED for
+the core loop (config#1052 relative-best: a beats-champion challenger PROMOTES, it
+does not enter an observe soak). ``select_winner``/``run_rotation_and_select`` no
+longer flag or register observe-eligibles (see test_model_zoo.py for the relative-
+best eligibility tests). The registry ``observe`` stage + ``register_to_observe``
+are RETAINED as dormant, additive infrastructure for a possible future explicit
+observe soak; these tests pin that they still behave correctly (stage-only patch,
+never copies into live weights, never demotes a champion) and that the shadow
+runner still enumerates both stages. A1 effective-N DSR (tightens, never loosens)
+is retained observability and is pinned here too.
 """
 from __future__ import annotations
 
@@ -166,130 +166,31 @@ def test_shadow_runner_lists_both_challenger_and_observe(monkeypatch):
     assert set(calls) == {"challenger", "observe"}
 
 
-# ── select_winner: observe_eligible logic ────────────────────────────────────
+# ── observe tier COLLAPSED: select_winner emits no observe fields ─────────────
 
 
-def test_select_winner_marks_observe_eligible_near_miss(monkeypatch):
-    # A challenger that BEATS the champion + clears the registry bar (dsr 0.85 >=
-    # 0.80) but FAILS the full gate (passes_overfit_gate False) → observe-eligible,
-    # NOT promotion-eligible.
+def test_select_winner_emits_no_observe_fields(monkeypatch):
+    # config#1052: the observe tier is retired for the core loop. A DSR-gate-failing
+    # challenger that beats the champion now PROMOTES (relative-best) rather than
+    # being flagged observe_eligible — so neither the per-candidate observe_eligible
+    # flag nor the leaderboard observe_eligible_version_ids plumbing exists anymore.
     monkeypatch.setattr(cfg, "FORWARD_DAYS", 21, raising=False)
-    monkeypatch.setattr(cfg, "WF_DSR_REGISTRY_THRESHOLD", 0.80, raising=False)
+    monkeypatch.setattr(cfg, "MODEL_ZOO_PROMOTE_MIN_IC", 0.0, raising=False)
     s3 = _FakeS3({
         cfg.META_MANIFEST_KEY: _mk_manifest(21, 0.10, True),
-        # near-miss: beats champ (0.20 > 0.10+margin), registry bar passes via
-        # downside+dsr=0.85, but full gate (overfit) fails.
+        # beats champ (0.20 > 0.10+margin), DSR gate FAILS → still PROMOTES now.
         "predictor/registry/nm-v/manifest.json": _mk_manifest(
             21, 0.20, False, registry_dsr=0.85, dsr=0.85),
     })
     trained = [{"spec_id": "nm", "version_id": "nm-v", "model_version": "spec-nm"}]
     board = mz.select_winner(s3, "bkt", trained=trained, margin=0.01)
     c = board["candidates"][0]
-    assert c["reason"] == "near_miss_below_promotion_bar"
-    assert c["beats_champion_by_margin"] is True
-    assert c["registry_bar_pass"] is True
-    assert c["observe_eligible"] is True
-    assert c["eligible"] is False
-    assert board["winner_version_id"] is None              # no full-gate winner
-    assert board["observe_eligible_version_ids"] == ["nm-v"]
-
-
-def test_select_winner_full_gate_winner_is_not_observe(monkeypatch):
-    # A full-gate-pass winner is promotion-eligible — NOT observe (observe is the
-    # near-miss tier). observe_eligible must be False for it.
-    monkeypatch.setattr(cfg, "FORWARD_DAYS", 21, raising=False)
-    monkeypatch.setattr(cfg, "WF_DSR_REGISTRY_THRESHOLD", 0.80, raising=False)
-    s3 = _FakeS3({
-        cfg.META_MANIFEST_KEY: _mk_manifest(21, 0.10, True),
-        "predictor/registry/w-v/manifest.json": _mk_manifest(
-            21, 0.20, True, registry_dsr=0.97, dsr=0.97),
-    })
-    trained = [{"spec_id": "w", "version_id": "w-v", "model_version": "spec-w"}]
-    board = mz.select_winner(s3, "bkt", trained=trained, margin=0.01)
-    c = board["candidates"][0]
+    assert c["reason"] == "eligible"                       # promotes on relative-best
     assert c["eligible"] is True
-    assert c["observe_eligible"] is False
-    assert board["winner_version_id"] == "w-v"
-    assert board["observe_eligible_version_ids"] == []
-
-
-def test_select_winner_loser_not_observe_eligible(monkeypatch):
-    # Clears the registry bar but does NOT beat the champion → not observe-eligible
-    # (observe requires demonstrated CPCV edge over the champion).
-    monkeypatch.setattr(cfg, "FORWARD_DAYS", 21, raising=False)
-    monkeypatch.setattr(cfg, "WF_DSR_REGISTRY_THRESHOLD", 0.80, raising=False)
-    s3 = _FakeS3({
-        cfg.META_MANIFEST_KEY: _mk_manifest(21, 0.20, True),
-        "predictor/registry/lo-v/manifest.json": _mk_manifest(
-            21, 0.10, False, registry_dsr=0.85, dsr=0.85),  # below champ
-    })
-    trained = [{"spec_id": "lo", "version_id": "lo-v", "model_version": "spec-lo"}]
-    board = mz.select_winner(s3, "bkt", trained=trained, margin=0.01)
-    c = board["candidates"][0]
-    assert c["beats_champion_by_margin"] is False
-    assert c["observe_eligible"] is False
-    assert board["observe_eligible_version_ids"] == []
-
-
-# ── run_rotation_and_select: registers observe WITHOUT promoting champion ─────
-
-
-def _rotation_fixture(monkeypatch, *, auto_promote):
-    monkeypatch.setattr(cfg, "FORWARD_DAYS", 21, raising=False)
-    monkeypatch.setattr(cfg, "WF_DSR_REGISTRY_THRESHOLD", 0.80, raising=False)
-    specs = [{"id": "nm", "status": "active", "model_version_label": "spec-nm",
-              "overrides": {}}]
-    s3 = _FakeS3({
-        cfg.META_MANIFEST_KEY: _mk_manifest(21, 0.10, True),
-        cfg.META_FEATURE_LIST_KEY: {"features": ["a"]},
-        # near-miss challenger: beats champ, registry bar passes, full gate fails.
-        "predictor/registry/nm-v/manifest.json": _mk_manifest(
-            21, 0.20, False, registry_dsr=0.85, dsr=0.85),
-        "predictor/registry/nm-v/_lineage.json": {"version_id": "nm-v", "stage": "challenger"},
-    })
-    monkeypatch.setattr(reg, "list_versions", lambda s3c, b, stage=None: (
-        [{"version_id": "nm-v", "model_version": "spec-nm", "date": "2026-06-13"}]
-        if stage == "challenger" else []
-    ))
-    promotes = []
-    monkeypatch.setattr(reg, "promote_to_champion",
-                        lambda s3c, b, vid, **k: promotes.append(vid))
-    observes = []
-    _orig = reg.register_to_observe
-    monkeypatch.setattr(reg, "register_to_observe",
-                        lambda s3c, b, vid, **k: (observes.append(vid), _orig(s3c, b, vid, **k))[1])
-
-    def _fake_train(bucket, *, date_str=None, dry_run=False):
-        return {"status": "ok"}
-
-    board = mz.run_rotation_and_select(
-        "bkt", budget=5, specs=specs, train_fn=_fake_train,
-        registered_versions=[], s3=s3, auto_promote_winner=auto_promote,
-        date_str="2026-06-13",
-    )
-    return board, promotes, observes, s3
-
-
-def test_rotation_registers_observe_does_not_promote_observe_mode(monkeypatch):
-    board, promotes, observes, s3 = _rotation_fixture(monkeypatch, auto_promote=False)
-    assert board["winner_version_id"] is None              # no full-gate winner
-    assert board["promoted"] is None                        # champion NOT promoted
-    assert promotes == []                                   # promote_to_champion never called
-    assert observes == ["nm-v"]                             # moved to observe tier
-    assert board["moved_to_observe"] == ["nm-v"]
-    # stage actually patched to observe in the registry
-    assert json.loads(s3.puts["predictor/registry/nm-v/_lineage.json"])["stage"] == "observe"
-
-
-def test_rotation_registers_observe_even_under_cutover(monkeypatch):
-    # Observe is shadow-only / zero allocation, so it runs independent of the
-    # auto-promote flag. A near-miss still moves to observe; the champion is NOT
-    # promoted (the near-miss is not a full-gate winner).
-    board, promotes, observes, _ = _rotation_fixture(monkeypatch, auto_promote=True)
-    assert board["mode"] == "cutover"
-    assert board["winner_version_id"] is None
-    assert promotes == []                                   # near-miss is not promoted
-    assert observes == ["nm-v"]
+    assert "observe_eligible" not in c                     # flag removed
+    assert c["dsr_gate_pass"] is False                     # DSR gate surfaced, not blocking
+    assert board["winner_version_id"] == "nm-v"
+    assert "observe_eligible_version_ids" not in board     # plumbing removed
 
 
 # ── A1: effective-N tightens DSR + surfaces the 'needs ~Y' bar ────────────────

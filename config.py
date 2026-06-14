@@ -568,6 +568,15 @@ MODEL_ZOO_AUTO_PROMOTE_WINNER = _flag_env_or_yaml(
 )
 # CPCV mean-IC margin a challenger must beat the champion by to be selected.
 MODEL_ZOO_PROMOTE_MARGIN = float(_cfg.get("model_zoo_promote_margin", 0.01))
+# config#671/#673/#1052 — RELATIVE-BEST promotion: the absolute DSR-0.95 hurdle is
+# NO LONGER a promotion blocker (it's an observability number — both champion and
+# challenger are equally data-starved estimates on ~1 independent 21d block, so the
+# incumbent has no special epistemic claim; defaulting to the staler champion is
+# status-quo bias, and 21d-alpha models go stale). Promotion fires on beats-champion
+# +margin. The ONLY absolute floor is this positive-IC guard: never promote a model
+# whose leak-free-CPCV mean IC is <= MODEL_ZOO_PROMOTE_MIN_IC, even if it's best-of-N
+# (a best-of-N with non-positive predictive IC is noise, not edge). Default 0.0.
+MODEL_ZOO_PROMOTE_MIN_IC = float(_cfg.get("model_zoo_promote_min_ic", 0.0))
 # L4582: CSCV-PBO target for the rotation's selection step (Bailey-LdP 2014,
 # probability the in-sample winner lands in the bottom half out-of-sample).
 # OBSERVE-only — logged to the leaderboard, not gating; <0.2 is the bar any

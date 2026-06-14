@@ -174,3 +174,81 @@ def test_leaderboard_writes_dated_and_latest():
     assert f"{ol.OUTPUT_PREFIX}/2026-06-13.json" in s3.puts
     assert f"{ol.OUTPUT_PREFIX}/latest.json" in s3.puts
     assert res["s3_key"] == f"{ol.OUTPUT_PREFIX}/2026-06-13.json"
+
+
+# ── config#1052: champion realized-edge NOISE-CHASING monitor ─────────────────
+
+
+def test_champion_monitor_healthy_when_realized_edge_positive():
+    # The promoted champion ranks AAA (rising) > BBB (falling) → positive realized
+    # rank-IC over enough matured outcomes → chasing_noise False.
+    dates = _weekly_dates(5)
+    champ = _pred_rows({"AAA": 0.9, "BBB": 0.1}, dates)        # correct ranking
+    res = ol.build_champion_realized_monitor(
+        bucket="b", write_to_s3=False, date_str="2026-06-13", horizon_days=21,
+        live_pairs=champ, prices_by_ticker=_prices(), sector_map={},
+    )
+    assert res["kind"] == "champion_realized_monitor"
+    assert res["champion"]["realized_rank_ic"] > 0
+    assert res["champion"]["n_matured_outcomes"] >= ol.MIN_REALIZED_OUTCOMES
+    assert res["chasing_noise"] is False
+    assert "healthy" in res["verdict_reason"]
+
+
+def test_champion_monitor_flags_noise_when_realized_ic_non_positive():
+    # The promoted champion ranks BACKWARDS (AAA falling-weight) → non-positive
+    # realized rank-IC over enough matured outcomes → chasing_noise True (alarm).
+    dates = _weekly_dates(5)
+    champ = _pred_rows({"AAA": 0.1, "BBB": 0.9}, dates)        # inverted ranking
+    res = ol.build_champion_realized_monitor(
+        bucket="b", write_to_s3=False, date_str="2026-06-13", horizon_days=21,
+        live_pairs=champ, prices_by_ticker=_prices(), sector_map={},
+    )
+    assert res["champion"]["realized_rank_ic"] <= 0
+    assert res["chasing_noise"] is True
+    assert "NOISE WATCH" in res["verdict_reason"]
+
+
+def test_champion_monitor_verdict_none_when_too_few_outcomes():
+    # Too few matured outcomes → no verdict assertable (chasing_noise None), stated
+    # explicitly rather than silently defaulting to "healthy".
+    last = _prices(120)["AAA"].index[-1]
+    near_end = [(last - pd.Timedelta(days=k)).date().isoformat() for k in range(3)]
+    champ = _pred_rows({"AAA": 0.9, "BBB": 0.1}, near_end)
+    res = ol.build_champion_realized_monitor(
+        bucket="b", write_to_s3=False, date_str="2026-06-13", horizon_days=21,
+        live_pairs=champ, prices_by_ticker=_prices(), sector_map={},
+    )
+    assert res["chasing_noise"] is None
+    assert "insufficient matured outcomes" in res["verdict_reason"]
+
+
+def test_champion_monitor_is_measurement_only_no_actuator():
+    # The monitor never promotes/demotes/allocates — no registry actuator symbol.
+    import inspect
+
+    src = inspect.getsource(ol.build_champion_realized_monitor)
+    assert "promote_to_champion" not in src
+    assert "register_to_observe" not in src
+
+
+def test_champion_monitor_writes_dated_and_latest():
+    dates = _weekly_dates(5)
+    champ = _pred_rows({"AAA": 0.9, "BBB": 0.1}, dates)
+
+    class _S3:
+        def __init__(self):
+            self.puts = []
+
+        def put_object(self, Bucket, Key, Body, ContentType=None):  # noqa: N803
+            self.puts.append(Key)
+
+    s3 = _S3()
+    res = ol.build_champion_realized_monitor(
+        bucket="b", write_to_s3=True, write_latest=True, s3_client=s3,
+        date_str="2026-06-13", horizon_days=21,
+        live_pairs=champ, prices_by_ticker=_prices(), sector_map={},
+    )
+    assert f"{ol.OUTPUT_PREFIX}/2026-06-13.json" in s3.puts
+    assert f"{ol.OUTPUT_PREFIX}/latest.json" in s3.puts
+    assert res["s3_key"] == f"{ol.OUTPUT_PREFIX}/2026-06-13.json"

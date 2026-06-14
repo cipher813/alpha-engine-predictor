@@ -288,6 +288,19 @@ model_zoo_weekly_budget: 3
 # logged to the leaderboard `selection_pbo` block; <0.2 is the bar any public
 # DSR/selection claim must clear).
 model_zoo_pbo_target: 0.2
+# config#671/#673/#1052 — RELATIVE-BEST promotion. The absolute DSR-0.95 hurdle is
+# NO LONGER a promotion blocker (it is surfaced as observability — dsr_gate_pass /
+# dsr_training — on each candidate + the promotion alert). The weekly rotation
+# auto-promotes the best leak-free-CPCV challenger that beats the live champion's
+# CPCV mean IC by `model_zoo_promote_margin`, subject to a single positive floor:
+# never promote a challenger whose CPCV mean IC is <= `model_zoo_promote_min_ic`
+# (a best-of-N with non-positive IC is noise, not edge). The repurposed
+# observe_leaderboard runs as a NOISE-CHASING monitor of the promoted champion.
+model_zoo_promote_margin: 0.005
+model_zoo_promote_min_ic: 0.0
+# model_zoo_auto_promote_winner: true   # auto-promote is live (set in predictor.yaml);
+#                                       # safety rails = promotion alert w/ revert cmd
+#                                       # + #237 turnover governor + one-command revert.
 
 # ── Feature engineering parameters ────────────────────────────────────────────
 features:

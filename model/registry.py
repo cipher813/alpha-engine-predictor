@@ -33,24 +33,24 @@ DEFAULT_REGISTRY_PREFIX = "predictor/registry/"
 # The lifecycle stages a registered version can carry. `snapshot_to_registry`
 # records one into the lineage; the CLI validates `--stage` against this set.
 #
-# Stage ladder (config #671 — Option B observe tier):
-#   challenger → observe → champion → archived
-# ``observe`` (a.k.a. shadow-live) is the SHADOW-ONLY promotion tier between
-# ``challenger`` and ``champion``: a challenger that clears the LOWER registry
-# bar (DSR >= WF_DSR_REGISTRY_THRESHOLD + downside gate) AND beats the incumbent
-# champion's CPCV mean IC by a margin — but does NOT yet clear the FULL promotion
-# bar (the data-starved DSR >= WF_DSR_THRESHOLD, passable ~late-2026 once enough
-# independent 21d blocks accrue). An ``observe`` version carries ZERO live
-# allocation: it is shadow-scored (predictions_shadow/) and its REALIZED edge is
-# tracked by the observe leaderboard, which gates any later observe→champion
-# move. It is shadow-runnable exactly like a challenger (the shadow runner
-# enumerates both stages). It NEVER trades capital — moving observe→champion is
-# a separate, operator-gated promotion driven by REALIZED edge, not training DSR.
+# Stage ladder:  challenger → (observe) → champion → archived
+#
+# ``observe`` (a.k.a. shadow-live) was the Option-B promote-to-observe tier
+# (config #671). Under the RELATIVE-BEST promotion rule (config#671/#673/#1052) a
+# beats-champion challenger PROMOTES directly rather than entering an observe soak,
+# so ``run_rotation_and_select`` no longer registers versions to ``observe`` — the
+# stage + ``register_to_observe`` are retained as DORMANT, additive infrastructure
+# (a stage-only patch, zero live allocation, never demotes a champion) so the
+# ladder is non-lossy and a future explicit observe soak can reuse them. Nothing in
+# the core loop feeds them today; no S3 producer is left dangling (it is a lineage
+# stage patch, not a freshness-tracked artifact). A version that lands in
+# ``observe`` is still shadow-runnable exactly like a challenger.
 VALID_STAGES = ("champion", "challenger", "observe", "archived")
 
-# Stages the Phase-1 shadow runner re-scores against the live universe. Both
-# challengers and observe-tier versions are shadowed (observe-tier accumulates
-# the same predictions_shadow/ history the leaderboard scores on realized edge).
+# Stages the Phase-1 shadow runner re-scores against the live universe. Challengers
+# are shadowed for the diagnostic realized-edge leaderboard; ``observe`` is kept in
+# the set so any dormant observe-stage bundle (none in the core loop today) would
+# still shadow correctly.
 SHADOW_STAGES = ("challenger", "observe")
 
 # Files that MUST be present for a snapshot to be a valid, reproducible bundle.
