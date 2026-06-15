@@ -477,18 +477,16 @@ XSEC_DEMEAN_ALPHA_ENABLED = _flag_env_or_yaml(
     "XSEC_DEMEAN_ALPHA_ENABLED", _level_neut_cfg.get("enabled", False)
 )
 
-# ── Challenger-first promotion (L4469) ──────────────────────────────────────
-# When False (default), a training run that PASSES the promotion gate does NOT
-# overwrite the live champion — it is registered as a CHALLENGER (shadow +
-# scored), and the operator promotes the best to champion via
-# `python -m model.registry promote` after the leaderboard shows realized OOS
-# edge. This closes the auto-ship-a-broken-model hole (the 5/30 8-model
-# auto-promoted on an inflated in-sample IC and flushed the book to SPY). Set
-# True (yaml or env) only to restore legacy auto-promote. Env-overridable.
-_promote_cfg = _cfg.get("training", {})
-TRAINING_AUTO_PROMOTE_ENABLED = _flag_env_or_yaml(
-    "TRAINING_AUTO_PROMOTE_ENABLED", _promote_cfg.get("auto_promote_enabled", False)
-)
+# ── Challenger-first promotion (L4469; UNCONDITIONAL since config#1052/#679) ─
+# Training is ALWAYS challenger-first: a run that PASSES the promotion gate is
+# registered as a CHALLENGER (shadow + scored) and NEVER overwrites the live
+# champion. Promotion is decided SOLELY by the relative-best model-zoo
+# `select_winner` step (`training/model_zoo.py`), which copies the winner's
+# bundle live via `model.registry.promote_to_champion`. The former
+# `TRAINING_AUTO_PROMOTE_ENABLED` flag (dead — always False in production) was
+# retired here: there is no training-time auto-promote path anymore. This closes
+# the auto-ship-a-broken-model hole structurally (the 5/30 8-model auto-promoted
+# on an inflated in-sample IC and flushed the book to SPY).
 
 # ── Model zoo (L4488c) ──────────────────────────────────────────────────────
 # Declarative variant specs for champion/challenger rotation. Each spec is a

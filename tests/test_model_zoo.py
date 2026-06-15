@@ -266,20 +266,24 @@ def _mk_manifest(forward_days, cpcv_ic, gate_pass, *, dsr=None):
     }
 
 
-def test_rotation_forces_challenger_first_and_restores(monkeypatch):
-    # G1: every spec trains with auto-promote forced OFF, restored after.
-    monkeypatch.setattr(cfg, "TRAINING_AUTO_PROMOTE_ENABLED", True, raising=False)
-    seen = []
+def test_rotation_trains_every_selected_spec():
+    # config#1052/#679: the former G1 guard (forcing TRAINING_AUTO_PROMOTE_ENABLED
+    # off per train) is GONE — training is unconditionally challenger-first, so a
+    # spec can never self-promote and there is nothing to force/restore. The
+    # surviving rotation invariant is that every selected spec is trained exactly
+    # once; G2 contract restore is covered by the roundtrip test below.
+    trained = []
 
     def _fake_train(bucket, *, date_str=None, dry_run=False):
-        seen.append(cfg.TRAINING_AUTO_PROMOTE_ENABLED)
+        trained.append(bucket)
         return {"status": "ok"}
 
-    mz.train_weekly_rotation(
+    results = mz.train_weekly_rotation(
         "bkt", budget=5, specs=_SPECS, train_fn=_fake_train, registered_versions=[],
     )
-    assert seen and all(v is False for v in seen)          # forced off during each train
-    assert cfg.TRAINING_AUTO_PROMOTE_ENABLED is True       # restored after the rotation
+    n_active = sum(1 for s in _SPECS if s.get("status", "active") == "active" and s.get("id"))
+    assert len(trained) == min(5, n_active)                # one train per selected spec
+    assert all(r.get("status") == "ok" for r in results.values())
 
 
 def test_snapshot_and_restore_live_contract_roundtrip():

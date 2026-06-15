@@ -103,13 +103,24 @@ class TestMetaTrainerGateDetailBlock:
                 "both reference each gate name"
             )
 
-    def test_blocker_reason_is_none_when_promoted(self):
-        """The reason field must be None (not the empty string, not
-        \"none\") when promotion succeeds so downstream readers can use
-        the field as a simple truthy/falsy promotion-status flag."""
+    def test_blocker_reason_reflects_challenger_first(self):
+        """config#1052/#679: training is unconditionally challenger-first
+        (`promoted` is always False here — TRAINING_AUTO_PROMOTE_ENABLED was
+        retired), so a gate-passing run's blocker reason is `challenger_first`
+        (the model registered as a challenger; the model-zoo `select_winner`
+        step owns promotion), and failing gates render the +-joined gate names."""
         src = _src("training/meta_trainer.py")
-        assert "None if promoted else" in src, (
-            "blocker reason must short-circuit to None when promoted=True"
+        assert "promoted = False" in src, (
+            "training must be unconditionally challenger-first — `promoted` "
+            "should be hardcoded False (TRAINING_AUTO_PROMOTE_ENABLED retired)"
+        )
+        assert '"+".join(_blockers) if _blockers else "challenger_first"' in src, (
+            "blocker reason must be the +-joined failing gates, else "
+            "`challenger_first` for a gate-passing challenger-registered run"
+        )
+        assert "TRAINING_AUTO_PROMOTE_ENABLED" not in src, (
+            "the dead TRAINING_AUTO_PROMOTE_ENABLED flag must not reappear in "
+            "meta_trainer (config#1052/#679 retired it)"
         )
 
 

@@ -234,34 +234,19 @@ def _list_registry_versions(bucket: str) -> list:
         return []
 
 
-# ── Rotation isolation (L4544 G1+G2) ────────────────────────────────────────
+# ── Rotation isolation (L4544 G2) ───────────────────────────────────────────
 # A zoo rotation trains CHALLENGER variants — it must NOT disturb the live
-# champion. Two hazards in meta_trainer:
-#   • TRAINING_AUTO_PROMOTE_ENABLED is globally ON → a spec whose gate passes
-#     would SELF-PROMOTE inside its own train run, bypassing the selection step.
+# champion. One hazard remains in meta_trainer:
 #   • feature_list.json + manifest.json are written to the LIVE keys
 #     UNCONDITIONALLY (model WEIGHTS are gated on `promoted`, but the two
 #     contract files are not) → a challenger train leaves the live champion's
 #     contract describing the challenger.
-# G1 forces challenger-first for the whole rotation; G2 restores the live
-# contract afterwards. Both are localized here (no meta_trainer surgery — the
-# champion path is freshly stabilized by #240).
-
-
-@contextlib.contextmanager
-def _challenger_first():
-    """G1 — force ``TRAINING_AUTO_PROMOTE_ENABLED=False`` for the duration so no
-    zoo spec self-promotes during a rotation (promotion is decided ONLY by the
-    selection step) and every challenger's weights stay archive-only."""
-    prev = getattr(cfg, "TRAINING_AUTO_PROMOTE_ENABLED", _SENTINEL)
-    cfg.TRAINING_AUTO_PROMOTE_ENABLED = False
-    try:
-        yield
-    finally:
-        if prev is _SENTINEL:
-            delattr(cfg, "TRAINING_AUTO_PROMOTE_ENABLED")
-        else:
-            cfg.TRAINING_AUTO_PROMOTE_ENABLED = prev
+# G2 restores the live contract after the rotation. (The former G1 — forcing
+# TRAINING_AUTO_PROMOTE_ENABLED=False so no spec self-promoted — is GONE: since
+# config#1052/#679 training is UNCONDITIONALLY challenger-first, so a spec can
+# never self-promote and there is nothing to force. Promotion is decided solely
+# by the `select_winner` selection step below.) G2 is localized here (no
+# meta_trainer surgery — the champion path is freshly stabilized by #240).
 
 
 def _live_contract_keys() -> list[str]:
@@ -346,21 +331,22 @@ def train_weekly_rotation(
         if s3 is not None:
             saved_contract = _snapshot_live_contract(s3, bucket)
 
+    # Training is unconditionally challenger-first (config#1052/#679), so no spec
+    # can self-promote — the former G1 guard is gone. Promotion is decided only by
+    # the `select_winner` selection step downstream.
     results: dict = {}
     try:
-        # G1 — no spec self-promotes for the whole rotation.
-        with _challenger_first():
-            for sid in selected:
-                try:
-                    results[sid] = train_spec(
-                        sid, bucket, date_str=date_str, dry_run=dry_run,
-                        specs=specs, train_fn=train_fn,
-                    )
-                except Exception as exc:  # noqa: BLE001 — one variant must not block the rest
-                    log.warning("model_zoo: spec %s failed (continuing): %s", sid, exc, exc_info=True)
-                    results[sid] = {"status": "error", "error": str(exc)}
+        for sid in selected:
+            try:
+                results[sid] = train_spec(
+                    sid, bucket, date_str=date_str, dry_run=dry_run,
+                    specs=specs, train_fn=train_fn,
+                )
+            except Exception as exc:  # noqa: BLE001 — one variant must not block the rest
+                log.warning("model_zoo: spec %s failed (continuing): %s", sid, exc, exc_info=True)
+                results[sid] = {"status": "error", "error": str(exc)}
     finally:
-        # G2 — always restore, even if the rotation raised mid-way.
+        # G2 — always restore the live contract, even if the rotation raised mid-way.
         if saved_contract and s3 is not None:
             _restore_live_contract(s3, bucket, saved_contract)
     return results

@@ -377,12 +377,16 @@ def send_training_email(result: dict, date_str: str) -> bool:
     promoted     = result.get("promoted", False)
     promoted_mode = result.get("promoted_mode")
     # `passes_ic` is now the QUALITY verdict (all gates passed), decoupled from
-    # the promotion decision (L4540). Challenger-first: a run can pass every gate
-    # and NOT promote because auto-promote is off — that is a registered
-    # challenger, NOT a failure. `auto_promote_enabled` defaults True for legacy
-    # archive runs (pre-challenger-first, where promoted == gate_passed).
+    # the promotion decision (L4540). Training is ALWAYS challenger-first since
+    # config#1052/#679 (the dead TRAINING_AUTO_PROMOTE_ENABLED flag was retired):
+    # a run can pass every gate and NOT promote — that is a registered challenger,
+    # NOT a failure; the model-zoo `select_winner` step owns promotion. Legacy
+    # pre-challenger-first archive manifests may carry `auto_promote_enabled=True`
+    # (where promoted == gate_passed); honor that for old-archive reads, but a
+    # current run is challenger-registered whenever it passes the gate without
+    # promoting.
     passes_ic    = result.get("passes_ic_gate", False)
-    auto_promote = result.get("auto_promote_enabled", True)
+    auto_promote = result.get("auto_promote_enabled", False)
     challenger_registered = bool(passes_ic and not promoted and not auto_promote)
     val_ic       = result.get("val_ic", 0.0)
     test_ic      = result.get("test_ic", 0.0)

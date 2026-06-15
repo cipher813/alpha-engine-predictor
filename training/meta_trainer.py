@@ -3485,19 +3485,20 @@ def run_meta_training(
         and output_dist_gate_passed
         and stratified_gate_passed
     )
-    # Challenger-first promotion (L4469): training does NOT auto-overwrite the
-    # live champion. A gate-passing model is registered as a CHALLENGER (shadow
-    # + scored); the operator promotes the best to champion via
-    # `python -m model.registry promote` once the leaderboard shows realized
-    # OOS edge. `gate_passed` is the gate's verdict; `promoted` — which gates
-    # BOTH the live-weight upload and the champion registry snapshot below — is
-    # the EFFECTIVE outcome, true only when auto-promote is explicitly
-    # re-enabled. Default-off closes the auto-ship-a-broken-model hole (the
-    # 5/30 8-model overwrote the champion on an inflated in-sample IC, then
-    # flushed the live book to SPY on its first inference).
+    # Challenger-first promotion (L4469; UNCONDITIONAL since config#1052/#679).
+    # Training NEVER auto-overwrites the live champion: it ALWAYS registers the
+    # trained model as a CHALLENGER (shadow + scored), and promotion is decided
+    # SOLELY by the relative-best model-zoo `select_winner` step (which copies the
+    # winner's bundle live via `model.registry.promote_to_champion`). The dead
+    # training-time auto-promote flag (always False in production) was retired —
+    # there is no training-time auto-promote path anymore. `gate_passed` is the
+    # gate's verdict, retained for registration/diagnostics; `promoted` is always
+    # False here (the base champion-arch retrain enters the zoo selection pool as a
+    # challenger via the registry capture-gap below). This closes the
+    # auto-ship-a-broken-model hole structurally (the 5/30 8-model overwrote the
+    # champion on an inflated in-sample IC, then flushed the live book to SPY).
     gate_passed = promoted
-    auto_promote_enabled = bool(getattr(cfg, "TRAINING_AUTO_PROMOTE_ENABLED", False))
-    promoted = gate_passed and auto_promote_enabled
+    promoted = False
     # Promotion-blocker reason string. Resolved from the SAME gate booleans
     # the live `promoted` formula above uses, so it can never disagree with
     # the actual outcome. Persisted into training_summary so downstream
@@ -3518,8 +3519,12 @@ def run_meta_training(
         _blockers.append("output_dist")
     if not stratified_gate_passed:
         _blockers.append("stratified")
+    # Training is ALWAYS challenger-first (config#1052/#679) → `promoted` is never
+    # True here. The "blocker" is the gate verdict for diagnostics: failing gates
+    # if any fired, else `challenger_first` (gate passed; the model registered as a
+    # challenger and the model-zoo `select_winner` step owns the promote decision).
     promoted_blocker_reason: str | None = (
-        None if promoted else ("+".join(_blockers) if _blockers else ("challenger_first_auto_promote_disabled" if gate_passed else "unknown"))
+        "+".join(_blockers) if _blockers else "challenger_first"
     )
     _stratified_status = (
         "n/a" if stratified_result is None
@@ -3541,8 +3546,8 @@ def run_meta_training(
         _stratified_status,
         "" if output_dist_blocking else " (OBSERVE-ONLY: not blocking)",
         (
-            "PROMOTE" if promoted
-            else "CHALLENGER (gate-pass; auto-promote OFF, challenger-first)"
+            "CHALLENGER (gate-pass; always challenger-first — "
+            "model-zoo select_winner owns promotion)"
             if gate_passed else "BLOCK"
         ),
         mom_median_ic, vol_median_ic,
@@ -3757,12 +3762,14 @@ def run_meta_training(
                 "served_version": served_version,
                 "served_date": served_date,
                 # Challenger-first forensic trail (L4469): gate_passed = the
-                # promotion gate's verdict; auto_promote_enabled = whether
-                # training is allowed to overwrite the live champion. When
-                # gate_passed and NOT auto_promote_enabled, the run registered a
-                # challenger and live weights were left unchanged.
+                # promotion gate's verdict. Training is ALWAYS challenger-first
+                # (config#1052/#679 retired the training-time auto-promote flag), so it
+                # NEVER overwrites the live champion — the model registers as a
+                # challenger and the model-zoo `select_winner` step owns promotion.
+                # `auto_promote_enabled` is a frozen-False legacy contract field,
+                # kept so existing manifest/email readers don't break on absence.
                 "gate_passed": gate_passed,
-                "auto_promote_enabled": auto_promote_enabled,
+                "auto_promote_enabled": False,
                 "models": {
                     "momentum": {
                         "kind": "deterministic_baseline",
@@ -4434,15 +4441,17 @@ def run_meta_training(
         "mse_ic": round(mom_test_ic, 6),
         "val_ic": round(meta_model._val_ic, 6),
         # `passes_ic_gate` is the QUALITY verdict (all promotion gates passed),
-        # NOT the promotion decision — under challenger-first a run can pass every
-        # gate and deliberately NOT promote (auto_promote off). Previously this
-        # was `promoted`, so a gate-passing challenger-first run was mislabeled
+        # NOT the promotion decision — training is ALWAYS challenger-first
+        # (config#1052/#679), so a run can pass every gate and deliberately NOT
+        # promote (the model-zoo `select_winner` step owns promotion). Previously
+        # this was `promoted`, so a gate-passing challenger-first run was mislabeled
         # "FAIL" in the training email (L4540, recurrence of L1668). The email
-        # reads `gate_passed` / `auto_promote_enabled` to distinguish a registered
-        # challenger from a true gate failure.
+        # reads `gate_passed` to distinguish a registered challenger from a true
+        # gate failure. `auto_promote_enabled` is a frozen-False legacy contract
+        # field, kept so existing email/summary readers don't break on absence.
         "passes_ic_gate": gate_passed,
         "gate_passed": gate_passed,
-        "auto_promote_enabled": auto_promote_enabled,
+        "auto_promote_enabled": False,
         "ic_ir": 0.0,
         "feature_importance_top10": [],
         "feature_ics": {},

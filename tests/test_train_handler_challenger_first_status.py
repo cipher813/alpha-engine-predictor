@@ -58,12 +58,14 @@ def _capture_subject(monkeypatch, result):
 
 
 def test_challenger_first_gate_pass_is_not_labeled_fail(monkeypatch):
-    # The 2026-06-06 geometry: every gate passed, auto-promote OFF → registered
-    # challenger, NOT a failure.
+    # config#1052/#679: training is unconditionally challenger-first — every gate
+    # passed, model registered as a challenger (promotion owned by the model-zoo
+    # select_winner step), NOT a failure. `auto_promote_enabled` is the frozen-False
+    # legacy contract field a current manifest carries.
     result = _base_result(
         promoted=False, gate_passed=True, passes_ic_gate=True,
         auto_promote_enabled=False,
-        promotion_gate_detail={"promoted_blocker_reason": "challenger_first_auto_promote_disabled"},
+        promotion_gate_detail={"promoted_blocker_reason": "challenger_first"},
     )
     cap = _capture_subject(monkeypatch, result)
     assert "PASS" in cap["subject"]
@@ -76,6 +78,10 @@ def test_challenger_first_gate_pass_is_not_labeled_fail(monkeypatch):
 
 
 def test_promoted_run_reads_pass_promoted(monkeypatch):
+    # Backward-compat: a LEGACY pre-challenger-first archive manifest may carry
+    # promoted=True / auto_promote_enabled=True. The email path still honors a
+    # `promoted` result (e.g. a manual `model.registry --promote` restamp), so the
+    # "Promoted" subject must still render when an old/restamped manifest is read.
     result = _base_result(
         promoted=True, gate_passed=True, passes_ic_gate=True,
         auto_promote_enabled=True, promoted_mode="meta",
