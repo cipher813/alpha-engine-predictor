@@ -124,7 +124,8 @@ LIB_PYTHON="${LIB_PYTHON:-/home/ec2-user/alpha-engine-dashboard/.venv/bin/python
 REPO_URL="https://github.com/cipher813/alpha-engine-predictor.git"  # public repo, no auth
 
 # Parse flags
-MODE="both"  # both | full-only | smoke-only | preflight-only | model-zoo-weekly
+MODE="both"  # both | full-only | smoke-only | preflight-only | model-zoo-weekly | model-zoo-spec | model-zoo-select
+MODEL_ZOO_SPEC_ID=""  # set by --model-zoo-spec <id>
 while [ $# -gt 0 ]; do
   case "$1" in
     --full-only) MODE="full-only" ;;
@@ -133,10 +134,23 @@ while [ $# -gt 0 ]; do
     # L4544: train the weekly model-zoo rotation + immediate CPCV selection
     # (challenger-first; champion retrain is the separate --full-only run).
     --model-zoo-weekly) MODE="model-zoo-weekly" ;;
+    # config#1083 PARALLEL fan-out: train exactly ONE challenger spec on this
+    # spot (the SF ModelZooTrainMap launches one spot per spec id).
+    --model-zoo-spec) shift; MODE="model-zoo-spec"; MODEL_ZOO_SPEC_ID="$1" ;;
+    # config#1083 PARALLEL fan-out: run ONLY the selection over whatever specs
+    # registered for the date (the SF ModelZooSelect joins after the Map).
+    --model-zoo-select) MODE="model-zoo-select" ;;
     --instance-type) shift; INSTANCE_TYPE="$1" ;;
   esac
   shift
 done
+
+# config#1083 — fail loud if --model-zoo-spec was given without a spec id (the
+# Map iteration must carry an explicit spec; a blank id is a wiring bug).
+if [ "$MODE" = "model-zoo-spec" ] && [ -z "$MODEL_ZOO_SPEC_ID" ]; then
+  echo "ERROR: --model-zoo-spec requires a spec id (got empty)" >&2
+  exit 2
+fi
 
 echo "═══════════════════════════════════════════════════════════════"
 echo "  GBM Spot Training — $(date +%Y-%m-%d)  (SSM transport)"
@@ -215,7 +229,7 @@ cleanup() {
   local _logdate_now _hit
   _logdate_now="$(date -u +%Y-%m-%d)"
   echo "==> Confirming spot-side workload logs in s3://${S3_BUCKET}/_ssm_logs/ ..."
-  for _slug in spot-smoke spot-model-zoo-weekly spot-full-training; do
+  for _slug in spot-smoke spot-model-zoo-weekly spot-model-zoo-spec spot-model-zoo-select spot-full-training; do
     _hit="$(aws s3 ls "s3://${S3_BUCKET}/_ssm_logs/${_slug}/${_logdate_now}/" --region "$AWS_REGION" 2>/dev/null | tail -1 || true)"
     if [ -n "$_hit" ]; then
       echo "    ${_slug}: s3://${S3_BUCKET}/_ssm_logs/${_slug}/${_logdate_now}/$(echo "$_hit" | awk '{print $NF}')"
@@ -452,8 +466,8 @@ PREFLIGHT
 fi
 
 # ── Smoke test (dry_run=True) ─────────────────────────────────────────────────
-# model-zoo-weekly skips the champion smoke (it trains its own challenger variants).
-if [ "$MODE" != "full-only" ] && [ "$MODE" != "model-zoo-weekly" ]; then
+# model-zoo modes skip the champion smoke (they train/select challenger variants).
+if [ "$MODE" != "full-only" ] && [ "$MODE" != "model-zoo-weekly" ] && [ "$MODE" != "model-zoo-spec" ] && [ "$MODE" != "model-zoo-select" ]; then
   echo ""
   echo "═══════════════════════════════════════════════════════════════"
   echo "  SMOKE TEST (dry_run=True)"
@@ -657,6 +671,167 @@ ZOO
 
   echo ""
   echo "==> Model-zoo rotation complete. Instance will be terminated."
+  exit 0
+fi
+
+# ── Model-zoo PARALLEL: train ONE challenger spec (config#1083) ────────────────
+# The SF ModelZooTrainMap launches one spot per spec id; this trains exactly that
+# spec as a challenger (challenger-first + live-contract restore are enforced
+# inside model_zoo.train_one_spec) and exits NON-ZERO only on a real training
+# failure — so the Map iteration records THIS spec's failure without aborting
+# siblings (the per-spec isolation property). Mirrors the model-zoo-weekly
+# workload wrapping: ssm_log_capture ship-on-exit, flow-doctor setup_logging,
+# experiment-package staging. No selection / promotion happens here — that's the
+# separate ModelZooSelect state (--model-zoo-select).
+if [ "$MODE" = "model-zoo-spec" ]; then
+  echo ""
+  echo "═══════════════════════════════════════════════════════════════"
+  echo "  MODEL-ZOO TRAIN ONE SPEC: ${MODEL_ZOO_SPEC_ID}"
+  echo "═══════════════════════════════════════════════════════════════"
+  # Interpolating export prefix so the quoted heredoc body (which must stay
+  # paren/apostrophe-free per the bash 3.2 note) reads the spec id from the env.
+  MZ_SPEC_EXPORT="export MODEL_ZOO_SPEC_ID=${MODEL_ZOO_SPEC_ID}"$'\n'
+  run_ssm "model-zoo-spec" "${MZ_SPEC_EXPORT}$(cat <<'ZOOSPEC'
+set -eo pipefail
+export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1 ALPHA_ENGINE_DEPLOYED=1 ALPHA_ENGINE_EXPERIMENT_ID=reference S3_BUCKET=alpha-engine-research
+cd /home/ec2-user/predictor
+command -v python3.12 >/dev/null && PY=python3.12 || PY=python3
+# Spot-side log durability + flow-doctor wiring — see the model-zoo-weekly step.
+# Paren-free and apostrophe-free per the bash 3.2 note above.
+cat > /tmp/spot-model-zoo-spec.py <<'PYEOF'
+import os, sys
+sys.path.insert(0, '.')
+os.environ.setdefault('S3_BUCKET', os.environ.get('S3_BUCKET', 'alpha-engine-research'))
+bucket = os.environ.get('S3_BUCKET', 'alpha-engine-research')
+
+import logging
+import os.path as _osp
+_FD_YAML = _osp.join(_osp.abspath("."), "flow-doctor-model-zoo.yaml")
+from alpha_engine_lib.logging import setup_logging
+setup_logging("predictor-model-zoo", flow_doctor_yaml=_FD_YAML, exclude_patterns=[])
+
+import config as cfg
+from training.model_zoo import train_one_spec
+
+log = logging.getLogger('model_zoo.spot')
+spec_id = os.environ.get('MODEL_ZOO_SPEC_ID', '')
+log.info('model_zoo train-spec probe: spec=%s  MODEL_SPECS=%d  config=%s  ALPHA_ENGINE_EXPERIMENT_ID=%s',
+         spec_id, len(getattr(cfg, 'MODEL_SPECS', [])),
+         getattr(cfg, '_CONFIG_PATH', '?'),
+         getattr(cfg, '_EXPERIMENT_ID', os.environ.get('ALPHA_ENGINE_EXPERIMENT_ID', 'reference')))
+if not spec_id:
+    raise SystemExit('MODEL_ZOO_SPEC_ID not set on the spot')
+
+try:
+    from alpha_engine_lib.dates import now_dual
+    _td = now_dual().trading_day
+    date_str = _td.isoformat() if hasattr(_td, 'isoformat') else str(_td)
+except Exception:
+    log.warning('model_zoo spot: now_dual unavailable', exc_info=True)
+    date_str = None
+
+# Raises on a real training failure → non-zero exit → the Map iteration records
+# THIS spec failed without aborting siblings.
+train_one_spec(spec_id, bucket, date_str=date_str)
+print()
+print('=' * 60)
+print('  MODEL-ZOO TRAIN-SPEC ' + spec_id + ' COMPLETE')
+print('=' * 60)
+PYEOF
+$PY -m alpha_engine_lib.ssm_log_capture run --slug spot-model-zoo-spec --log /var/log/spot-model-zoo-spec.log --bucket "$S3_BUCKET" -- $PY /tmp/spot-model-zoo-spec.py
+ZOOSPEC
+)" "${MAX_RUNTIME_SECONDS}"
+
+  aws cloudwatch put-metric-data \
+    --namespace "AlphaEngine" \
+    --metric-name "Heartbeat" \
+    --dimensions "Process=predictor-model-zoo-spec" \
+    --value 1 --unit "Count" \
+    --region "${AWS_REGION:-us-east-1}" 2>/dev/null \
+    && echo "Heartbeat emitted: predictor-model-zoo-spec" \
+    || echo "WARNING: Failed to emit heartbeat (non-fatal)"
+
+  echo ""
+  echo "==> Model-zoo train-spec ${MODEL_ZOO_SPEC_ID} complete. Instance will be terminated."
+  exit 0
+fi
+
+# ── Model-zoo PARALLEL: SELECT over the registered specs (config#1083) ─────────
+# Runs AFTER the ModelZooTrainMap joins (one spot). Selects over whatever spec-*
+# challengers registered for the date (failed Map iterations are simply absent —
+# tolerated), writes the leaderboard to BOTH the dated key AND latest.json,
+# promotes the winner if MODEL_ZOO_AUTO_PROMOTE_WINNER, and sends the one
+# consolidated digest. No training happens here.
+if [ "$MODE" = "model-zoo-select" ]; then
+  echo ""
+  echo "═══════════════════════════════════════════════════════════════"
+  echo "  MODEL-ZOO SELECT (observe-first by default)"
+  echo "═══════════════════════════════════════════════════════════════"
+  run_ssm "model-zoo-select" "$(cat <<'ZOOSEL'
+set -eo pipefail
+export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1 ALPHA_ENGINE_DEPLOYED=1 ALPHA_ENGINE_EXPERIMENT_ID=reference S3_BUCKET=alpha-engine-research
+cd /home/ec2-user/predictor
+command -v python3.12 >/dev/null && PY=python3.12 || PY=python3
+# Spot-side log durability + flow-doctor wiring — see the model-zoo-weekly step.
+# Paren-free and apostrophe-free per the bash 3.2 note above.
+cat > /tmp/spot-model-zoo-select.py <<'PYEOF'
+import os, sys
+sys.path.insert(0, '.')
+os.environ.setdefault('S3_BUCKET', os.environ.get('S3_BUCKET', 'alpha-engine-research'))
+bucket = os.environ.get('S3_BUCKET', 'alpha-engine-research')
+
+import logging
+import os.path as _osp
+_FD_YAML = _osp.join(_osp.abspath("."), "flow-doctor-model-zoo.yaml")
+from alpha_engine_lib.logging import setup_logging
+setup_logging("predictor-model-zoo", flow_doctor_yaml=_FD_YAML, exclude_patterns=[])
+
+import config as cfg
+from training.model_zoo import run_select_only
+
+log = logging.getLogger('model_zoo.spot')
+log.info('model_zoo select probe: MODEL_SPECS=%d  config=%s  ALPHA_ENGINE_EXPERIMENT_ID=%s',
+         len(getattr(cfg, 'MODEL_SPECS', [])),
+         getattr(cfg, '_CONFIG_PATH', '?'),
+         getattr(cfg, '_EXPERIMENT_ID', os.environ.get('ALPHA_ENGINE_EXPERIMENT_ID', 'reference')))
+
+try:
+    from alpha_engine_lib.dates import now_dual
+    _td = now_dual().trading_day
+    date_str = _td.isoformat() if hasattr(_td, 'isoformat') else str(_td)
+except Exception:
+    log.warning('model_zoo spot: now_dual unavailable - run_select_only will self-default', exc_info=True)
+    date_str = None
+
+board = run_select_only(bucket, date_str=date_str)
+print()
+print('=' * 60)
+print('  MODEL-ZOO SELECT')
+print('=' * 60)
+champ = board.get('champion', {})
+print('  Mode:           ' + str(board.get('mode')))
+print('  Champion CPCV:  ' + str(champ.get('cpcv_mean_ic')) + ' fwd=' + str(champ.get('forward_days')))
+for c in board.get('candidates', []):
+    print('    ' + str(c.get('spec_id')) + ' cpcv=' + str(c.get('cpcv_mean_ic')) + ' fwd=' + str(c.get('forward_days')) + ' eligible=' + str(c.get('eligible')) + ' (' + str(c.get('reason')) + ')')
+print('  Winner:         ' + str(board.get('winner_version_id')))
+print('  Promoted:       ' + str(board.get('promoted')))
+print('=' * 60)
+PYEOF
+$PY -m alpha_engine_lib.ssm_log_capture run --slug spot-model-zoo-select --log /var/log/spot-model-zoo-select.log --bucket "$S3_BUCKET" -- $PY /tmp/spot-model-zoo-select.py
+ZOOSEL
+)" "${MAX_RUNTIME_SECONDS}"
+
+  aws cloudwatch put-metric-data \
+    --namespace "AlphaEngine" \
+    --metric-name "Heartbeat" \
+    --dimensions "Process=predictor-model-zoo-select" \
+    --value 1 --unit "Count" \
+    --region "${AWS_REGION:-us-east-1}" 2>/dev/null \
+    && echo "Heartbeat emitted: predictor-model-zoo-select" \
+    || echo "WARNING: Failed to emit heartbeat (non-fatal)"
+
+  echo ""
+  echo "==> Model-zoo select complete. Instance will be terminated."
   exit 0
 fi
 

@@ -596,14 +596,20 @@ def send_training_email(result: dict, date_str: str) -> bool:
                 ) + "\n"
             )
         else:
+            # config#1083 n_train landmine fix: a fold dict can lack n_train / ic
+            # (e.g. a fold that errored or a CPCV-only summary). f["n_train"]:,
+            # KeyError'd and crashed the WHOLE training email — the 2nd of the two
+            # botched rotations. Default-read every fold field so the email never
+            # crashes on a malformed fold (fail-soft on the OBSERVABILITY email; the
+            # training result itself already persisted to S3).
             fold_rows = "".join(
                 f'<tr style="background:{"#f9f9f9" if i % 2 == 0 else "#fff"};">'
-                f'<td style="padding:2px 6px; font-family:monospace; font-size:11px;">{f["fold"]}</td>'
-                f'<td style="padding:2px 6px; font-family:monospace; font-size:11px;">{f["test_start"]}</td>'
-                f'<td style="padding:2px 6px; font-family:monospace; font-size:11px;">{f["test_end"]}</td>'
-                f'<td style="padding:2px 6px; font-family:monospace; font-size:11px;">{f["n_train"]:,}</td>'
+                f'<td style="padding:2px 6px; font-family:monospace; font-size:11px;">{f.get("fold", "?")}</td>'
+                f'<td style="padding:2px 6px; font-family:monospace; font-size:11px;">{f.get("test_start", "?")}</td>'
+                f'<td style="padding:2px 6px; font-family:monospace; font-size:11px;">{f.get("test_end", "?")}</td>'
+                f'<td style="padding:2px 6px; font-family:monospace; font-size:11px;">{f.get("n_train", 0):,}</td>'
                 f'<td style="padding:2px 6px; font-family:monospace; font-size:11px; '
-                f'color:{"#2e7d32" if f["ic"] > 0 else "#c62828"};">{f["ic"]:.4f}</td>'
+                f'color:{"#2e7d32" if f.get("ic", 0) > 0 else "#c62828"};">{f.get("ic", 0):.4f}</td>'
                 f'</tr>'
                 for i, f in enumerate(wf_data["folds"])
             )
@@ -627,8 +633,8 @@ def send_training_email(result: dict, date_str: str) -> bool:
                 f"\nMedian IC: {wf_median:.4f} — {wf_label}"
                 f"\nPositive folds: {wf_pct*100:.0f}%\n"
                 + "\n".join(
-                    f"  Fold {f['fold']}: [{f['test_start']} → {f['test_end']}] "
-                    f"train={f['n_train']:,}  IC={f['ic']:.4f}"
+                    f"  Fold {f.get('fold', '?')}: [{f.get('test_start', '?')} → {f.get('test_end', '?')}] "
+                    f"train={f.get('n_train', 0):,}  IC={f.get('ic', 0):.4f}"
                     for f in wf_data["folds"]
                 ) + "\n"
             )
