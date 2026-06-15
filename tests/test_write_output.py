@@ -289,6 +289,83 @@ class TestCoverageGuard:
         wo.run(ctx)
 
 
+class TestInferenceCoverageDenominator:
+    """config#1075: run(ctx) persists the tradable-universe coverage denominator.
+
+    n_universe = |signals.json universe| and n_universe_covered = universe
+    tickers that got a prediction, so the report card's inference_coverage can
+    grade covered/universe ∈ [0,1] instead of a permanent N/A.
+    """
+
+    def _ctx(self, predictions, signals_data):
+        from inference.pipeline import PipelineContext
+        return PipelineContext(
+            date_str="2026-06-14",
+            bucket="bucket",
+            dry_run=True,  # metrics print to stdout; no S3 write
+            predictions=list(predictions),
+            signals_data=signals_data,
+            explicit_tickers=[],
+        )
+
+    @staticmethod
+    def _metrics(capsys):
+        out = capsys.readouterr().out
+        return json.loads(out.split("=== METRICS (dry-run) ===\n")[1])
+
+    @patch.object(wo, "get_veto_threshold", return_value=0.65)
+    @patch.object(wo, "_load_gbm_meta", return_value={})
+    def test_counts_universe_and_covered(self, _m1, _m2, capsys):
+        # universe of 4; only A/B/C scored → covered 3, universe 4.
+        ctx = self._ctx(
+            predictions=[
+                {"ticker": "A", "predicted_alpha": 0.01, "combined_rank": 1,
+                 "predicted_direction": "UP", "prediction_confidence": 0.55},
+                {"ticker": "B", "predicted_alpha": 0.01, "combined_rank": 2,
+                 "predicted_direction": "UP", "prediction_confidence": 0.55},
+                {"ticker": "C", "predicted_alpha": 0.01, "combined_rank": 3,
+                 "predicted_direction": "UP", "prediction_confidence": 0.55},
+            ],
+            signals_data={"universe": ["A", "B", "C", "D"], "buy_candidates": []},
+        )
+        wo.run(ctx)
+        m = self._metrics(capsys)
+        assert m["n_universe"] == 4
+        assert m["n_universe_covered"] == 3  # D unscored
+
+    @patch.object(wo, "get_veto_threshold", return_value=0.65)
+    @patch.object(wo, "_load_gbm_meta", return_value={})
+    def test_universe_dict_entries_normalized(self, _m1, _m2, capsys):
+        # universe entries as {ticker: …} dicts must be counted too.
+        ctx = self._ctx(
+            predictions=[
+                {"ticker": "A", "predicted_alpha": 0.01, "combined_rank": 1,
+                 "predicted_direction": "UP", "prediction_confidence": 0.55},
+            ],
+            signals_data={"universe": [{"ticker": "A"}, {"ticker": "B"}], "buy_candidates": []},
+        )
+        wo.run(ctx)
+        m = self._metrics(capsys)
+        assert m["n_universe"] == 2
+        assert m["n_universe_covered"] == 1
+
+    @patch.object(wo, "get_veto_threshold", return_value=0.65)
+    @patch.object(wo, "_load_gbm_meta", return_value={})
+    def test_empty_universe_records_zero(self, _m1, _m2, capsys):
+        # No universe in signals.json → 0 (evaluator keeps honest N/A, no /0).
+        ctx = self._ctx(
+            predictions=[
+                {"ticker": "A", "predicted_alpha": 0.01, "combined_rank": 1,
+                 "predicted_direction": "UP", "prediction_confidence": 0.55},
+            ],
+            signals_data={"buy_candidates": []},
+        )
+        wo.run(ctx)
+        m = self._metrics(capsys)
+        assert m["n_universe"] == 0
+        assert m["n_universe_covered"] == 0
+
+
 class TestGbmVetoConfidenceFloor:
     """Pin the confidence floor on gbm_veto computation.
 

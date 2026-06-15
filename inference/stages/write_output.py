@@ -369,6 +369,8 @@ def write_predictions(
     veto_threshold: float | None = None,
     fd=None,
     level_neutralization: dict | None = None,
+    n_universe: int | None = None,
+    n_universe_covered: int | None = None,
 ) -> None:
     """
     Write predictions JSON to S3 at both the dated key and latest.json.
@@ -460,6 +462,13 @@ def write_predictions(
         **metrics,
         "n_predictions_today": len(predictions),
         "n_high_confidence": n_high_confidence,
+        # config#1075: the tradable-universe coverage denominator + covered count
+        # so the report card's inference_coverage grades a real value in [0,1]
+        # (covered/universe) instead of a permanent N/A. Computed at the call site
+        # against signals.json's universe ∩ the merged predictions. None on the
+        # degraded write paths (soft-timeout / abort partials) — honest absence.
+        "n_universe": n_universe,
+        "n_universe_covered": n_universe_covered,
         "last_run_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "status": "ok",
         # Audit Phase 2a-INFER: persist the gate result alongside the
@@ -1186,6 +1195,21 @@ def run(ctx: PipelineContext) -> None:
         )
         raise PipelineHardFail(msg)
 
+    # ── Inference coverage denominator (config#1075) ─────────────────────────
+    # Persist the tradable-universe count + how many of those names got a
+    # prediction, so the report card's inference_coverage grades covered/universe
+    # ∈ [0,1] (robust to the supplemental coverage-gap re-invocation, which keeps
+    # the same signals.json universe and merges predictions). Universe entries
+    # may be ticker strings or {ticker: …} dicts — normalize both.
+    _universe = sd.get("universe") or []
+    _universe_tickers = {
+        ((e.get("ticker") if isinstance(e, dict) else e) or "").upper()
+        for e in _universe
+    }
+    _universe_tickers.discard("")
+    n_universe = len(_universe_tickers)
+    n_universe_covered = len(_universe_tickers & _scored)
+
     # ── Veto logic ───────────────────────────────────────────────────────────
     market_regime = ctx.signals_data.get("market_regime", "") if ctx.signals_data else ""
     # Stage D' Wire 4: pass intensity_z (stamped on ctx by run_inference
@@ -1236,7 +1260,8 @@ def run(ctx: PipelineContext) -> None:
     # ── Write predictions ────────────────────────────────────────────────────
     write_predictions(ctx.predictions, ctx.date_str, ctx.bucket, metrics,
                       dry_run=ctx.dry_run, veto_threshold=veto_thresh, fd=ctx.fd,
-                      level_neutralization=getattr(ctx, "level_neutralization", None))
+                      level_neutralization=getattr(ctx, "level_neutralization", None),
+                      n_universe=n_universe, n_universe_covered=n_universe_covered)
 
     # ── Send email ───────────────────────────────────────────────────────────
     # Goal: exactly one morning briefing per day, reflecting the final merged
