@@ -158,7 +158,7 @@ class TestFlowDoctorYamlSchema:
             cfg = yaml.safe_load(f)
         for key in ("flow_name", "repo", "notify", "store", "rate_limits"):
             assert key in cfg, f"missing top-level key: {key}"
-        assert cfg["repo"] == "cipher813/alpha-engine-predictor"
+        assert cfg["repo"] == "nousergon/crucible-predictor"
 
     def test_training_yaml_has_required_top_level_keys(self):
         import yaml
@@ -166,7 +166,7 @@ class TestFlowDoctorYamlSchema:
             cfg = yaml.safe_load(f)
         for key in ("flow_name", "repo", "notify", "store", "rate_limits"):
             assert key in cfg, f"missing top-level key: {key}"
-        assert cfg["repo"] == "cipher813/alpha-engine-predictor"
+        assert cfg["repo"] == "nousergon/crucible-predictor"
 
     def test_training_yaml_has_s3_sink(self):
         # The S3 sink is the spot-side crash-artifact durability path: on the
@@ -193,7 +193,7 @@ class TestFlowDoctorYamlSchema:
             cfg = yaml.safe_load(f)
         for key in ("flow_name", "repo", "notify", "store", "rate_limits"):
             assert key in cfg, f"missing top-level key: {key}"
-        assert cfg["repo"] == "cipher813/alpha-engine-predictor"
+        assert cfg["repo"] == "nousergon/crucible-predictor"
         assert cfg["flow_name"] == "predictor-model-zoo"
 
     def test_model_zoo_yaml_has_email_and_s3_sinks(self):

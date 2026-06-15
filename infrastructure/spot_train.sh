@@ -279,7 +279,7 @@ done
 # was the 54-line inline ``aws ssm send-command`` + poll + stream + S3
 # capture bash function that L342 was explicitly chartered to retire.
 # The lib equivalent ships in ``alpha_engine_lib.ssm_dispatcher`` (lib
-# v0.35.0+, [#73](https://github.com/cipher813/alpha-engine-lib/pull/73))
+# v0.35.0+, [#73](https://github.com/nousergon/nousergon-lib/pull/73))
 # with identical contract: base64-wrap → SendCommand → poll → stream
 # StandardOutputContent delta → fetch StandardErrorContent on terminal
 # non-Success → propagate exit. Adds InvocationDoesNotExist

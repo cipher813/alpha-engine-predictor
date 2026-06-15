@@ -20,7 +20,7 @@ from alpha_engine_lib.preflight import BasePreflight
 
 log = logging.getLogger(__name__)
 
-_PREDICTOR_REPO = "cipher813/alpha-engine-predictor"
+_PREDICTOR_REPO = "nousergon/crucible-predictor"
 
 
 class PredictorPreflight(BasePreflight):

@@ -1,6 +1,6 @@
 # alpha-engine-predictor — Code Index
 
-> Index of entry points, key files, and data contracts. Companion to [README.md](README.md). System overview lives in [`alpha-engine-docs`](https://github.com/cipher813/alpha-engine-docs).
+> Index of entry points, key files, and data contracts. Companion to [README.md](README.md). System overview lives in [`nousergon-docs`](https://github.com/nousergon/nousergon-docs).
 
 ## Module purpose
 

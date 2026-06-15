@@ -40,7 +40,7 @@ def test_run_composes_full_check_sequence():
 
     env.assert_called_once_with("AWS_REGION")
     s3.assert_called_once()
-    drift.assert_called_once_with("cipher813/alpha-engine-predictor")
+    drift.assert_called_once_with("nousergon/crucible-predictor")
     s3_key.assert_called_once()
     assert s3_key.call_args.args[0] == "predictor/weights/meta/meta_model.pkl"
 
@@ -88,7 +88,7 @@ def test_run_checks_drift_by_default():
          patch.object(pf, "check_s3_key"):
         pf.run(skip_deploy_drift=False)
 
-    drift.assert_called_once_with("cipher813/alpha-engine-predictor")
+    drift.assert_called_once_with("nousergon/crucible-predictor")
 
 
 def test_run_for_drift_gate_is_strict_subset():
@@ -105,7 +105,7 @@ def test_run_for_drift_gate_is_strict_subset():
 
     env.assert_called_once_with("AWS_REGION")
     s3.assert_called_once()
-    drift.assert_called_once_with("cipher813/alpha-engine-predictor")
+    drift.assert_called_once_with("nousergon/crucible-predictor")
     s3_key.assert_not_called()
     fresh.assert_not_called()
 

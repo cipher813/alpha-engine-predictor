@@ -1,5 +1,5 @@
 flow_name: predictor-inference
-repo: cipher813/alpha-engine-predictor
+repo: nousergon/crucible-predictor
 owner: "@brianmcmahon"
 notify:
   - type: email

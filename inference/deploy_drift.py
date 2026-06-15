@@ -204,7 +204,7 @@ def check_deploy_drift(
     account_id: str,
     sf_name: str = "alpha-engine-weekday-pipeline",
     stack_name: str = "alpha-engine-orchestration",
-    repo: str = "cipher813/alpha-engine-data",
+    repo: str = "nousergon/nousergon-data",
     branch: str = "main",
 ) -> dict:
     """Compare deployed SF + CF SHAs against GitHub `repo@branch` HEAD.

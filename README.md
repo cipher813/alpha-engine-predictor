@@ -7,11 +7,11 @@
 [![LightGBM](https://img.shields.io/badge/LightGBM-1a73e8?style=flat-square)](https://lightgbm.readthedocs.io/)
 [![ArcticDB](https://img.shields.io/badge/ArcticDB-0e1117?style=flat-square)](https://docs.arcticdb.io/)
 [![License: AGPL-3.0-only](https://img.shields.io/badge/License-AGPL--3.0--only-yellow?style=flat-square)](LICENSE)
-[![Phase 2 · Reliability](https://img.shields.io/badge/Phase_2-Reliability-e9c46a?style=flat-square)](https://github.com/cipher813/alpha-engine-docs#phase-trajectory)
+[![Phase 2 · Reliability](https://img.shields.io/badge/Phase_2-Reliability-e9c46a?style=flat-square)](https://github.com/nousergon/nousergon-docs#phase-trajectory)
 
 Stacked meta-ensemble that predicts **21-day log-domain market-relative alpha** (`canonical_predicted_alpha` field, post-2026-05-09 cutover) for each ticker. Three Layer-1 specialized models — LightGBM momentum, LightGBM volatility, and a research-score calibrator — feed a Layer-2 Ridge meta-learner alongside research-context and raw macro features. Outputs UP/FLAT/DOWN with a confidence score and a veto gate that blocks high-confidence DOWN entries.
 
-> System overview, Step Function orchestration, and module relationships live in [`alpha-engine-docs`](https://github.com/cipher813/alpha-engine-docs). Code index lives in [`OVERVIEW.md`](OVERVIEW.md).
+> System overview, Step Function orchestration, and module relationships live in [`nousergon-docs`](https://github.com/nousergon/nousergon-docs). Code index lives in [`OVERVIEW.md`](OVERVIEW.md).
 
 ## What this does
 
@@ -47,19 +47,19 @@ Veto gate fires when DOWN confidence exceeds the auto-tuned threshold; Executor 
 
 ## Configuration
 
-This repo is **public**. Hyperparameters, confidence thresholds, and tuned ensemble weights live in the private [`alpha-engine-config`](https://github.com/cipher813/alpha-engine-config) repo and are auto-applied weekly by the Backtester via `s3://alpha-engine-research/config/predictor_params.json`. Architecture and approach are public; specific values are private.
+This repo is **public**. Hyperparameters, confidence thresholds, and tuned ensemble weights live in the private [`alpha-engine-config`](https://github.com/nousergon/alpha-engine-config) repo and are auto-applied weekly by the Backtester via `s3://alpha-engine-research/config/predictor_params.json`. Architecture and approach are public; specific values are private.
 
 ## Sister repos
 
 | Module | Repo |
 |---|---|
-| Executor | [`alpha-engine`](https://github.com/cipher813/alpha-engine) |
-| Data | [`alpha-engine-data`](https://github.com/cipher813/alpha-engine-data) |
-| Research | [`alpha-engine-research`](https://github.com/cipher813/alpha-engine-research) |
-| Backtester | [`alpha-engine-backtester`](https://github.com/cipher813/alpha-engine-backtester) |
-| Dashboard | [`alpha-engine-dashboard`](https://github.com/cipher813/alpha-engine-dashboard) |
-| Library | [`alpha-engine-lib`](https://github.com/cipher813/alpha-engine-lib) |
-| Docs | [`alpha-engine-docs`](https://github.com/cipher813/alpha-engine-docs) |
+| Executor | [`crucible-executor`](https://github.com/nousergon/crucible-executor) |
+| Data | [`nousergon-data`](https://github.com/nousergon/nousergon-data) |
+| Research | [`crucible-research`](https://github.com/nousergon/crucible-research) |
+| Backtester | [`crucible-backtester`](https://github.com/nousergon/crucible-backtester) |
+| Dashboard | [`crucible-dashboard`](https://github.com/nousergon/crucible-dashboard) |
+| Library | [`nousergon-lib`](https://github.com/nousergon/nousergon-lib) |
+| Docs | [`nousergon-docs`](https://github.com/nousergon/nousergon-docs) |
 
 ## License
 

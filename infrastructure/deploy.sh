@@ -79,7 +79,7 @@ echo "Working directory: $REPO_ROOT"
 
 # ── Stage proprietary config from alpha-engine-config ────────────────────────
 # predictor.yaml is gitignored in this repo and lives in the private
-# cipher813/alpha-engine-config repo alongside the configs for the other
+# nousergon/alpha-engine-config repo alongside the configs for the other
 # modules. Without staging it into the build context, the Dockerfile's
 # `COPY config/ config/` only captures predictor.sample.yaml and the Lambda
 # fails at import with FileNotFoundError — the silent 2026-04-13 regression.
@@ -103,7 +103,7 @@ else
     echo "ERROR: config/predictor.yaml not found — tried:"
     echo "  config/predictor.yaml (local dev)"
     echo "  $src (config repo sibling)"
-    echo "Hint: clone cipher813/alpha-engine-config as a sibling directory,"
+    echo "Hint: clone nousergon/alpha-engine-config as a sibling directory,"
     echo "      or set CONFIG_REPO_DIR=/path/to/alpha-engine-config"
     exit 1
   fi

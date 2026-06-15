@@ -33,7 +33,7 @@ jobs:
         with:
           path: alpha-engine-predictor
 
-      # deploy.sh stages predictor.yaml from cipher813/alpha-engine-config
+      # deploy.sh stages predictor.yaml from nousergon/alpha-engine-config
       # into the build context. The real config is gitignored in this repo,
       # so a fresh GitHub runner has none of it — without this step the
       # Dockerfile's `COPY config/ config/` would ship an image missing
@@ -43,7 +43,7 @@ jobs:
       - name: Checkout alpha-engine-config
         uses: actions/checkout@v4
         with:
-          repository: cipher813/alpha-engine-config
+          repository: nousergon/alpha-engine-config
           path: alpha-engine-config
           token: ${{ secrets.ALPHA_ENGINE_CONFIG_TOKEN }}
 
@@ -81,7 +81,7 @@ jobs:
 
       - name: Append to system-wide deploy changelog
         if: always()
-        uses: cipher813/alpha-engine-docs/.github/actions/append-changelog@main
+        uses: nousergon/nousergon-docs/.github/actions/append-changelog@main
         with:
           deploy_status: ${{ job.status == 'success' && 'success' || 'failure' }}
           deploy_workflow: deploy.yml
