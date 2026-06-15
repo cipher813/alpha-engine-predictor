@@ -201,6 +201,104 @@ def test_run_ssm_call_sites_present():
     )
 
 
+# ── Spot-side log durability (ship-on-exit) ──────────────────────────────────
+# Each spot-side WORKLOAD heredoc (smoke / model-zoo-weekly / full-training)
+# previously ran its python inline via ``$PY - <<'PYEOF'`` — so the spot's own
+# stdout/stderr lived ONLY in SSM ``get-command-invocation``, which returns
+# EMPTY when the spot dies mid-run (e.g. an OOM SIGKILL, RC=-1) and is destroyed
+# the moment the dispatcher's ``trap cleanup EXIT`` terminates the box. The fix
+# routes each workload through ``alpha_engine_lib.ssm_log_capture run`` (the lib
+# chokepoint for tee-to-logfile + ship-to-S3-on-EXIT, same primitive the data /
+# backtester Saturday-SF spot states use), so the FULL workload log always
+# reaches S3 before teardown. These tests pin that wrap so a future refactor
+# can't silently revert to the inline ``$PY -`` form and re-lose the log.
+_SPOT_WORKLOAD_SLUGS = (
+    "spot-smoke",
+    "spot-model-zoo-weekly",
+    "spot-full-training",
+)
+
+
+def test_spot_workloads_ship_log_on_exit_via_lib():
+    """Every spot-side workload MUST run through
+    ``python -m alpha_engine_lib.ssm_log_capture run`` so its combined
+    stdout+stderr is tee'd to a spot-local logfile AND shipped to S3 on
+    EXIT (success, non-zero, or SIGKILL) BEFORE the dispatcher terminates
+    the spot. This is the durability fix for the off-cycle full-only OOM
+    (RC=-1) incident whose full training log was lost."""
+    text = _SCRIPT.read_text()
+    for slug in _SPOT_WORKLOAD_SLUGS:
+        wrap = (
+            f"alpha_engine_lib.ssm_log_capture run --slug {slug} "
+            f"--log /var/log/{slug}.log"
+        )
+        assert wrap in text, (
+            f"spot workload {slug!r} is not wrapped in the lib log-capture "
+            f"chokepoint. Expected a line containing:\n  {wrap}\n"
+            "Without it the workload's stdout/stderr lives only in SSM "
+            "get-command-invocation, which returns EMPTY on instance death "
+            "(OOM RC=-1) and is destroyed when the dispatcher cleanup EXIT "
+            "trap terminates the spot. Route the workload through "
+            "`$PY -m alpha_engine_lib.ssm_log_capture run --slug <X> "
+            "--log /var/log/<X>.log --bucket \"$S3_BUCKET\" -- $PY /tmp/<X>.py`."
+        )
+        # The wrapper must pass --bucket so the ship targets the right bucket.
+        assert f"--slug {slug} --log /var/log/{slug}.log --bucket" in text, (
+            f"spot workload {slug!r} ssm_log_capture wrap is missing the "
+            "--bucket argument."
+        )
+
+
+def test_no_inline_py_dash_heredoc_for_workloads():
+    """The workload python MUST be written to a spot-local file and run
+    via the log-capture wrap — NOT inline via ``$PY - <<'PYEOF'`` (the
+    inline form is what lost the log on the OOM incident). Pin that the
+    only ``$PY -`` style invocations left are the wrapped ones; the
+    workload bodies are now ``cat > /tmp/<slug>.py <<'PYEOF'``."""
+    text = _SCRIPT.read_text()
+    # The preflight-only step still legitimately uses an inline `$PY - <<`
+    # because it is a fast read-only probe that cannot OOM the box and exits
+    # 0 cleanly; durability there is not load-bearing. Assert the three
+    # heavy workloads each stage their python to a file instead.
+    for slug in _SPOT_WORKLOAD_SLUGS:
+        assert f"cat > /tmp/{slug}.py <<'PYEOF'" in text, (
+            f"spot workload {slug!r} should stage its python body to "
+            f"/tmp/{slug}.py via `cat > /tmp/{slug}.py <<'PYEOF'` so it can "
+            "be run under the log-capture wrap, not inline via `$PY -`."
+        )
+
+
+def test_cleanup_confirms_spot_log_before_terminate():
+    """The dispatcher ``cleanup()`` (EXIT trap) MUST make a bounded
+    best-effort confirmation of the spot-side log location in S3 BEFORE
+    ``terminate-instances`` — so the dispatcher log → spot log is one hop
+    for an operator triaging a failure. Secondary to the self-ship; must
+    not block teardown."""
+    text = _SCRIPT.read_text()
+    m = re.search(r"^cleanup\(\)\s*\{.*?^\}", text, re.MULTILINE | re.DOTALL)
+    assert m, "no cleanup() function found in spot_train.sh"
+    body = m.group(0)
+    # The confirmation (s3 ls into _ssm_logs/) must appear BEFORE the
+    # terminate-instances call within the function body.
+    ls_idx = body.find("_ssm_logs/")
+    term_idx = body.find("terminate-instances")
+    assert ls_idx != -1, (
+        "cleanup() does not reference the _ssm_logs/ tree — the STEP 3 "
+        "belt-and-suspenders spot-log confirmation is missing."
+    )
+    assert term_idx != -1, "cleanup() no longer calls terminate-instances?"
+    assert ls_idx < term_idx, (
+        "cleanup() must confirm the spot log in S3 BEFORE terminating the "
+        "instance — otherwise the pointer is logged after the box (and any "
+        "still-unshipped state) is gone."
+    )
+    # One-hop pointer to the failure diagnostics record too (STEP 4).
+    assert "_spot_diagnostics/ae-predictor" in body, (
+        "cleanup() should echo the _spot_diagnostics/ae-predictor/{date}.json "
+        "pointer so the dispatcher log → failure record is one hop."
+    )
+
+
 def test_run_ssm_signature_unchanged():
     """The L342 PR 4 lift kept the caller-facing signature:
     ``run_ssm "<description>" "<bash script>" [timeout_seconds]``.
