@@ -184,6 +184,56 @@ def train_spec(
         return train_fn(bucket, date_str=date_str, dry_run=dry_run)
 
 
+def train_one_spec(
+    spec_id: str,
+    bucket: str,
+    *,
+    date_str: str | None = None,
+    dry_run: bool = False,
+    specs: list | None = None,
+    train_fn=None,
+    s3=None,
+) -> dict:
+    """config#1083 — TRAIN exactly ONE spec as a challenger, fully isolated, for
+    the SF parallel fan-out (one memory-isolated spot per spec).
+
+    This is the per-spot entrypoint the ``ModelZooTrainMap`` iterations call. It
+    applies the SAME G2 contract isolation the sequential rotation applies around
+    the whole batch, but scoped to this single spec so the per-spot run is self-
+    contained: snapshot+restore the live champion contract around the train (a
+    challenger train overwrites the live manifest/feature_list unconditionally;
+    restore it after — best-effort, never fatal). Training is UNCONDITIONALLY
+    challenger-first since config#1052/#679 (the former G1 force-flag is gone), so
+    a spec can never self-promote — selection is the only promoter.
+
+    Raises on a REAL training failure so the Map iteration records THIS spec's
+    failure (and only this spec's) without aborting siblings — the key robustness
+    property. Returns the train result dict on success.
+    """
+    # G2 — snapshot the live contract before the challenger train overwrites it.
+    # Only for the real trainer (train_fn is None) on a non-dry run; an injected
+    # test train_fn does no live writes, so there's nothing to restore.
+    saved_contract: dict = {}
+    if not dry_run and train_fn is None:
+        if s3 is None:
+            try:
+                import boto3
+                s3 = boto3.client("s3")
+            except Exception:  # noqa: BLE001 — G2 is best-effort
+                log.warning("model_zoo train-spec G2: no S3 client — live-contract restore skipped", exc_info=True)
+        if s3 is not None:
+            saved_contract = _snapshot_live_contract(s3, bucket)
+    try:
+        return train_spec(
+            spec_id, bucket, date_str=date_str, dry_run=dry_run,
+            specs=specs, train_fn=train_fn,
+        )
+    finally:
+        # G2 — always restore, even if the train raised mid-way.
+        if saved_contract and s3 is not None:
+            _restore_live_contract(s3, bucket, saved_contract)
+
+
 def train_all_active(
     bucket: str,
     *,
@@ -259,6 +309,30 @@ def select_rotation_specs(
         return (last is not None, last or "", -int(s.get("priority", 0)), s["id"])
 
     return [s["id"] for s in sorted(active, key=_key)[:max(0, budget)]]
+
+
+def list_rotation_spec_ids(
+    bucket: str,
+    *,
+    budget: int | None = None,
+    specs: list | None = None,
+    registered_versions: list | None = None,
+) -> list[str]:
+    """config#1083 — the spec ids the rotation should train THIS run, as a flat
+    list, for the SF ``ResolveZooSpecs`` dispatcher (its output ItemsPath feeds
+    the per-spec ``Map``). Thin wrapper over ``select_rotation_specs`` reading the
+    budget from cfg + the registry best-effort (a registry read failure → all
+    specs look never-trained → first ``budget`` by id, never blocks the run).
+    Returns [] if no active specs (the Map then runs zero iterations and select
+    handles the empty pool)."""
+    specs = specs if specs is not None else getattr(cfg, "MODEL_SPECS", [])
+    if budget is None:
+        budget = int(getattr(cfg, "MODEL_ZOO_WEEKLY_BUDGET", 3))
+    if registered_versions is None:
+        registered_versions = _list_registry_versions(bucket)
+    selected = select_rotation_specs(specs, registered_versions, budget)
+    log.info("model_zoo list-rotation-specs: budget=%d → %s", budget, selected)
+    return selected
 
 
 def _list_registry_versions(bucket: str) -> list:
@@ -510,6 +584,62 @@ def _resolve_trained_versions(s3, bucket: str, results: dict, *, specs: list | N
         {"spec_id": label_to_spec[mv], "model_version": mv, "version_id": v.get("version_id")}
         for mv, v in newest.items() if v.get("version_id")
     ]
+
+
+def _resolve_registered_specs_for_date(
+    s3, bucket: str, date_str: str | None, *, specs: list | None = None,
+) -> list[dict]:
+    """config#1083 — the registry-driven pool for the PARALLEL ``select`` step.
+
+    Unlike ``_resolve_trained_versions`` (which keys off an in-process ``results``
+    dict from a sequential rotation), the parallel fan-out has NO results dict:
+    each spec trained on its OWN spot and registered independently. So we read the
+    registry directly and map every ACTIVE spec's label → its newest registered
+    challenger FOR ``date_str`` (the version this rotation produced). A spec whose
+    Map iteration FAILED simply has no version for this date → it is absent from
+    the pool (TOLERATED — logged present/absent, never crashes). Best-effort: a
+    registry read failure → [] (select then ranks only the base champion-arch).
+    """
+    specs = specs if specs is not None else getattr(cfg, "MODEL_SPECS", [])
+    active = [s for s in specs
+              if s.get("status", "active") == "active" and s.get("id")]
+    label_to_spec = {}
+    for s in active:
+        try:
+            label_to_spec[_resolve_label(s)] = s["id"]
+        except Exception:  # noqa: BLE001 — a malformed spec just isn't in the pool
+            continue
+    try:
+        from model.registry import list_versions
+        versions = list_versions(s3, bucket, stage="challenger")
+    except Exception:  # noqa: BLE001 — selection is best-effort
+        log.warning("model_zoo select: could not list registry challengers", exc_info=True)
+        return []
+    # Newest challenger per label, restricted to today's vintage when date_str is
+    # given (the version THIS rotation produced; a stale prior-week version must
+    # not masquerade as a fresh candidate). list_versions is newest-first.
+    newest: dict[str, dict] = {}
+    for v in versions:
+        mv = v.get("model_version")
+        if mv not in label_to_spec:
+            continue
+        if date_str and v.get("date") != date_str:
+            continue
+        cur = newest.get(mv)
+        if cur is None or (v.get("date", ""), v.get("created_utc", "")) > (cur.get("date", ""), cur.get("created_utc", "")):
+            newest[mv] = v
+    pool = [
+        {"spec_id": label_to_spec[mv], "model_version": mv, "version_id": v.get("version_id")}
+        for mv, v in newest.items() if v.get("version_id")
+    ]
+    present = sorted(c["spec_id"] for c in pool)
+    absent = sorted(sid for sid in label_to_spec.values() if sid not in present)
+    log.info(
+        "model_zoo select: registered-for-%s pool — present=%s absent=%s "
+        "(absent = failed/skipped Map iteration; tolerated)",
+        date_str, present, absent,
+    )
+    return pool
 
 
 def _resolve_base_champion_version(s3, bucket: str, date_str: str | None) -> dict | None:
@@ -784,16 +914,24 @@ def select_winner(
 
 
 def _write_leaderboard(s3, bucket: str, date_str: str | None, leaderboard: dict) -> None:
-    key = f"{_LEADERBOARD_PREFIX}/{date_str or 'latest'}.json"
-    try:
-        s3.put_object(
-            Bucket=bucket, Key=key,
-            Body=json.dumps(leaderboard, indent=2, default=str).encode(),
-            ContentType="application/json",
-        )
-        log.info("model_zoo: leaderboard written to s3://%s/%s", bucket, key)
-    except Exception:  # noqa: BLE001 — observability artifact, never fatal
-        log.warning("model_zoo: could not write leaderboard to %s", key, exc_info=True)
+    # config#1083: write BOTH the dated key AND latest.json. The prior code wrote
+    # only the dated key (or latest.json when date_str was None) — never both — so
+    # consumers reading predictor/model_zoo/leaderboard/latest.json saw a STALE
+    # board after every dated rotation. Mirror to latest.json so the latest pointer
+    # always reflects the most recent rotation. Each PUT is independent so a
+    # dated-key failure doesn't suppress the latest mirror (and vice versa).
+    body = json.dumps(leaderboard, indent=2, default=str).encode()
+    keys = [f"{_LEADERBOARD_PREFIX}/latest.json"]
+    if date_str:
+        keys.insert(0, f"{_LEADERBOARD_PREFIX}/{date_str}.json")
+    for key in keys:
+        try:
+            s3.put_object(
+                Bucket=bucket, Key=key, Body=body, ContentType="application/json",
+            )
+            log.info("model_zoo: leaderboard written to s3://%s/%s", bucket, key)
+        except Exception:  # noqa: BLE001 — observability artifact, never fatal
+            log.warning("model_zoo: could not write leaderboard to %s", key, exc_info=True)
 
 
 def _current_champion_version_id(s3, bucket: str) -> str | None:
@@ -1264,6 +1402,71 @@ def run_rotation_and_select(
         return leaderboard
 
     trained = _resolve_trained_versions(s3, bucket, results, specs=specs)
+    return select_and_finalize(
+        s3, bucket, date_str=date_str, mode=mode,
+        auto_promote_winner=auto_promote_winner, trained=trained, dry_run=dry_run,
+    )
+
+
+def select_and_finalize(
+    s3,
+    bucket: str,
+    *,
+    date_str: str | None = None,
+    mode: str | None = None,
+    auto_promote_winner: bool | None = None,
+    trained: list[dict] | None = None,
+    specs: list | None = None,
+    dry_run: bool = False,
+) -> dict:
+    """config#1083 — the SELECTION + finalization tail of a model-zoo rotation,
+    factored out so it is reusable by BOTH the sequential ``run_rotation_and_select``
+    (which supplies ``trained`` from its in-process results) AND the PARALLEL
+    ``select`` entrypoint (which passes ``trained=None`` → the pool is resolved
+    from the registry: every active spec's newest challenger registered for
+    ``date_str``, TOLERATING specs whose Map iteration failed — they are simply
+    absent, never a crash).
+
+    Steps (unchanged from the prior inline tail): add the base champion-arch to
+    the pool, record the cumulative trial ledger, capture the prior champion for
+    a revert command, ``select_winner``, write the leaderboard to BOTH the dated
+    key AND latest.json, promote the winner if ``auto_promote_winner``, run the
+    realized-edge monitor, and ALWAYS send the one consolidated digest (the digest
+    is best-effort observability — a send failure is logged LOUD + recorded on the
+    leaderboard, never aborts the rotation). Returns the leaderboard dict.
+    """
+    if auto_promote_winner is None:
+        auto_promote_winner = bool(getattr(cfg, "MODEL_ZOO_AUTO_PROMOTE_WINNER", False))
+    if mode is None:
+        mode = "cutover" if auto_promote_winner else "observe"
+    if date_str is None:
+        try:
+            from alpha_engine_lib.dates import now_dual
+            _td = now_dual().trading_day
+            date_str = _td.isoformat() if hasattr(_td, "isoformat") else str(_td)
+            log.info("model_zoo select: no date passed — defaulting to trading_day %s", date_str)
+        except Exception:  # noqa: BLE001 — date defaulting must not block selection
+            log.warning("model_zoo select: could not resolve trading_day via now_dual", exc_info=True)
+
+    if s3 is None and not dry_run:
+        try:
+            import boto3
+            s3 = boto3.client("s3")
+        except Exception:  # noqa: BLE001
+            log.warning("model_zoo select: no S3 client — selection limited", exc_info=True)
+
+    if dry_run or s3 is None:
+        leaderboard = {"date": date_str, "mode": mode, "dry_run": bool(dry_run),
+                       "candidates": [], "winner_version_id": None, "promoted": None}
+        log.info("model_zoo select: dry_run/no-S3 — selection skipped")
+        return leaderboard
+
+    # PARALLEL path: no in-process trained list → resolve the pool from the
+    # registry (every active spec's newest challenger for this date; failed Map
+    # iterations are absent, tolerated).
+    if trained is None:
+        trained = _resolve_registered_specs_for_date(s3, bucket, date_str, specs=specs)
+
     # L4571: the base champion-arch retrain competes in the SAME pool.
     base = _resolve_base_champion_version(s3, bucket, date_str)
     if base and base["version_id"] not in {t.get("version_id") for t in trained}:
@@ -1360,9 +1563,110 @@ def run_rotation_and_select(
     return leaderboard
 
 
+def run_select_only(
+    bucket: str,
+    *,
+    date_str: str | None = None,
+    dry_run: bool = False,
+    specs: list | None = None,
+    s3=None,
+    auto_promote_winner: bool | None = None,
+) -> dict:
+    """config#1083 — the PARALLEL ``select`` entrypoint: run ONLY the selection
+    over whatever spec-* challengers registered for this date (the per-spec Map
+    iterations trained + registered them on their own spots), plus the base
+    champion-arch. Tolerates missing specs, writes the leaderboard to BOTH keys,
+    promotes the winner if auto-promote is on, sends the consolidated digest, and
+    fires the inert-rotation alert when the pool is empty (no challenger trained
+    AND no base) so a totally-failed Map never goes silent. Returns the
+    leaderboard dict."""
+    if date_str is None:
+        try:
+            from alpha_engine_lib.dates import now_dual
+            _td = now_dual().trading_day
+            date_str = _td.isoformat() if hasattr(_td, "isoformat") else str(_td)
+            log.info("model_zoo select: no date passed — defaulting to trading_day %s", date_str)
+        except Exception:  # noqa: BLE001 — date defaulting must not block selection
+            log.warning("model_zoo select: could not resolve trading_day via now_dual", exc_info=True)
+
+    if s3 is None and not dry_run:
+        try:
+            import boto3
+            s3 = boto3.client("s3")
+        except Exception:  # noqa: BLE001
+            log.warning("model_zoo select: no S3 client — selection limited", exc_info=True)
+
+    leaderboard = select_and_finalize(
+        s3, bucket, date_str=date_str, auto_promote_winner=auto_promote_winner,
+        trained=None, specs=specs, dry_run=dry_run,
+    )
+
+    # config#1051/#1083 (no-silent-fails): an empty pool — zero challenger
+    # candidates AND no base champion-arch — means every Map iteration failed /
+    # produced nothing. Fail loud (CW metric + SNS), distinct from "challengers
+    # ran but lost". Skipped on a dry run. The base champion-arch (if present)
+    # is itself a candidate, so the alert fires only on a TRULY inert select.
+    if not dry_run and s3 is not None:
+        _cands = leaderboard.get("candidates", []) or []
+        _n_specs = sum(1 for s in (specs if specs is not None else getattr(cfg, "MODEL_SPECS", []))
+                       if s.get("status", "active") == "active" and s.get("id"))
+        _n_challengers = sum(1 for c in _cands if c.get("spec_id") != "champion-arch")
+        _emit_challengers_trained_metric(_n_challengers)
+        if _n_specs >= 1 and len(_cands) == 0:
+            _alert_inert_rotation(
+                bucket, date_str, n_active=_n_specs, n_selected=0, results={},
+            )
+    return leaderboard
+
+
+def _cli_subcommand(argv: list) -> bool:
+    """config#1083 — the PARALLEL fan-out subcommands (train-spec / select /
+    list-rotation-specs) the Step Function invokes per spot. Dispatched when the
+    first argv token is one of them; returns True if it handled the call. The
+    legacy flag-based CLI (--spec / --weekly-rotation / --run-rotation-and-select)
+    is preserved for the manual / sequential path — these are ADDITIVE."""
+    import sys
+    sub = argv[0] if argv else None
+    if sub not in {"train-spec", "select", "list-rotation-specs"}:
+        return False
+
+    p = argparse.ArgumentParser(prog=f"model_zoo {sub}")
+    p.add_argument("--bucket", required=True)
+    p.add_argument("--date", default=None)
+    p.add_argument("--dry-run", action="store_true")
+    if sub == "train-spec":
+        p.add_argument("--spec", required=True, help="The single spec id to train.")
+    if sub == "list-rotation-specs":
+        p.add_argument("--budget", type=int, default=None,
+                       help="Rotation budget (default MODEL_ZOO_WEEKLY_BUDGET).")
+    args = p.parse_args(argv[1:])
+
+    if sub == "list-rotation-specs":
+        ids = list_rotation_spec_ids(args.bucket, budget=args.budget)
+        print(json.dumps(ids))
+        return True
+    if sub == "train-spec":
+        # Trains exactly ONE spec; exits non-zero ONLY on a real training failure
+        # so the SF Map iteration records THIS spec's failure without aborting
+        # siblings (the per-spec isolation property). Let the exception propagate
+        # to a non-zero exit (no swallow — fail loud per no-silent-fails).
+        train_one_spec(args.spec, args.bucket, date_str=args.date, dry_run=args.dry_run)
+        return True
+    if sub == "select":
+        run_select_only(args.bucket, date_str=args.date, dry_run=args.dry_run)
+        return True
+    return False  # pragma: no cover
+
+
 def _cli() -> None:
+    import sys
+    if _cli_subcommand(sys.argv[1:]):
+        return
     p = argparse.ArgumentParser(
-        description="Model zoo: train a declared variant spec as a challenger (L4488c)."
+        description="Model zoo: train a declared variant spec as a challenger (L4488c).\n"
+                    "Parallel fan-out subcommands (config#1083): "
+                    "`train-spec --spec <id> --bucket B`, `select --bucket B`, "
+                    "`list-rotation-specs --bucket B [--budget N]`."
     )
     p.add_argument("--bucket", required=True)
     p.add_argument("--spec", default=None, help="Spec id to train.")
