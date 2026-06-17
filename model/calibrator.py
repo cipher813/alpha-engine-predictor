@@ -23,6 +23,10 @@ from pathlib import Path
 
 import numpy as np
 
+from alpha_engine_lib.quant.stats.calibration import (
+    expected_calibration_error as _lib_expected_calibration_error,
+)
+
 log = logging.getLogger(__name__)
 
 
@@ -237,26 +241,20 @@ def _expected_calibration_error(
     actual_labels: np.ndarray,
     n_bins: int = 10,
 ) -> float:
+    """Expected Calibration Error of ``predicted_probs`` vs ``actual_labels``.
+
+    Thin wrapper over the fleet-canonical implementation in
+    ``alpha_engine_lib.quant.stats.calibration`` so the calibrator's fit-time
+    ECE (``ece_before``/``ece_after``) and the backtester's production-time ECE
+    are computed by the SAME code on the SAME quantity (calibrated probability
+    vs binary outcome) — the only way the two numbers are comparable as a
+    calibration-drift signal. ``predicted_probs`` must be a P(UP), not a margin.
+
+    Returns the scalar ECE (0.0 when there is no usable bin), preserving the
+    prior float contract for callers.
     """
-    Compute Expected Calibration Error (ECE).
-
-    Bins predictions into n_bins equally-spaced buckets, computes the
-    absolute difference between mean predicted probability and actual
-    frequency of positive outcomes in each bin, weighted by bin size.
-    """
-    bin_edges = np.linspace(0, 1, n_bins + 1)
-    ece = 0.0
-    n_total = len(predicted_probs)
-
-    for i in range(n_bins):
-        mask = (predicted_probs >= bin_edges[i]) & (predicted_probs < bin_edges[i + 1])
-        if i == n_bins - 1:
-            mask = mask | (predicted_probs == bin_edges[i + 1])
-        n_bin = mask.sum()
-        if n_bin == 0:
-            continue
-        avg_pred = predicted_probs[mask].mean()
-        avg_actual = actual_labels[mask].mean()
-        ece += (n_bin / n_total) * abs(avg_pred - avg_actual)
-
-    return float(ece)
+    result = _lib_expected_calibration_error(
+        predicted_probs, actual_labels, n_bins=n_bins,
+    )
+    ece = result.get("ece")
+    return float(ece) if ece is not None else 0.0

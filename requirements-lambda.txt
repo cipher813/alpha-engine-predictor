@@ -8,7 +8,7 @@
 # Inference Lambda does NOT import risk_model (factor_risk_xs / [quant-xs]) — that
 # runs only in PredictorTraining on EC2 — so this keeps the leaner extras; the
 # lockstep test compares only the version tag, which must match requirements.txt.
-alpha-engine-lib[arcticdb,flow_doctor,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.59.3
+alpha-engine-lib[arcticdb,flow_doctor,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.59.8
 numpy>=1.24.0,<2
 pandas>=2.0.0
 pyarrow>=14.0.0
