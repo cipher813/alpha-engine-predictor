@@ -85,3 +85,11 @@ jobs:
         with:
           deploy_status: ${{ job.status == 'success' && 'success' || 'failure' }}
           deploy_workflow: deploy.yml
+
+  # Alert (Telegram) on genuine post-merge failure of this workflow on the
+  # default branch. Reusable workflow + transport in nousergon-lib. config#1128.
+  notify-main-failure:
+    needs: [deploy]
+    if: ${{ failure() && github.ref == 'refs/heads/main' }}
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@main
+    secrets: inherit
