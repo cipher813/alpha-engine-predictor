@@ -45,6 +45,7 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     "inference/stages/shadow_versions.py": 1,  # predictions_shadow/{vid}/{date}.json — observe-only, best-effort, no freshness SLA (L4469 Phase 1)
     "model/registry.py": 4,  # lineage write + promote-in-place patch + _patch_stage + L4540 served-identity restamp of live manifest.json (already a registered artifact; L4469; copy_object not counted)
     "monitoring/drift_detector.py": 1,
+    "monitoring/feature_drift.py": 1,  # feature_drift_reference.json — weekly training-time KS reference, diagnostic-supporting (absence → report card N/A, not a trading failure), no freshness SLA (config#859)
     "regime/retrospective_eval_handler.py": 2,
     "regime/substrate.py": 2,
     "training/meta_trainer.py": 7,
