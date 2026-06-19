@@ -1455,8 +1455,22 @@ def run_meta_training(
     # future momentum L1 model returns through a named-baseline
     # promotion gate.
 
-    # Collect OOS predictions for meta-model training
-    oos_meta_rows = []  # list of dicts with meta-features + actual outcome
+    # Collect OOS predictions for meta-model training.
+    # Research-free specs (long-horizon) KEEP rows that lack a signals snapshot,
+    # which over the full walk-forward is ~1.7M rows vs the ~1.3K snapshot-covered
+    # rows a research-USING spec sees — enough to OOM the meta_training CPCV on
+    # the spot (2026-06-19 horizon-60d/90d OOM, empty-stderr kill). Bound the
+    # research-free collection with a recency-preserving deque: folds stream
+    # oldest→newest, so maxlen keeps the most-recent N rows. The deep-history
+    # signal is already captured by the L1 GBMs (trained on the full set); the L2
+    # meta only needs enough OOS rows for the Ridge + CPCV. Research-USING stays
+    # an unbounded list (byte-identical — it's snapshot-limited to ~1.3K anyway).
+    if _research_features_in_meta:
+        oos_meta_rows = []  # list of dicts with meta-features + actual outcome
+    else:
+        from collections import deque
+        _rf_cap = int(getattr(cfg, "RESEARCH_FREE_MAX_OOS_ROWS", 150000))
+        oos_meta_rows = deque(maxlen=_rf_cap)
     fold_results = []
     mom_fold_ics = []
     # Counters for the research-signal join (added 2026-04-28 alongside
@@ -1680,6 +1694,18 @@ def run_meta_training(
         })
         log.info("  Fold %d/%d: mom_IC=%.4f  vol_IC=%.4f  (%.1fs)",
                  i + 1, len(folds), mom_ic, vol_ic, elapsed)
+
+    # Research-free collection used a bounded deque (recency cap) to avoid the
+    # meta_training OOM; materialize it back to a list for the downstream code
+    # that indexes/zips it. Research-USING is already a list (no-op).
+    if not isinstance(oos_meta_rows, list):
+        _n_capped = len(oos_meta_rows)
+        oos_meta_rows = list(oos_meta_rows)
+        log.info(
+            "research-free meta: OOS rows recency-capped to %d (cap=%d) to bound "
+            "meta_training memory; L1 GBMs still trained on the full history.",
+            _n_capped, _rf_cap,
+        )
 
     # ── Step 6b: Research-signal join summary (added 2026-04-28) ────────────
     # Before-fix the meta-trainer hardcoded constants for the four research

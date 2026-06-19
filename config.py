@@ -433,6 +433,13 @@ EXPECTED_MOVE_IN_META = _meta_stack_cfg.get("expected_move_in_meta", True)
 # select_winner's horizon filter keeps a longer-horizon model out of the live
 # 21d serving slot).
 RESEARCH_FEATURES_IN_META = _meta_stack_cfg.get("research_features_in_meta", True)
+# RESEARCH_FREE_MAX_OOS_ROWS: recency cap on the OOS meta-training rows when a
+# spec is research-free (RESEARCH_FEATURES_IN_META=False). Research-free specs
+# keep snapshot-less rows, which over the full walk-forward is ~1.7M rows and
+# OOMs the meta_training CPCV on the spot. The cap (recency-preserving deque)
+# bounds memory; the deep history is still learned by the L1 GBMs. No effect on
+# research-USING specs (snapshot-limited to ~1.3K rows, far under the cap).
+RESEARCH_FREE_MAX_OOS_ROWS = int(_meta_stack_cfg.get("research_free_max_oos_rows", 150000))
 # META_STANDARDIZE_ENABLED: standardize (z-score) + winsorize the DIRECTIONAL
 # meta-features before the Ridge (Asness-Moskowitz-Pedersen signal-level
 # combine + outlier guard). Default False ⇒ raw features, byte-identical. The
