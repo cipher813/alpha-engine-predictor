@@ -101,6 +101,10 @@ _ALLOWED_OVERRIDES = {
     # arg). Default-preserving so the champion is byte-identical when unset.
     "EXPECTED_MOVE_IN_META",
     "META_STANDARDIZE_ENABLED",
+    # Long-horizon validation: drop the research-derived meta features + skip
+    # the signals-join so a 60/90d spec can train past the short signals.json
+    # history (validate-only; the horizon filter keeps it out of the 21d slot).
+    "RESEARCH_FEATURES_IN_META",
 }
 
 _SENTINEL = object()

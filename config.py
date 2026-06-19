@@ -423,6 +423,16 @@ MOMENTUM_L1_IN_META = _meta_stack_cfg.get("momentum_l1_in_meta", True)
 # cause). With it off the vol L1 still trains + emits the field for sizing /
 # confidence / the barrier model — it just stops driving DIRECTIONAL alpha.
 EXPECTED_MOVE_IN_META = _meta_stack_cfg.get("expected_move_in_meta", True)
+# RESEARCH_FEATURES_IN_META: keep the four research-derived columns (research
+# score / conviction / sector + calibrator) in the L2 meta-vector. Default
+# True ⇒ byte-identical to today. A long-horizon model-zoo spec (horizon-60d/
+# 90d) flips it False: its label window predates the short signals.json
+# history, so the research-signal join would drop every row. With it off the
+# join is skipped and those columns leave the meta vector, letting the spec
+# train on the years-deep price/macro features alone (validate-only —
+# select_winner's horizon filter keeps a longer-horizon model out of the live
+# 21d serving slot).
+RESEARCH_FEATURES_IN_META = _meta_stack_cfg.get("research_features_in_meta", True)
 # META_STANDARDIZE_ENABLED: standardize (z-score) + winsorize the DIRECTIONAL
 # meta-features before the Ridge (Asness-Moskowitz-Pedersen signal-level
 # combine + outlier guard). Default False ⇒ raw features, byte-identical. The

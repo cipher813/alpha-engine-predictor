@@ -473,7 +473,7 @@ def send_training_email(result: dict, date_str: str) -> bool:
     promo_label = (
         f"Promoted → weights/meta/ ✓" if promoted and is_meta
         else f"Promoted → gbm_latest ({promoted_mode}) ✓" if promoted
-        else "Registered challenger (gates passed; auto-promote off) ◆"
+        else "Registered challenger (gates passed; model-zoo select_winner decides promotion) ◆"
         if challenger_registered
         else f"NOT promoted ({_build_failure_reason()}) ✗"
     )

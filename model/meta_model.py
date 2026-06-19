@@ -76,6 +76,21 @@ META_FEATURES = [
     "regime_intensity_z",
 ]
 
+# The research-derived meta-features — populated from the weekly signals.json
+# snapshot join (research score / conviction / sector) plus the research-score
+# calibrator. A model-zoo spec with RESEARCH_FEATURES_IN_META=False excludes
+# these from the meta vector AND skips the signals-join, so a long-horizon spec
+# (whose 60/90d label window predates the short signals.json history) can train
+# on the years-deep price/macro features alone. Validate-only: such a model
+# predicts a longer horizon than the live 21d champion, so select_winner's
+# horizon filter keeps it out of the serving slot.
+RESEARCH_META_FEATURES = [
+    "research_calibrator_prob",
+    "research_composite_score",
+    "research_conviction",
+    "sector_macro_modifier",
+]
+
 # Directional meta-features eligible for the L4565 standardize+winsorize
 # transform (the SOTA signal-level combine). These are the TICKER-VARYING
 # directional signals: standardizing them puts every signal on a comparable
@@ -225,6 +240,18 @@ class MetaModel:
         # (the scaler keys on names). Defaults to the leading META_FEATURES.
         names = feature_names or META_FEATURES[:X.shape[1]]
         self._feature_names = list(names)
+
+        # Fail loud on a feature_names / X-columns mismatch. A model-zoo spec
+        # that drops a meta feature (e.g. EXPECTED_MOVE_IN_META=False) MUST pass
+        # the filtered build_train_meta_features() list, not raw META_FEATURES —
+        # otherwise _compute_importance indexes coef[i] past the array end
+        # (2026-06-19 sota-directional-combine: IndexError, 13 names vs 12 cols).
+        if len(self._feature_names) != X.shape[1]:
+            raise ValueError(
+                f"MetaModel.fit: {len(self._feature_names)} feature_names but X "
+                f"has {X.shape[1]} columns — they must match. Pass the filtered "
+                f"build_train_meta_features() list when a spec drops a meta feature."
+            )
 
         # L4565: build + apply the directional standardize+winsorize transform.
         # Fit on the TRAIN matrix only (this X) → leak-free when fit/predict run

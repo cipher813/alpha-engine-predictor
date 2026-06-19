@@ -467,6 +467,7 @@ def build_train_meta_features(
     resid_mom_enabled: bool,
     momentum_l1_in_meta: bool = True,
     expected_move_in_meta: bool = True,
+    research_features_in_meta: bool = True,
 ) -> list[str]:
     """W2/W4.2 (L4469) + L4565 observe gates: the L2 training-time feature list.
 
@@ -490,11 +491,12 @@ def build_train_meta_features(
     Promotion of any delta = flip its flag (defaults preserve today byte-for-byte;
     all observe-gated, exercised by the model-zoo specs).
     """
-    from model.meta_model import META_FEATURES
+    from model.meta_model import META_FEATURES, RESEARCH_META_FEATURES
     feats = [
         f for f in META_FEATURES
         if (momentum_l1_in_meta or f != "momentum_score")
         and (expected_move_in_meta or f != "expected_move")
+        and (research_features_in_meta or f not in RESEARCH_META_FEATURES)
     ]
     if resid_mom_enabled:
         feats.append("residual_momentum_score")
@@ -1368,13 +1370,30 @@ def run_meta_training(
     # top-level sector_modifiers map. Walk-forward row construction below
     # joins (test_date, ticker) → most-recent-prior snapshot to pull real
     # values for the four meta-model research features.
+    # RESEARCH_FEATURES_IN_META (default True) gates the entire signals.json
+    # join. A long-horizon spec sets it False: its label window predates the
+    # short signals history, so the join would drop every row → the 0-rows
+    # guard would (correctly, for a research-USING spec) abort. Skipping the
+    # join + excluding the research columns from TRAIN_META_FEATURES is an
+    # EXPLICIT per-spec declaration that this model uses no research features —
+    # NOT the forbidden silent-constant fallback (which substituted constants
+    # for features that WERE in the meta).
+    _research_features_in_meta = bool(getattr(cfg, "RESEARCH_FEATURES_IN_META", True))
+    signals_lookup = {}
     try:
-        import boto3 as _boto3_sig
-        _s3_signals = _boto3_sig.client("s3")
-        signals_history = _load_signals_history(_s3_signals, bucket)
-        signals_lookup = _build_signals_lookup_by_test_date(
-            signals_history, [str(d) for d in sorted(set(all_dates))]
-        )
+        if _research_features_in_meta:
+            import boto3 as _boto3_sig
+            _s3_signals = _boto3_sig.client("s3")
+            signals_history = _load_signals_history(_s3_signals, bucket)
+            signals_lookup = _build_signals_lookup_by_test_date(
+                signals_history, [str(d) for d in sorted(set(all_dates))]
+            )
+        else:
+            log.info(
+                "RESEARCH_FEATURES_IN_META=False — skipping signals.json join; "
+                "research features excluded from the meta vector (long-horizon "
+                "validate-only spec)."
+            )
     except Exception as exc:
         # Hard-fail per feedback_no_silent_fails — a training run that
         # silently falls back to constants is the bug we are fixing.
@@ -1581,15 +1600,23 @@ def run_meta_training(
                 # models above still train on the full (date, ticker)
                 # set; only L2 narrows to rows where research signals
                 # were actually present in production.
-                if signals_payload is None:
-                    n_rows_dropped_no_signals_snapshot += 1
-                    continue
-                research_features = _extract_research_features(
-                    signals_payload, ticker, fold_calibrator
-                )
-                if research_features is None:
-                    n_rows_dropped_ticker_missing += 1
-                    continue
+                if _research_features_in_meta:
+                    if signals_payload is None:
+                        n_rows_dropped_no_signals_snapshot += 1
+                        continue
+                    research_features = _extract_research_features(
+                        signals_payload, ticker, fold_calibrator
+                    )
+                    if research_features is None:
+                        n_rows_dropped_ticker_missing += 1
+                        continue
+                else:
+                    # Research-free (long-horizon): zero the research columns.
+                    # They are EXCLUDED from TRAIN_META_FEATURES so they never
+                    # enter meta_X; the zeros only satisfy incidental row reads.
+                    # The row is RETAINED — no snapshot dependency.
+                    from model.meta_model import RESEARCH_META_FEATURES
+                    research_features = {f: 0.0 for f in RESEARCH_META_FEATURES}
 
                 row = {
                     "momentum_score": float(mom_preds[local_idx]),
@@ -1680,7 +1707,7 @@ def run_meta_training(
         dropped_no_snapshot=n_rows_dropped_no_signals_snapshot,
         dropped_ticker_missing=n_rows_dropped_ticker_missing,
     )
-    if n_rows_with_real_signals == 0:
+    if _research_features_in_meta and n_rows_with_real_signals == 0:
         raise RuntimeError(
             "Meta-trainer: 0 rows survived the research-signal join. "
             "Either no test_date in the walk-forward folds maps to a "
@@ -1862,14 +1889,16 @@ def run_meta_training(
     # nonlinear refits) so the observed ICs reflect the model that will serve.
     _meta_standardize = bool(getattr(cfg, "META_STANDARDIZE_ENABLED", False))
     TRAIN_META_FEATURES = build_train_meta_features(
-        _resid_mom_enabled, _momentum_l1_in_meta, _expected_move_in_meta
+        _resid_mom_enabled, _momentum_l1_in_meta, _expected_move_in_meta,
+        _research_features_in_meta,
     )
     log.info(
         "Training meta-model on %d OOS rows... "
         "(residual_momentum L1 in stack: %s; raw momentum_score in meta: %s; "
-        "expected_move in meta: %s; directional standardize+winsor: %s)",
+        "expected_move in meta: %s; research features in meta: %s; "
+        "directional standardize+winsor: %s)",
         len(oos_meta_rows), _resid_mom_enabled, _momentum_l1_in_meta,
-        _expected_move_in_meta, _meta_standardize,
+        _expected_move_in_meta, _research_features_in_meta, _meta_standardize,
     )
     meta_X_all = np.array([[r[f] for f in TRAIN_META_FEATURES] for r in oos_meta_rows])
     meta_y_all = np.array([r["actual_fwd"] for r in oos_meta_rows])  # legacy, kept for diagnostics
@@ -2723,7 +2752,7 @@ def run_meta_training(
         meta_model_tb = MetaModel(alpha=1.0)
         meta_model_tb.fit(
             tb_X, tb_y,
-            feature_names=META_FEATURES,
+            feature_names=TRAIN_META_FEATURES,
             sample_weight=tb_sample_weights,
             standardize_directional=_meta_standardize,
         )
@@ -2798,7 +2827,7 @@ def run_meta_training(
             meta_label_clf = MetaLabelClassifier()
             meta_label_clf.fit(
                 touch_X, touch_y,
-                feature_names=META_FEATURES,
+                feature_names=TRAIN_META_FEATURES,
                 sample_weight=touch_weights,
             )
             log.info(
