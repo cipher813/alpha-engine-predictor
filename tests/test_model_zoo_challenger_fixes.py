@@ -95,3 +95,23 @@ def test_promo_label_does_not_say_auto_promote_off():
     )
     assert "auto-promote off" not in src
     assert "model-zoo select_winner decides promotion" in src
+
+
+# ── 2d: research-free OOS-row recency cap (the horizon OOM fix) ──────────
+
+
+def test_research_free_max_oos_rows_config_default():
+    assert hasattr(cfg, "RESEARCH_FREE_MAX_OOS_ROWS")
+    # Sane default: large enough for a meta Ridge + CPCV, small enough to not OOM.
+    assert 10_000 <= cfg.RESEARCH_FREE_MAX_OOS_ROWS <= 1_000_000
+
+
+def test_research_free_path_uses_bounded_deque():
+    src = (
+        open(os.path.join(os.path.dirname(__file__), "..", "training", "meta_trainer.py"))
+        .read()
+    )
+    # Research-free collection must be bounded (deque maxlen) — an unbounded
+    # list re-introduces the ~1.7M-row meta_training OOM (2026-06-19 horizon).
+    assert "deque(maxlen=_rf_cap)" in src
+    assert "RESEARCH_FREE_MAX_OOS_ROWS" in src
