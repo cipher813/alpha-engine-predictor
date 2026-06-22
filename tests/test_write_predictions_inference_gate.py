@@ -182,3 +182,48 @@ class TestGateEdgeCases:
                     {"model_version": "test"},
                     dry_run=True,
                 )
+
+
+# ── Observe-only shadow-Platt dual-output (config#1176) ──────────────────────
+
+class TestShadowPlattObserveBlock:
+    """The shadow balanced-Platt p_up distribution is gated observe-only and
+    surfaced as output_distribution_gate_shadow_platt — never feeding the live
+    gate the executor reads."""
+
+    @staticmethod
+    def _capture_envelope(preds):
+        import json
+        from inference.stages import write_output
+        bodies = []
+
+        def fake_put(s3, bucket, key, body):
+            bodies.append(body)
+
+        with patch.object(write_output, "_s3_put_json", side_effect=fake_put):
+            write_output.write_predictions(
+                preds, "2026-06-22", "test-bucket", {"model_version": "test"},
+            )
+        for b in bodies:
+            parsed = json.loads(b)
+            if isinstance(parsed, dict) and "predictions" in parsed:
+                return parsed
+        raise AssertionError("no predictions envelope captured")
+
+    def test_shadow_platt_block_populated_when_p_up_platt_present(self):
+        preds = _healthy_predictions()
+        # Attach a continuous (smooth) shadow p_up — Platt-like, well-spread.
+        for i, p in enumerate(preds):
+            p["p_up_platt"] = round(0.12 + (i / (len(preds) - 1)) * 0.74, 4)
+        env = self._capture_envelope(preds)
+        shadow = env["output_distribution_gate_shadow_platt"]
+        assert shadow is not None
+        assert "passed" in shadow and "metrics" in shadow
+        assert shadow["metrics"]["n_unique_p_up"] >= 8
+        # Live gate block is independent and present.
+        assert env["output_distribution_gate"] is not None
+
+    def test_shadow_platt_block_null_when_absent(self):
+        preds = _healthy_predictions()  # no p_up_platt
+        env = self._capture_envelope(preds)
+        assert env["output_distribution_gate_shadow_platt"] is None

@@ -209,6 +209,28 @@ def _load_meta_models(ctx: PipelineContext) -> None:
         except Exception:
             pass
 
+    # Shadow calibrator — OBSERVE-ONLY dual-output (config#1176). Training
+    # already fits a parallel calibrator (predictor.yaml calibration.shadow_method
+    # = "platt", class_weight="balanced") on the SAME OOS rows/labels as the
+    # live (isotonic) calibrator and persists it under this key. Loading it here
+    # lets inference emit a parallel ``p_up_platt`` per ticker so a soak can
+    # compare the two on REAL daily batches — specifically whether balanced-Platt
+    # removes the isotonic staircase coarseness (the 2026-06-22 low-dispersion
+    # gate false-positive) WITHOUT re-collapsing the way unbalanced Platt did on
+    # 2026-05-23. Strictly observability: never feeds the authoritative p_up,
+    # direction, confidence, veto, or sizing. Tolerant — absent artifact (older
+    # cycle / shadow disabled) just means no p_up_platt field.
+    ctx.shadow_calibrator = None
+    if getattr(cfg, "CALIBRATION_ENABLED", True):
+        try:
+            from model.calibrator import PlattCalibrator
+            _sp = _dl(f"{prefix}isotonic_calibrator_shadow.pkl",
+                      "calibrator_shadow.pkl")
+            ctx.shadow_calibrator = PlattCalibrator.load(_sp)
+            log.info("Loaded shadow (Platt) calibrator — observe-only p_up_platt")
+        except Exception as e:
+            log.debug("shadow calibrator not available (observe-only OK): %s", e)
+
     n_loaded = len(ctx.meta_models)
     if n_loaded == 0:
         raise RuntimeError("No meta-models available — cannot run inference")

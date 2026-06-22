@@ -419,6 +419,40 @@ def write_predictions(
             inference_gate_result.reason,
         )
 
+    # Observe-only (config#1176): run the SAME gate on the shadow balanced-Platt
+    # p_up distribution so every daily run records whether Platt would clear the
+    # gate ORGANICALLY (continuous output → high unique-count, no isotonic
+    # staircase) and how its dispersion compares to live isotonic. Pure
+    # forensics for the calibration-method soak — never touches the live
+    # gate_block the executor's hold-book safeguard reads. Empty until the shadow
+    # calibrator is loaded + emitting p_up_platt.
+    shadow_platt_gate = None
+    _platt_rows = [
+        {"p_up": p["p_up_platt"],
+         "predicted_direction": "UP" if p["p_up_platt"] >= 0.5 else "DOWN"}
+        for p in predictions
+        if p.get("p_up_platt") is not None
+    ]
+    if _platt_rows:
+        try:
+            _pg = validate_live_batch_distribution(_platt_rows)
+            shadow_platt_gate = {
+                "passed": _pg.passed,
+                "failed_check": _pg.failed_check,
+                "metrics": _pg.metrics,
+            }
+            log.info(
+                "Shadow-Platt distribution (observe, config#1176): passed=%s "
+                "unique=%s modal=%s stdev=%s  |  live isotonic unique=%s modal=%s stdev=%s",
+                _pg.passed, _pg.metrics.get("n_unique_p_up"),
+                _pg.metrics.get("modal_fraction"), _pg.metrics.get("stdev_p_up"),
+                inference_gate_result.metrics.get("n_unique_p_up"),
+                inference_gate_result.metrics.get("modal_fraction"),
+                inference_gate_result.metrics.get("stdev_p_up"),
+            )
+        except Exception as _e:
+            log.debug("shadow-platt gate compute failed (observe-only): %s", _e)
+
     threshold = veto_threshold if veto_threshold is not None else cfg.MIN_CONFIDENCE
     # Build the predictions envelope
     n_high_confidence = sum(
@@ -450,6 +484,10 @@ def write_predictions(
         # strongly-biased batch (passed=False) must not drive an optimizer
         # rotation — the executor holds the current book instead.
         "output_distribution_gate": gate_block,
+        # Observe-only shadow-Platt gate (config#1176) — sibling to the live
+        # gate; records how balanced-Platt's distribution would fare. Null until
+        # the shadow calibrator emits p_up_platt. NOT read by the executor.
+        "output_distribution_gate_shadow_platt": shadow_platt_gate,
         # Cross-sectional level-neutralization observe block (L4487). Additive;
         # records the common-mode mean removed + the raw-vs-centered direction
         # diff. When its `applied` is True the predictions' predicted_alpha is
