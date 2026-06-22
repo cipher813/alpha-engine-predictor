@@ -871,6 +871,25 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
             predicted_direction = "UP" if p_up >= 0.5 else "DOWN"
             confidence = abs(p_up - 0.5) * 2.0
 
+        # Shadow (Platt) calibration — OBSERVE-ONLY parallel p_up (config#1176).
+        # Re-derives p_up from the balanced-Platt shadow calibrator using the
+        # SAME alpha + label_clip the live calibration used, so the soak can
+        # compare isotonic-live vs Platt-shadow on real daily batches (does
+        # Platt remove the staircase coarseness?). NEVER feeds the authoritative
+        # p_up / direction / confidence / veto / sizing — additive field, null
+        # when shadow not loaded or per-ticker calibrate raises.
+        p_up_platt: float | None = None
+        _shadow_cal = getattr(ctx, "shadow_calibrator", None)
+        if _shadow_cal is not None and _shadow_cal.is_fitted:
+            try:
+                p_up_platt = round(
+                    float(_shadow_cal.calibrate_prediction(alpha, label_clip=max_r)["p_up"]),
+                    4,
+                )
+            except Exception as _e:
+                log.debug("p_up_platt shadow calibrate failed for %s: %s", ticker, _e)
+                p_up_platt = None
+
         result = {
             "ticker": ticker,
             "predicted_direction": predicted_direction,
@@ -886,6 +905,10 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
                 round(float(alpha_std), 6) if alpha_std is not None else None
             ),
             "p_up": round(p_up, 4),
+            # Observe-only parallel calibration (config#1176) — balanced-Platt
+            # shadow's p_up for the same alpha. Null when shadow absent. NOT
+            # consumed by the executor; for calibration-method soak comparison.
+            "p_up_platt": p_up_platt,
             "p_flat": 0.0,
             "p_down": round(p_down, 4),
             "combined_rank": None,
