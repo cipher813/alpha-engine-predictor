@@ -522,7 +522,7 @@ MODEL_VERSION_LABEL = _cfg.get("model_version_label", "v3.0-meta")
 # STALEST active specs (oldest/absent registered version) so the whole zoo is
 # refreshed round-robin over ~ceil(len(active)/N) weeks. The champion retrain
 # is separate + always-on; this budget is the challenger zoo on top of it.
-MODEL_ZOO_WEEKLY_BUDGET = int(_cfg.get("model_zoo_weekly_budget", 3))
+MODEL_ZOO_WEEKLY_BUDGET = int(_cfg.get("model_zoo_weekly_budget", 4))
 
 # config#1051 (no-silent-fails): an EMPTY ``model_specs`` roster while the
 # rotation budget is >= 1 is never intentional on the rotation box — it means

@@ -331,7 +331,7 @@ def list_rotation_spec_ids(
     handles the empty pool)."""
     specs = specs if specs is not None else getattr(cfg, "MODEL_SPECS", [])
     if budget is None:
-        budget = int(getattr(cfg, "MODEL_ZOO_WEEKLY_BUDGET", 3))
+        budget = int(getattr(cfg, "MODEL_ZOO_WEEKLY_BUDGET", 4))
     if registered_versions is None:
         registered_versions = _list_registry_versions(bucket)
     selected = select_rotation_specs(specs, registered_versions, budget)
@@ -427,7 +427,7 @@ def train_weekly_rotation(
     dry run (no live writes happen) and best-effort if S3 is unavailable."""
     specs = specs if specs is not None else getattr(cfg, "MODEL_SPECS", [])
     if budget is None:
-        budget = int(getattr(cfg, "MODEL_ZOO_WEEKLY_BUDGET", 3))
+        budget = int(getattr(cfg, "MODEL_ZOO_WEEKLY_BUDGET", 4))
     if registered_versions is None:
         registered_versions = _list_registry_versions(bucket)
     selected = select_rotation_specs(specs, registered_versions, budget)
