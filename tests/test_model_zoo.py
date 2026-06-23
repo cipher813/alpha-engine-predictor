@@ -616,3 +616,36 @@ def test_assert_model_specs_loaded_noop_when_budget_zero(monkeypatch):
     monkeypatch.setattr(cfg, "MODEL_SPECS", [], raising=False)
     monkeypatch.setattr(cfg, "MODEL_ZOO_WEEKLY_BUDGET", 0, raising=False)
     cfg.assert_model_specs_loaded()  # no raise
+
+
+# ── alpha-engine-config#1133: reconcile the weekly-budget DEFAULT to 4 ────────
+# The live/reference predictor.yaml sets 4 (full active pool, fresh-best-wins
+# redesign, config#1088). The code DEFAULT fallbacks used to read 3 — a fresh
+# deploy that fell back to the default would silently train 3 challengers, not
+# the intended 4 (e.g. a renamed/missing config key). These pin the fallback so
+# the code default never drifts below the canonical reference again.
+
+_RECONCILED_WEEKLY_BUDGET_DEFAULT = 4
+
+
+def test_config_weekly_budget_default_matches_reference():
+    """config.py's ``_cfg.get(..., DEFAULT)`` fallback must equal the canonical
+    reference value (4). Asserts the literal default, independent of whatever
+    the loaded yaml happens to set, so a missing/renamed key falls back to 4."""
+    import inspect
+    src = inspect.getsource(cfg)
+    assert (
+        'int(_cfg.get("model_zoo_weekly_budget", '
+        f'{_RECONCILED_WEEKLY_BUDGET_DEFAULT}))' in src
+    ), "config.py model_zoo_weekly_budget default must be the reference value (4)"
+
+
+def test_rotation_default_budget_is_reference(monkeypatch):
+    """When cfg lacks the attr entirely, the rotation's ``getattr`` fallback
+    selects 4 specs — the reference pool size, not the stale 3."""
+    monkeypatch.delattr(cfg, "MODEL_ZOO_WEEKLY_BUDGET", raising=False)
+    specs = [{"id": f"s{i}", "status": "active"} for i in range(6)]
+    selected = mz.list_rotation_spec_ids(
+        "bkt", specs=specs, registered_versions=[],
+    )
+    assert len(selected) == _RECONCILED_WEEKLY_BUDGET_DEFAULT

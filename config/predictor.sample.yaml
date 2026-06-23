@@ -274,7 +274,7 @@ shadow_versions:
 model_version_label: v3.0-meta     # base label; a spec overrides it per-run
 # L4488g: weekly rotation budget — `model_zoo --weekly-rotation` trains only the
 # N stalest active specs per run (round-robin refresh) to bound Saturday compute.
-model_zoo_weekly_budget: 3
+model_zoo_weekly_budget: 4
 # L4582(a): CSCV-PBO target for the rotation's selection step (observe-only —
 # logged to the leaderboard `selection_pbo` block; <0.2 is the bar any public
 # DSR/selection claim must clear).
