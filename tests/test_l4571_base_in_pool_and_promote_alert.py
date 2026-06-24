@@ -155,9 +155,15 @@ class TestPromotionAlert:
         assert "--promote base-today" in alerts_sent[0]["message"]  # manual-promote hint
 
     def test_no_winner_no_alert(self, monkeypatch):
-        # All candidates below champion+margin → no winner, no alert.
+        # Genuine no-winner case (config#1175). With model_zoo_promote_margin=0.0
+        # eligibility is `ic >= baseline` (fresh-best-wins), so a TIE PROMOTES —
+        # the former base_ic=variant_ic=0.10 inputs here actually cut over resid-v,
+        # making the "no winner / no alert" assertion stale. Use candidates strictly
+        # BELOW the serving champion (0.10): the fresh champion-arch (0.05) does not
+        # beat serving so it does not refresh, and the variant (0.03) is below the
+        # baseline so no challenger wins → no promotion, no alert.
         board, promotes, alerts_sent = _pool_fixture(
-            monkeypatch, auto_promote=True, base_ic=0.10, variant_ic=0.10)
+            monkeypatch, auto_promote=True, base_ic=0.05, variant_ic=0.03)
         assert board["winner_version_id"] is None
         assert promotes == []
         assert alerts_sent == []
