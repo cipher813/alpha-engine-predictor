@@ -1134,7 +1134,21 @@ def _main_impl(
     Returns the result dict from run_meta_training().
     """
     if date_str is None:
-        date_str = datetime.now().strftime("%Y-%m-%d")
+        # Trading-day axis (config#1015): the Saturday SF runs on a calendar
+        # date that is NOT a trading day, so a calendar now() keyed the training
+        # summary / meta-archive / oos_rows / risk_model artifacts on Saturday
+        # instead of Friday's close — contaminating the predictor artifact chain.
+        # Mirror model_zoo's default: resolve the trading_day via now_dual,
+        # falling back to calendar only if the lib lookup fails.
+        try:
+            from alpha_engine_lib.dates import now_dual
+            _td = now_dual().trading_day
+            date_str = _td.isoformat() if hasattr(_td, "isoformat") else str(_td)
+            log.info("train_handler: no date passed — defaulting to trading_day %s", date_str)
+        except Exception:  # noqa: BLE001 — date defaulting must not block training
+            date_str = datetime.now().strftime("%Y-%m-%d")
+            log.warning("train_handler: could not resolve trading_day via now_dual; "
+                        "fell back to calendar date %s", date_str, exc_info=True)
 
     # setup_logging already ran at module-top (see comment near the
     # alpha_engine_lib.logging import). Apply standard log level here.
