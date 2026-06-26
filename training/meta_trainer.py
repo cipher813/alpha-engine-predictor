@@ -1192,6 +1192,18 @@ def run_meta_training(
     log.info("Arrays built: %d samples, mom=%d features, vol=%d features",
              N, X_mom.shape[1], X_vol.shape[1])
 
+    # ── Peak-RSS-by-phase instrumentation (config#688) ───────────────────────
+    # The `peak_rss_mb` running max was previously initialized deep in the
+    # Step 8 volatility-fit region (`peak_rss_mb = _log_rss(...)`), so the
+    # manifest's reported training peak silently excluded the earlier phases
+    # the OOM investigation actually fingered — the canonical-alpha (date×
+    # ticker) build (Step 3b), the regime-feature build (Step 4), and the
+    # macro-array allocation (Step 4b "OOM hotspot", 2026-06-01). Seed the
+    # running max here so every subsequent phase boundary contributes to the
+    # persisted `peak_rss_mb`, and confirm/refute the 16 GiB headroom runway
+    # against measured by-phase numbers rather than the late-phase-only window.
+    peak_rss_mb = _log_rss("after streaming array build (Step 1-3)")
+
     # ── Step 3b: Canonical alpha labels (audit Track A PR 2/6, observe-only) ─
     # Computes log-domain risk-matched alpha vs vol-cohort EW basket per
     # (date, ticker) from all_close_prices. Per audit §7.3-§7.4 this is
@@ -1230,6 +1242,7 @@ def run_meta_training(
             "rows will get None for actual_fwd_canonical",
             e,
         )
+    peak_rss_mb = max(peak_rss_mb, _log_rss("after Step 3b canonical-alpha labels"))
 
     # ── Step 4: Build regime features + labels ───────────────────────────────
     regime_predictor = RegimePredictor()
@@ -1252,6 +1265,7 @@ def run_meta_training(
     regime_y_aligned = regime_y.loc[common_dates].to_numpy().astype(int)
 
     log.info("Regime data: %d dates with features+labels", len(common_dates))
+    peak_rss_mb = max(peak_rss_mb, _log_rss("after Step 4 regime-feature build"))
 
     # ── Step 4b: Build macro feature array for Stage 1b parallel observation ─
     # Stage 1b of the regime-conditioning rebuild (plan doc:
@@ -1290,6 +1304,7 @@ def run_meta_training(
         cfg.MACRO_NORM_WINDOW,
         100.0 * float(np.isfinite(X_macro_zscored).all(axis=1).mean()),
     )
+    peak_rss_mb = max(peak_rss_mb, _log_rss("after Step 4b macro-array build (OOM hotspot)"))
 
     # ── Step 5: Load research calibrator data from S3 ────────────────────────
     research_scores = np.array([])
@@ -1706,6 +1721,7 @@ def run_meta_training(
             "meta_training memory; L1 GBMs still trained on the full history.",
             _n_capped, _rf_cap,
         )
+    peak_rss_mb = max(peak_rss_mb, _log_rss("after Step 6 walk-forward loop"))
 
     # ── Step 6b: Research-signal join summary (added 2026-04-28) ────────────
     # Before-fix the meta-trainer hardcoded constants for the four research
@@ -3210,7 +3226,7 @@ def run_meta_training(
     log.info("Momentum production (deterministic baseline): test_IC=%.4f", mom_test_ic)
 
     # Volatility production model
-    peak_rss_mb = _log_rss("before prod_vol (plain) fit")
+    peak_rss_mb = max(peak_rss_mb, _log_rss("before prod_vol (plain) fit"))
     prod_vol = GBMScorer(params=tuned_params, n_estimators=cfg.GBM_N_ESTIMATORS,
                          early_stopping_rounds=cfg.GBM_EARLY_STOPPING_ROUNDS)
     prod_vol.fit(X_vol[:n_train], np.abs(y_fwd[:n_train]),
