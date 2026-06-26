@@ -307,8 +307,7 @@ if __name__ == "__main__":
         _ef.fetch_revision_history = lambda *a, **k: {t: {} for t in _OFFLINE_TICKERS}
 
         import data.options_fetcher as _of
-        _of.fetch_options_features = lambda *a, **k: {t: {} for t in _OFFLINE_TICKERS}
-        _of.load_historical_options = lambda *a, **k: {}
+        _of.load_historical_options = lambda *a, **k: {t: {} for t in _OFFLINE_TICKERS}
 
         # Stub health write
         try:

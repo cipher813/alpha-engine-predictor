@@ -33,7 +33,9 @@ def fake_earnings(monkeypatch):
 def fake_options(monkeypatch):
     options = MagicMock(name="options_fetcher")
     options.load_historical_options = MagicMock(return_value={"AAPL": {"o": 1}})
-    options.fetch_options_features = MagicMock(return_value={"MSFT": {"o": 2}})
+    # yfinance fetch retired in PR4b (config#874) — assert it no longer exists
+    # so a regression that re-adds a live-fetch fallback fails loudly.
+    del options.fetch_options_features
     monkeypatch.setitem(sys.modules, "data.options_fetcher", options)
     return options
 
@@ -61,15 +63,19 @@ def test_run_populates_all_four_sources(fake_earnings, fake_options, fake_boto):
     assert ctx.options_all == {"AAPL": {"o": 1}}
     assert ctx.fundamental_all == {"AAPL": {"f": 1}, "MSFT": {"f": 2}}
     fake_earnings.cache_earnings_to_s3.assert_called_once()
-    fake_options.fetch_options_features.assert_not_called()  # cached path wins
+    # PR4b: options come from the S3 archive read only.
+    fake_options.load_historical_options.assert_called_once_with("2026-04-15", "bucket-x")
 
 
-def test_run_falls_back_to_yfinance_when_no_cached_options(fake_earnings, fake_options, fake_boto):
+def test_run_neutral_fills_when_archive_options_missing(fake_earnings, fake_options, fake_boto):
+    """PR4b cutover: a missing archive snapshot neutral-fills (empty dict) —
+    there is NO yfinance fallback. The stage must not reach for a live fetch."""
     fake_options.load_historical_options = MagicMock(return_value=None)
+    # Re-assert the retired symbol is absent: any access would raise.
+    assert not hasattr(fake_options, "fetch_options_features")
     ctx = _ctx()
     run(ctx)
-    fake_options.fetch_options_features.assert_called_once()
-    assert ctx.options_all == {"MSFT": {"o": 2}}
+    assert ctx.options_all == {}
 
 
 # ── Per-source independent failure ──────────────────────────────────────────
@@ -94,14 +100,13 @@ def test_run_revision_fetch_failure_logged(fake_earnings, fake_options, fake_bot
     assert any("Revision data fetch failed" in r.message for r in caplog.records)
 
 
-def test_run_options_fetch_failure_logged(fake_earnings, fake_options, fake_boto, caplog):
-    fake_options.load_historical_options.side_effect = RuntimeError("options API down")
-    fake_options.fetch_options_features.side_effect = RuntimeError("yfinance down")
+def test_run_options_archive_read_failure_logged(fake_earnings, fake_options, fake_boto, caplog):
+    fake_options.load_historical_options.side_effect = RuntimeError("S3 down")
     ctx = _ctx()
     with caplog.at_level("WARNING"):
         run(ctx)
     assert ctx.options_all == {}
-    assert any("Options features fetch failed" in r.message for r in caplog.records)
+    assert any("Options archive read failed" in r.message for r in caplog.records)
 
 
 def test_run_fundamentals_today_key_path(fake_earnings, fake_options, fake_boto):
@@ -149,7 +154,6 @@ def test_run_all_sources_fail_logs_error(fake_earnings, fake_options, fake_boto,
     fake_earnings.fetch_earnings_data.side_effect = RuntimeError("down")
     fake_earnings.fetch_revision_history.side_effect = RuntimeError("down")
     fake_options.load_historical_options.side_effect = RuntimeError("down")
-    fake_options.fetch_options_features.side_effect = RuntimeError("down")
     fake_boto.get_object.side_effect = RuntimeError("S3 down")
     fake_boto.list_objects_v2.return_value = {"Contents": []}
 

@@ -31,17 +31,23 @@ def run(ctx: PipelineContext) -> None:
     except Exception as exc:
         log.warning("O11: Revision data fetch failed (features will use defaults): %s", exc)
 
-    # O12: Options
+    # O12: Options — read the S3 archive snapshot (archive/options/{date}.json,
+    # written by nousergon-data collectors/alternative.py). yfinance retired in
+    # PR4b (config#874): hard cutover after the producer write-both soak. On an
+    # archive miss the model neutral-fills downstream (empty dict here), exactly
+    # as the legacy path did on a yfinance miss.
     try:
-        from data.options_fetcher import load_historical_options, fetch_options_features
+        from data.options_fetcher import load_historical_options
         ctx.options_all = load_historical_options(ctx.date_str, ctx.bucket) or {}
         if ctx.options_all:
-            log.info("O12: Loaded cached options for %d tickers from S3", len(ctx.options_all))
+            log.info("O12: Loaded options for %d tickers from S3 archive", len(ctx.options_all))
         else:
-            ctx.options_all = fetch_options_features(ctx.tickers, reference_date=ctx.date_str)
-            log.info("O12: Fetched options features for %d tickers via yfinance", len(ctx.options_all))
+            log.warning(
+                "O12: No options snapshot at archive/options/%s.json "
+                "(features will use defaults)", ctx.date_str,
+            )
     except Exception as exc:
-        log.warning("O12: Options features fetch failed (features will use defaults): %s", exc)
+        log.warning("O12: Options archive read failed (features will use defaults): %s", exc)
 
     # Fundamentals — read from S3 cache (written weekly by DataPhase1)
     try:
