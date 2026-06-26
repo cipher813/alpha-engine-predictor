@@ -22,19 +22,12 @@ import logging
 import os
 import time
 
-import arcticdb as adb
 import pandas as pd
 
 log = logging.getLogger(__name__)
 
 DEFAULT_BUCKET = "alpha-engine-research"
 ARCTIC_PREFIX = "arcticdb"
-
-
-def _get_arctic(bucket: str) -> adb.Arctic:
-    """Create ArcticDB connection via the lib chokepoint (L2771)."""
-    from alpha_engine_lib.arcticdb import open_arctic
-    return open_arctic(bucket)
 
 
 def download_from_arctic(
@@ -57,9 +50,9 @@ def download_from_arctic(
     local_dir = str(local_dir)
     os.makedirs(local_dir, exist_ok=True)
 
-    arctic = _get_arctic(bucket)
-    universe = arctic.get_library("universe")
-    macro_lib = arctic.get_library("macro")
+    from alpha_engine_lib.arcticdb import open_universe_lib, open_macro_lib
+    universe = open_universe_lib(bucket)
+    macro_lib = open_macro_lib(bucket)
 
     n_written = 0
 

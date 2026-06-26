@@ -70,10 +70,9 @@ def pull_from_arcticdb(local_dir: Path) -> int:
     import pandas as pd
     import boto3
 
-    from alpha_engine_lib.arcticdb import open_arctic
-    arctic = open_arctic(BUCKET)
-    universe = arctic.get_library("universe")
-    macro_lib = arctic.get_library("macro")
+    from alpha_engine_lib.arcticdb import open_universe_lib, open_macro_lib
+    universe = open_universe_lib(BUCKET)
+    macro_lib = open_macro_lib(BUCKET)
 
     # Universe ticker sample
     all_syms = universe.list_symbols()
