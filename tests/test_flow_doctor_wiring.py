@@ -148,6 +148,21 @@ class TestFlowDoctorYamlPresence:
         resolved = zoo_path.resolve().parent.parent / "flow-doctor-model-zoo.yaml"
         assert resolved.is_file(), f"training/model_zoo.py resolves to {resolved}"
 
+    def test_regime_yaml_at_repo_root_exists(self):
+        assert (REPO_ROOT / "flow-doctor-regime.yaml").is_file()
+
+    def test_yaml_path_resolved_by_regime_handler_exists(self):
+        # The weekly RegimeSubstrate Lambda mirrors inference's
+        # LAMBDA_TASK_ROOT-or-two-dirs-up resolution → flow-doctor-regime.yaml.
+        handler_path = REPO_ROOT / "regime" / "handler.py"
+        resolved = Path(os.path.dirname(os.path.dirname(os.path.abspath(handler_path)))) / "flow-doctor-regime.yaml"
+        assert resolved.is_file(), f"regime/handler.py resolves to {resolved}"
+
+    def test_yaml_path_resolved_by_retrospective_eval_handler_exists(self):
+        handler_path = REPO_ROOT / "regime" / "retrospective_eval_handler.py"
+        resolved = Path(os.path.dirname(os.path.dirname(os.path.abspath(handler_path)))) / "flow-doctor-regime.yaml"
+        assert resolved.is_file(), f"regime/retrospective_eval_handler.py resolves to {resolved}"
+
 
 class TestFlowDoctorYamlSchema:
     """Both yamls must declare keys consistent with the lib contract."""

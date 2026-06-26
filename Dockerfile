@@ -67,6 +67,7 @@ COPY regime/ regime/
 # spot, not Lambda; that yaml is read from the repo root via the local
 # checkout that spot_train.sh sets up.)
 COPY flow-doctor.yaml ./
+COPY flow-doctor-regime.yaml ./
 
 # Lambda handler entry point
 CMD ["inference.handler.handler"]

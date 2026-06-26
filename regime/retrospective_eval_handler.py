@@ -66,7 +66,7 @@ from botocore.exceptions import ClientError
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from alpha_engine_lib.logging import monitor_handler
+from nousergon_lib.logging import monitor_handler, setup_logging
 from regime.features import (
     DEFAULT_PRICE_CACHE_PREFIX,
     fetch_macro_feature_history,
@@ -83,6 +83,25 @@ from regime.retrospective_eval import (
 )
 from regime.substrate import DEFAULT_S3_BUCKET
 
+
+# Structured logging + flow-doctor. setup_logging attaches a FlowDoctorHandler
+# at ERROR (off under pytest) so every log.error() in this regime Lambda routes
+# through flow-doctor's capture -> dedupe -> alert dispatch. flow-doctor-regime.yaml
+# ships at the Lambda task root (Dockerfile COPY); ${VAR} secrets come from the
+# Lambda --environment block. Mirrors inference/handler.py.
+_FLOW_DOCTOR_EXCLUDE_PATTERNS: list[str] = []
+_FLOW_DOCTOR_YAML = os.path.join(
+    os.environ.get(
+        "LAMBDA_TASK_ROOT",
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    ),
+    "flow-doctor-regime.yaml",
+)
+setup_logging(
+    "predictor-regime",
+    flow_doctor_yaml=_FLOW_DOCTOR_YAML,
+    exclude_patterns=_FLOW_DOCTOR_EXCLUDE_PATTERNS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -334,8 +353,8 @@ def produce_t1_eval(
         rolling_window_weeks=rolling_window_weeks,
     )
 
-    from alpha_engine_lib.dates import now_dual
-    from alpha_engine_lib.eval_artifacts import new_eval_run_id
+    from nousergon_lib.dates import now_dual
+    from nousergon_lib.eval_artifacts import new_eval_run_id
 
     dual = now_dual()
     run_id = new_eval_run_id()
@@ -374,7 +393,7 @@ def _write_t1_eval_artifact(
     forensic ``{prefix}/{run_id}.json`` always; ``{prefix}/latest.json``
     sidecar with summary headlines.
     """
-    from alpha_engine_lib.eval_artifacts import (
+    from nousergon_lib.eval_artifacts import (
         eval_artifact_key,
         eval_latest_key,
     )

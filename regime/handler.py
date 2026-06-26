@@ -65,7 +65,7 @@ from regime.features import (
     current_features_from_history,
     fetch_macro_feature_history,
 )
-from alpha_engine_lib.logging import monitor_handler
+from nousergon_lib.logging import monitor_handler, setup_logging
 from regime.hmm import HMMRegimeClassifier
 from regime.substrate import (
     DEFAULT_S3_BUCKET,
@@ -75,6 +75,25 @@ from regime.substrate import (
     write_regime_substrate,
 )
 
+
+# Structured logging + flow-doctor. setup_logging attaches a FlowDoctorHandler
+# at ERROR (off under pytest) so every log.error() in this regime Lambda routes
+# through flow-doctor's capture -> dedupe -> alert dispatch. flow-doctor-regime.yaml
+# ships at the Lambda task root (Dockerfile COPY); ${VAR} secrets come from the
+# Lambda --environment block. Mirrors inference/handler.py.
+_FLOW_DOCTOR_EXCLUDE_PATTERNS: list[str] = []
+_FLOW_DOCTOR_YAML = os.path.join(
+    os.environ.get(
+        "LAMBDA_TASK_ROOT",
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    ),
+    "flow-doctor-regime.yaml",
+)
+setup_logging(
+    "predictor-regime",
+    flow_doctor_yaml=_FLOW_DOCTOR_YAML,
+    exclude_patterns=_FLOW_DOCTOR_EXCLUDE_PATTERNS,
+)
 
 logger = logging.getLogger(__name__)
 

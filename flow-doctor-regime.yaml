@@ -1,0 +1,20 @@
+flow_name: predictor-regime
+repo: nousergon/crucible-predictor
+owner: "@brianmcmahon"
+notify:
+  - type: email
+    sender: ${EMAIL_SENDER}
+    recipients: ${EMAIL_RECIPIENTS}
+    smtp_host: smtp.gmail.com
+    smtp_port: 587
+    smtp_password: ${GMAIL_APP_PASSWORD}
+  - type: s3
+    bucket: alpha-engine-research
+    subsystem: predictor
+store:
+  type: sqlite
+  path: /tmp/flow_doctor.db
+dedup_cooldown_minutes: 60
+dependencies: []
+rate_limits:
+  max_alerts_per_day: 10
