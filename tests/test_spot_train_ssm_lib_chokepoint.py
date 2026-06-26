@@ -79,11 +79,18 @@ def test_run_ssm_uses_lib_dispatcher():
         "and delegate the body to the lib CLI."
     )
     body = m.group(0)
-    assert "alpha_engine_lib.ssm_dispatcher" in body, (
-        "run_ssm() body does not reference alpha_engine_lib.ssm_dispatcher. "
+    assert "nousergon_lib.ssm_dispatcher" in body, (
+        "run_ssm() body does not reference nousergon_lib.ssm_dispatcher. "
         "The 2026-05-27 L342 PR 4 lift replaced the inline aws-ssm-send-command "
-        "+ poll body with `python -m alpha_engine_lib.ssm_dispatcher run "
-        "--script-stdin`. Re-introducing the inline form undoes the lift."
+        "+ poll body with `python -m nousergon_lib.ssm_dispatcher run "
+        "--script-stdin`. Re-introducing the inline form undoes the lift. "
+        "(Package renamed alpha_engine_lib -> nousergon_lib at lib 0.60.0; "
+        "config#1245 — '-m alpha_engine_lib' breaks under runpy on crossed boxes.)"
+    )
+    assert "-m alpha_engine_lib." not in body, (
+        "run_ssm() still invokes 'python -m alpha_engine_lib.<mod>'. The "
+        "deprecated alias shim lacks runpy's get_code, so '-m' dies under "
+        "runpy on boxes crossed to nousergon-lib >=0.60.x; use nousergon_lib."
     )
     assert "--script-stdin" in body, (
         "run_ssm() must pipe the script body via --script-stdin so the "
@@ -229,7 +236,7 @@ def test_spot_workloads_ship_log_on_exit_via_lib():
     text = _SCRIPT.read_text()
     for slug in _SPOT_WORKLOAD_SLUGS:
         wrap = (
-            f"alpha_engine_lib.ssm_log_capture run --slug {slug} "
+            f"nousergon_lib.ssm_log_capture run --slug {slug} "
             f"--log /var/log/{slug}.log"
         )
         assert wrap in text, (
@@ -239,7 +246,7 @@ def test_spot_workloads_ship_log_on_exit_via_lib():
             "get-command-invocation, which returns EMPTY on instance death "
             "(OOM RC=-1) and is destroyed when the dispatcher cleanup EXIT "
             "trap terminates the spot. Route the workload through "
-            "`$PY -m alpha_engine_lib.ssm_log_capture run --slug <X> "
+            "`$PY -m nousergon_lib.ssm_log_capture run --slug <X> "
             "--log /var/log/<X>.log --bucket \"$S3_BUCKET\" -- $PY /tmp/<X>.py`."
         )
         # The wrapper must pass --bucket so the ship targets the right bucket.
@@ -323,7 +330,7 @@ def test_model_zoo_heredoc_wires_flow_doctor_setup_logging():
     start = text.find("cat > /tmp/spot-model-zoo-weekly.py <<'PYEOF'")
     assert start != -1, "model-zoo workload heredoc not found in spot_train.sh"
     body = text[start:]
-    end = body.find("PYEOF\n$PY -m alpha_engine_lib.ssm_log_capture")
+    end = body.find("PYEOF\n$PY -m nousergon_lib.ssm_log_capture")
     assert end != -1, "model-zoo workload heredoc terminator not found"
     body = body[:end]
     assert "from alpha_engine_lib.logging import setup_logging" in body, (

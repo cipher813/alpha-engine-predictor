@@ -58,8 +58,11 @@ _FLOOR_REPOS = (
 # `alpha_engine_lib.preflight` alongside `_fetch_origin_main_sha` — the regex is
 # already duplicated across repo test suites (chokepoint rule). Deferred: needs
 # a lib release + cross-repo re-pin.
+# Distribution name renamed alpha-engine-lib -> nousergon-lib at lib 0.60.0
+# (config#1245 / #1172). Accept either spelling so the cross-repo drift probe
+# keeps parsing pins as the fleet crosses one repo at a time.
 _LIB_PIN_RE = re.compile(
-    r"alpha-engine-lib\[[^\]]*\]\s*@\s*git\+https://github\.com/"
+    r"(?:alpha-engine-lib|nousergon-lib)\[[^\]]*\]\s*@\s*git\+https://github\.com/"
     r"nousergon/nousergon-lib@(v[0-9]+\.[0-9]+\.[0-9]+)"
 )
 

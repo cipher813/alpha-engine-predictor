@@ -184,12 +184,12 @@ if ! git diff --quiet HEAD -- config.py config/predictor.sample.yaml training/tr
 fi
 
 # ── Launch spot instance ──────────────────────────────────────────────────────
-# Capacity-resilient launch via alpha_engine_lib.ec2_spot (lib v0.26.0+).
+# Capacity-resilient launch via nousergon_lib.ec2_spot (lib v0.26.0+).
 # Rotates (instance_type × subnet) on InsufficientInstanceCapacity etc.
 # Replaces the broken-by-design hardcoded single-subnet + single-instance-type
 # pattern (2026-05-22 incident — Evaluator failed in sibling backtester spot).
 echo "==> Requesting spot instance (lib CLI rotation: types=[$INSTANCE_TYPES], subnets=[$SUBNETS])..."
-INSTANCE_ID=$("$LIB_PYTHON" -m alpha_engine_lib.ec2_spot launch \
+INSTANCE_ID=$("$LIB_PYTHON" -m nousergon_lib.ec2_spot launch \
   --types "$INSTANCE_TYPES" \
   --subnets "$SUBNETS" \
   --image-id "$AMI_ID" \
@@ -217,13 +217,13 @@ cleanup() {
   echo ""
   # Belt-and-suspenders (STEP 3): BEFORE terminating the spot, confirm where
   # each workload's spot-side log landed in S3. The spot SELF-SHIP via
-  # alpha_engine_lib.ssm_log_capture (each workload heredoc) is PRIMARY — this
+  # nousergon_lib.ssm_log_capture (each workload heredoc) is PRIMARY — this
   # is only a bounded best-effort confirmation + a one-hop pointer in the
   # dispatcher log so an operator triaging a failure (esp. an OOM RC=-1 where
   # SSM get-command-invocation returns empty) can find the full log immediately.
   # Bounded: a single short `aws s3 ls` per slug, all failures swallowed, never
   # blocks teardown. Key shape: _ssm_logs/{slug}/{YYYY-MM-DD}/{host}-{HHMMSSZ}.log
-  # (alpha_engine_lib.ssm_log_capture._exit_key). The exit-time UTC date is the
+  # (nousergon_lib.ssm_log_capture._exit_key). The exit-time UTC date is the
   # key component; on a run straddling UTC midnight the log lands under the exit
   # date, so probe today's date.
   local _logdate_now _hit
@@ -278,7 +278,7 @@ done
 # **2026-05-27 — Lib chokepoint lift (ROADMAP L342 PR 4).** This helper
 # was the 54-line inline ``aws ssm send-command`` + poll + stream + S3
 # capture bash function that L342 was explicitly chartered to retire.
-# The lib equivalent ships in ``alpha_engine_lib.ssm_dispatcher`` (lib
+# The lib equivalent ships in ``nousergon_lib.ssm_dispatcher`` (lib
 # v0.35.0+, [#73](https://github.com/nousergon/nousergon-lib/pull/73))
 # with identical contract: base64-wrap → SendCommand → poll → stream
 # StandardOutputContent delta → fetch StandardErrorContent on terminal
@@ -303,7 +303,7 @@ done
 # {date}.json key shape would otherwise clobber within a shared prefix.
 run_ssm() {
   local description="$1" script="$2" timeout_s="${3:-3600}"
-  printf '%s' "$script" | "$LIB_PYTHON" -m alpha_engine_lib.ssm_dispatcher run \
+  printf '%s' "$script" | "$LIB_PYTHON" -m nousergon_lib.ssm_dispatcher run \
     --instance-id "$INSTANCE_ID" \
     --description "predictor-training: $description" \
     --timeout "$timeout_s" \
@@ -481,7 +481,7 @@ command -v python3.12 >/dev/null && PY=python3.12 || PY=python3
 # its stdout/stderr lived ONLY in SSM get-command-invocation, which returns
 # EMPTY when the spot dies mid-run e.g. OOM RC=-1 and is destroyed when the
 # dispatcher cleanup EXIT trap terminates the box. Route the workload through
-# the lib chokepoint alpha_engine_lib.ssm_log_capture: it tees combined
+# the lib chokepoint nousergon_lib.ssm_log_capture: it tees combined
 # stdout+stderr to a spot-local logfile AND ships that logfile to S3 on EXIT
 # including SIGKILL of the workload BEFORE the dispatcher tears the box down,
 # then propagates the workload exit code verbatim so set -eo pipefail and the
@@ -563,7 +563,7 @@ if noise:
     print(f'  Noise features: {noise}')
 print('=' * 60)
 PYEOF
-$PY -m alpha_engine_lib.ssm_log_capture run --slug spot-smoke --log /var/log/spot-smoke.log --bucket "$S3_BUCKET" -- $PY /tmp/spot-smoke.py
+$PY -m nousergon_lib.ssm_log_capture run --slug spot-smoke --log /var/log/spot-smoke.log --bucket "$S3_BUCKET" -- $PY /tmp/spot-smoke.py
 SMOKE
 )" 1800
   echo "Smoke test complete."
@@ -596,7 +596,7 @@ export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_
 cd /home/ec2-user/predictor
 command -v python3.12 >/dev/null && PY=python3.12 || PY=python3
 # Spot-side log durability — see the smoke step comment. Route the workload
-# through alpha_engine_lib.ssm_log_capture so the model-zoo log reaches S3 on
+# through nousergon_lib.ssm_log_capture so the model-zoo log reaches S3 on
 # EXIT including OOM-kill before the dispatcher terminates the box. Paren-free
 # and apostrophe-free per the bash 3.2 note above.
 cat > /tmp/spot-model-zoo-weekly.py <<'PYEOF'
@@ -656,7 +656,7 @@ print(f'  Winner:         {board.get("winner_version_id")}')
 print(f'  Promoted:       {board.get("promoted")}')
 print('=' * 60)
 PYEOF
-$PY -m alpha_engine_lib.ssm_log_capture run --slug spot-model-zoo-weekly --log /var/log/spot-model-zoo-weekly.log --bucket "$S3_BUCKET" -- $PY /tmp/spot-model-zoo-weekly.py
+$PY -m nousergon_lib.ssm_log_capture run --slug spot-model-zoo-weekly --log /var/log/spot-model-zoo-weekly.log --bucket "$S3_BUCKET" -- $PY /tmp/spot-model-zoo-weekly.py
 ZOO
 )" "${MAX_RUNTIME_SECONDS}"
 
@@ -738,7 +738,7 @@ print('=' * 60)
 print('  MODEL-ZOO TRAIN-SPEC ' + spec_id + ' COMPLETE')
 print('=' * 60)
 PYEOF
-$PY -m alpha_engine_lib.ssm_log_capture run --slug spot-model-zoo-spec --log /var/log/spot-model-zoo-spec.log --bucket "$S3_BUCKET" -- $PY /tmp/spot-model-zoo-spec.py
+$PY -m nousergon_lib.ssm_log_capture run --slug spot-model-zoo-spec --log /var/log/spot-model-zoo-spec.log --bucket "$S3_BUCKET" -- $PY /tmp/spot-model-zoo-spec.py
 ZOOSPEC
 )" "${MAX_RUNTIME_SECONDS}"
 
@@ -817,7 +817,7 @@ print('  Winner:         ' + str(board.get('winner_version_id')))
 print('  Promoted:       ' + str(board.get('promoted')))
 print('=' * 60)
 PYEOF
-$PY -m alpha_engine_lib.ssm_log_capture run --slug spot-model-zoo-select --log /var/log/spot-model-zoo-select.log --bucket "$S3_BUCKET" -- $PY /tmp/spot-model-zoo-select.py
+$PY -m nousergon_lib.ssm_log_capture run --slug spot-model-zoo-select --log /var/log/spot-model-zoo-select.log --bucket "$S3_BUCKET" -- $PY /tmp/spot-model-zoo-select.py
 ZOOSEL
 )" "${MAX_RUNTIME_SECONDS}"
 
@@ -848,7 +848,7 @@ command -v python3.12 >/dev/null && PY=python3.12 || PY=python3
 # Spot-side log durability — this is THE workload whose log was lost on the
 # off-cycle full-only OOM RC=-1 incident the python ran inline via $PY - so its
 # full training log lived only in SSM get-command-invocation which returns empty
-# on instance death. Route it through alpha_engine_lib.ssm_log_capture: tee
+# on instance death. Route it through nousergon_lib.ssm_log_capture: tee
 # combined stdout+stderr to /var/log/spot-full-training.log AND ship to S3 on
 # EXIT including SIGKILL BEFORE the dispatcher cleanup EXIT trap terminates the
 # box, propagating the workload exit code so set -eo pipefail and the SF still
@@ -905,7 +905,7 @@ print(f'  Elapsed:        {result.get("elapsed_s", "n/a")}s')
 print(f'  Slim cache:     {result.get("slim_cache_tickers", "n/a")} tickers')
 print('=' * 60)
 PYEOF
-$PY -m alpha_engine_lib.ssm_log_capture run --slug spot-full-training --log /var/log/spot-full-training.log --bucket "$S3_BUCKET" -- $PY /tmp/spot-full-training.py
+$PY -m nousergon_lib.ssm_log_capture run --slug spot-full-training --log /var/log/spot-full-training.log --bucket "$S3_BUCKET" -- $PY /tmp/spot-full-training.py
 TRAIN
 )" "${MAX_RUNTIME_SECONDS}"
 

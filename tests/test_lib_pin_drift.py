@@ -35,6 +35,17 @@ def test_parse_pin_happy():
     assert lpd._parse_pin(line) == "v0.53.0"
 
 
+def test_parse_pin_renamed_dist_nousergon_lib():
+    # Dist renamed alpha-engine-lib -> nousergon-lib at lib 0.60.0
+    # (config#1245). The drift probe must parse the new spelling so it keeps
+    # working as the fleet crosses one repo at a time.
+    line = (
+        "nousergon-lib[arcticdb,flow-doctor,quant-xs] @ "
+        "git+https://github.com/nousergon/nousergon-lib@v0.60.2"
+    )
+    assert lpd._parse_pin(line) == "v0.60.2"
+
+
 def test_parse_pin_miss_returns_none():
     assert lpd._parse_pin("requests==2.31.0\nnumpy>=1.26") is None
 

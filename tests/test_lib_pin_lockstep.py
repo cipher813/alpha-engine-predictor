@@ -24,8 +24,11 @@ from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
+# Distribution name renamed alpha-engine-lib -> nousergon-lib at lib 0.60.0
+# (config#1245 / #1172). Accept either spelling across the crossing; the
+# version-equality assertion below is the load-bearing part.
 _LIB_PIN_RE = re.compile(
-    r"alpha-engine-lib\[[^\]]*\]\s*@\s*git\+https://github\.com/nousergon/nousergon-lib@(v[0-9]+\.[0-9]+\.[0-9]+)"
+    r"(?:alpha-engine-lib|nousergon-lib)\[[^\]]*\]\s*@\s*git\+https://github\.com/nousergon/nousergon-lib@(v[0-9]+\.[0-9]+\.[0-9]+)"
 )
 
 
