@@ -55,6 +55,68 @@ LAMBDA_EXECUTION_ROLE_NAME="alpha-engine-predictor-role"
 IMAGE_TAG="latest"
 DRY_RUN=false
 
+# ── Canary status contract (config#853) ──────────────────────────────────────
+# Post-deploy canaries invoke the freshly-published version with a dry_run
+# payload and gate promotion on the response's `statusCode`. The acceptance
+# decision is centralised here so all three canary sites (inference, regime
+# substrate, regime retrospective-eval) share ONE producer-status contract and
+# a future skip-path added to any handler inherits correct rollback semantics
+# by default.
+#
+# Producer-status contract (verified against the handlers in this repo):
+#   inference/handler.py            — lambda_handler
+#   regime/handler.py               — lambda_handler
+#   regime/retrospective_eval_handler.py — lambda_handler
+#
+#   200          — SUCCESS. The dry_run path returns 200 for both a real run
+#                  AND every cold-start / empty-history no-op (the handlers
+#                  fall through to the same 200 return when there is nothing
+#                  to process). This is the only success code emitted today.
+#   204          — NO-OP success (allowlisted, defensive). Reserved for a
+#                  future "nothing to do" skip-path (HTTP No Content) so such
+#                  a path does NOT false-red the deploy and roll back a
+#                  perfectly good image. No handler emits this yet.
+#   skipped      — NO-OP success (allowlisted, defensive). String form of the
+#                  same no-op contract, mirroring nousergon-data #295's
+#                  status='SKIPPED' allowlist. Matched against the payload's
+#                  `statusCode` field (a future handler may set
+#                  statusCode="skipped" on a no-op). No handler emits this yet.
+#
+#   400 / 500 / any other value — REAL ERROR. 400 = bad request (e.g. the
+#                  deprecated `action=train` route, unknown regime action);
+#                  500 / unhandled exception (FunctionError, checked
+#                  separately) = genuine failure. These MUST roll back.
+#
+# Mirrors the explicit-allowlist pattern in
+# nousergon-data/infrastructure/deploy.sh (config "data #295"): enumerate the
+# legitimate no-op statuses rather than blanket-accepting non-200, so a real
+# error code can never masquerade as a no-op.
+CANARY_NOOP_STATUSES=("200" "204" "skipped")
+
+# canary_status_ok <statusCode>
+#   Exit 0 (accept → promote) iff <statusCode> is in the allowlist above.
+#   Exit 1 (reject → roll back) for every other value, including the empty
+#   string / "0" that the payload parsers emit on a malformed response.
+canary_status_ok() {
+  local status="$1"
+  local allowed
+  for allowed in "${CANARY_NOOP_STATUSES[@]}"; do
+    if [ "$status" = "$allowed" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# When sourced for unit testing (tests/test_canary_status_allowlist.py sets
+# CANARY_LIB_SOURCE_ONLY=1), stop here: expose the helper without running the
+# deploy. Placed BEFORE flag parsing so the test can source the script without
+# its positional args being misread as deploy flags. `return` is only valid in
+# a sourced context, so guard it.
+if [ "${CANARY_LIB_SOURCE_ONLY:-0}" = "1" ]; then
+  return 0 2>/dev/null || exit 0
+fi
+
 # Parse flags
 for arg in "$@"; do
   case "$arg" in
@@ -219,7 +281,10 @@ CANARY_STATUS=$(python3 -c "import json; d=json.load(open('$CANARY_OUT')); print
 CANARY_ERR_MSG=$(python3 -c "import json; d=json.load(open('$CANARY_OUT')); print(d.get('errorMessage','') or d.get('body',''))" 2>/dev/null || echo "")
 rm -f "$CANARY_OUT"
 
-if [ -n "$CANARY_FUNC_ERR" ] || [ "$CANARY_STATUS" != "200" ]; then
+# Promote on FunctionError-free response whose statusCode is in the
+# canary no-op allowlist (200 / 204 / skipped — see canary_status_ok above);
+# roll back on a genuine error code (400 / 500 / unhandled exception).
+if [ -n "$CANARY_FUNC_ERR" ] || ! canary_status_ok "$CANARY_STATUS"; then
   echo ""
   echo "ERROR: Canary failed — refusing to promote :${VERSION} to live."
   echo "       FunctionError : ${CANARY_FUNC_ERR:-<none>}"
@@ -331,7 +396,9 @@ echo "  Found (or freshly created) — updating..."
   REGIME_ERR_MSG=$(python3 -c "import json; d=json.load(open('$REGIME_CANARY_OUT')); print(d.get('errorMessage','') or d.get('body',''))" 2>/dev/null || echo "")
   rm -f "$REGIME_CANARY_OUT"
 
-  if [ -n "$REGIME_FUNC_ERR" ] || [ "$REGIME_STATUS" != "200" ]; then
+  # Same no-op allowlist as the inference canary (200 / 204 / skipped —
+  # see canary_status_ok above); roll back only on a genuine error code.
+  if [ -n "$REGIME_FUNC_ERR" ] || ! canary_status_ok "$REGIME_STATUS"; then
     echo ""
     echo "ERROR: Regime canary failed — refusing to promote :${REGIME_VERSION} to live."
     echo "       FunctionError : ${REGIME_FUNC_ERR:-<none>}"
@@ -433,7 +500,9 @@ echo "  Found (or freshly created) — updating..."
   REGIME_EVAL_ERR_MSG=$(python3 -c "import json; d=json.load(open('$REGIME_EVAL_CANARY_OUT')); print(d.get('errorMessage','') or d.get('body',''))" 2>/dev/null || echo "")
   rm -f "$REGIME_EVAL_CANARY_OUT"
 
-  if [ -n "$REGIME_EVAL_FUNC_ERR" ] || [ "$REGIME_EVAL_STATUS" != "200" ]; then
+  # Same no-op allowlist as the inference + regime canaries (200 / 204 /
+  # skipped — see canary_status_ok above); roll back only on a genuine error.
+  if [ -n "$REGIME_EVAL_FUNC_ERR" ] || ! canary_status_ok "$REGIME_EVAL_STATUS"; then
     echo ""
     echo "ERROR: Regime-eval canary failed — refusing to promote :${REGIME_EVAL_VERSION} to live."
     echo "       FunctionError : ${REGIME_EVAL_FUNC_ERR:-<none>}"
