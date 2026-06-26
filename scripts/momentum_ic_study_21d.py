@@ -35,12 +35,11 @@ import pandas as pd
 from scipy.stats import spearmanr
 
 BUCKET = "alpha-engine-research"
-# Wave-3 reader migration (ROADMAP L1401): try the new prefix first, fall
-# back to legacy during the soak. Post-PR4 cutover only the first entry
-# survives. (This script is local-only / untracked — see Wave-3 PR3-wave-2
-# PR notes for the discovery context.)
+# Wave-3 PR4 cutover (DONE): price_cache parquets live at
+# ``reference/price_cache/`` only — the legacy ``predictor/price_cache/`` tree
+# is removed live via ``aws s3 rm``, so the fallback entry is dropped.
 PRICE_CACHE_PREFIXES: tuple[str, ...] = (
-    "reference/price_cache/", "predictor/price_cache/",
+    "reference/price_cache/",
 )
 # sector_map.json is co-located inside the price_cache prefix and arrives
 # as part of the paginator-driven sync; the read in ``main()`` just opens

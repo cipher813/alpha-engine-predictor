@@ -10,6 +10,7 @@ import pytest
 from regime.features import (
     DEFAULT_PRICE_CACHE_PREFIX,
     SOURCE_TICKERS,
+    _PRICE_CACHE_NEW_PREFIX,
     current_features_from_history,
     fetch_macro_feature_history,
 )
@@ -69,7 +70,7 @@ def _seed_full_price_cache(s3: _FakeS3, bucket: str, prefix: str) -> None:
 
 def test_fetch_returns_weekly_dataframe_with_required_columns() -> None:
     s3 = _FakeS3()
-    _seed_full_price_cache(s3, "test-bucket", DEFAULT_PRICE_CACHE_PREFIX)
+    _seed_full_price_cache(s3, "test-bucket", _PRICE_CACHE_NEW_PREFIX)
     df = fetch_macro_feature_history(s3_client=s3, bucket="test-bucket")
     expected_cols = {
         "spy_20d_return", "vix_level", "vix_term_slope",
@@ -85,7 +86,7 @@ def test_fetch_hy_oas_converted_to_basis_points() -> None:
     Fetcher multiplies by 100 to land in basis points (4% → 400 bps).
     Synthetic data sets HYOAS Close = 4.0; expected output mean ~400."""
     s3 = _FakeS3()
-    _seed_full_price_cache(s3, "test-bucket", DEFAULT_PRICE_CACHE_PREFIX)
+    _seed_full_price_cache(s3, "test-bucket", _PRICE_CACHE_NEW_PREFIX)
     df = fetch_macro_feature_history(s3_client=s3, bucket="test-bucket")
     assert 350 < df["hy_oas_bps"].mean() < 450, (
         f"expected ~400 bps (4.0% × 100), got {df['hy_oas_bps'].mean():.1f}"
@@ -94,7 +95,7 @@ def test_fetch_hy_oas_converted_to_basis_points() -> None:
 
 def test_fetch_yield_curve_slope_is_difference() -> None:
     s3 = _FakeS3()
-    _seed_full_price_cache(s3, "test-bucket", DEFAULT_PRICE_CACHE_PREFIX)
+    _seed_full_price_cache(s3, "test-bucket", _PRICE_CACHE_NEW_PREFIX)
     df = fetch_macro_feature_history(s3_client=s3, bucket="test-bucket")
     # TNX synthetic mean ≈ 4.0, TWO ≈ 3.5 → slope ≈ 0.5
     assert 0.3 < df["yield_curve_slope"].mean() < 0.7
@@ -102,7 +103,7 @@ def test_fetch_yield_curve_slope_is_difference() -> None:
 
 def test_fetch_vix_term_slope_is_difference() -> None:
     s3 = _FakeS3()
-    _seed_full_price_cache(s3, "test-bucket", DEFAULT_PRICE_CACHE_PREFIX)
+    _seed_full_price_cache(s3, "test-bucket", _PRICE_CACHE_NEW_PREFIX)
     df = fetch_macro_feature_history(s3_client=s3, bucket="test-bucket")
     # VIX3M ≈ 19, VIX ≈ 18 → term slope ≈ 1.0
     assert 0.5 < df["vix_term_slope"].mean() < 1.5
@@ -112,7 +113,7 @@ def test_fetch_market_breadth_is_nan_pending_source() -> None:
     """Breadth source lands in a follow-up PR; column must be NaN today
     so downstream consumers see absence explicitly, not a spurious 0."""
     s3 = _FakeS3()
-    _seed_full_price_cache(s3, "test-bucket", DEFAULT_PRICE_CACHE_PREFIX)
+    _seed_full_price_cache(s3, "test-bucket", _PRICE_CACHE_NEW_PREFIX)
     df = fetch_macro_feature_history(s3_client=s3, bucket="test-bucket")
     assert df["market_breadth"].isna().all()
 
@@ -127,9 +128,9 @@ def test_fetch_resilient_to_missing_single_ticker() -> None:
     """Missing one of the 6 tickers must not crash the fetch — the
     feature derived from it goes NaN, others still populate."""
     s3 = _FakeS3()
-    _seed_full_price_cache(s3, "test-bucket", DEFAULT_PRICE_CACHE_PREFIX)
+    _seed_full_price_cache(s3, "test-bucket", _PRICE_CACHE_NEW_PREFIX)
     # Remove VIX3M — term slope should become NaN, other features OK
-    del s3._objects[("test-bucket", f"{DEFAULT_PRICE_CACHE_PREFIX}VIX3M.parquet")]
+    del s3._objects[("test-bucket", f"{_PRICE_CACHE_NEW_PREFIX}VIX3M.parquet")]
     df = fetch_macro_feature_history(s3_client=s3, bucket="test-bucket")
     assert df["vix_term_slope"].isna().all()
     assert not df["vix_level"].isna().all()
@@ -138,7 +139,7 @@ def test_fetch_resilient_to_missing_single_ticker() -> None:
 
 def test_fetch_lookback_weeks_truncates() -> None:
     s3 = _FakeS3()
-    _seed_full_price_cache(s3, "test-bucket", DEFAULT_PRICE_CACHE_PREFIX)
+    _seed_full_price_cache(s3, "test-bucket", _PRICE_CACHE_NEW_PREFIX)
     df_full = fetch_macro_feature_history(s3_client=s3, bucket="test-bucket")
     df_tail = fetch_macro_feature_history(s3_client=s3, bucket="test-bucket", lookback_weeks=20)
     assert len(df_tail) == 20
@@ -149,7 +150,7 @@ def test_fetch_as_of_truncates_right_edge() -> None:
     """as_of bounds the maximum date in the output — used by the
     backfill script to reproduce historical snapshots."""
     s3 = _FakeS3()
-    _seed_full_price_cache(s3, "test-bucket", DEFAULT_PRICE_CACHE_PREFIX)
+    _seed_full_price_cache(s3, "test-bucket", _PRICE_CACHE_NEW_PREFIX)
     as_of = pd.Timestamp("2025-06-01")
     df = fetch_macro_feature_history(s3_client=s3, bucket="test-bucket", as_of=as_of)
     assert df.index.max() <= as_of
@@ -195,16 +196,16 @@ def test_source_tickers_match_data_side_convention() -> None:
 # ── Wave-3 reader migration (ROADMAP L1401) ─────────────────────────────────
 
 
-def test_wave3_reader_prefers_new_prefix_over_legacy() -> None:
-    """During the producer write-both soak (alpha-engine-data#270 shipped
-    2026-05-19; ≥1-week soak), both prefixes hold byte-equal copies. The
-    reader MUST consult ``reference/price_cache/`` first so the new home
-    is exercised end-to-end before PR4 deletes legacy."""
+def test_wave3_reader_resolves_reference_and_ignores_legacy() -> None:
+    """Wave-3 PR4 cutover (DONE): the reader resolves the price_cache parquet
+    from ``reference/price_cache/`` ONLY. The legacy ``predictor/price_cache/``
+    prefix is dropped from the fallback chain and must NOT be consulted, even
+    if a stale copy still lingers under it pre-``aws s3 rm``."""
     from regime.features import _PRICE_CACHE_NEW_PREFIX, _read_parquet_close
 
     s3 = _FakeS3()
     # Seed the NEW prefix with one Close value, LEGACY with a clearly-
-    # different one. If the reader picked legacy, we'd see 999.
+    # different stale one. If the reader ever picked legacy, we'd see 999.
     new_df = pd.DataFrame(
         {"Close": [100.0]},
         index=pd.to_datetime(["2026-05-19"]),
@@ -220,12 +221,14 @@ def test_wave3_reader_prefers_new_prefix_over_legacy() -> None:
         "SPY", s3_client=s3, bucket="bkt",
         prefix=DEFAULT_PRICE_CACHE_PREFIX,
     )
-    assert s.iloc[0] == 100.0, "reader picked legacy when new was present"
+    assert s.iloc[0] == 100.0, "reader must resolve reference/, never legacy"
 
 
-def test_wave3_reader_falls_back_to_legacy_when_new_missing() -> None:
-    """Early in the soak window the NEW prefix can lag a fresh ticker.
-    The reader must fall back to legacy gracefully."""
+def test_wave3_reader_does_not_fall_back_to_legacy_when_reference_missing() -> None:
+    """Wave-3 PR4 cutover: with the legacy fallback dropped, a miss on
+    ``reference/price_cache/`` is the end of the chain. A parquet present
+    ONLY under the legacy prefix must NOT be found — the reader returns an
+    empty series (callers treat absence as non-fatal)."""
     from regime.features import _read_parquet_close
 
     s3 = _FakeS3()
@@ -233,14 +236,14 @@ def test_wave3_reader_falls_back_to_legacy_when_new_missing() -> None:
         {"Close": [123.0]},
         index=pd.to_datetime(["2026-05-19"]),
     )
-    # Only legacy seeded (no NEW key).
+    # Only legacy seeded (no reference/ key) — post-cutover this is invisible.
     s3.put_parquet("bkt", f"{DEFAULT_PRICE_CACHE_PREFIX}SPY.parquet", legacy_df)
 
     s = _read_parquet_close(
         "SPY", s3_client=s3, bucket="bkt",
         prefix=DEFAULT_PRICE_CACHE_PREFIX,
     )
-    assert s.iloc[0] == 123.0
+    assert s.empty, "legacy-only parquet must be invisible post-cutover"
 
 
 def test_wave3_reader_explicit_custom_prefix_does_not_fall_back() -> None:

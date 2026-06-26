@@ -28,7 +28,7 @@ pytest.importorskip("scipy")
 pytest.importorskip("pyarrow")
 
 
-from regime.features import DEFAULT_PRICE_CACHE_PREFIX
+from regime.features import DEFAULT_PRICE_CACHE_PREFIX, _PRICE_CACHE_NEW_PREFIX
 from regime.substrate import DEFAULT_S3_BUCKET, DEFAULT_S3_PREFIX, write_regime_substrate
 
 # Import script as a module (it has a `if __name__ == "__main__"` guard).
@@ -186,7 +186,7 @@ class TestArtifactExists:
 class TestBackfillOne:
     def test_writes_artifact_for_new_saturday(self) -> None:
         s3 = _FakeS3()
-        _seed_two_regime_price_cache(s3, "test-bucket", DEFAULT_PRICE_CACHE_PREFIX)
+        _seed_two_regime_price_cache(s3, "test-bucket", _PRICE_CACHE_NEW_PREFIX)
         result = bf.backfill_one(
             saturday=Date(2024, 5, 11),
             s3_client=s3,
@@ -202,7 +202,7 @@ class TestBackfillOne:
 
     def test_skips_when_artifact_exists(self) -> None:
         s3 = _FakeS3()
-        _seed_two_regime_price_cache(s3, "test-bucket", DEFAULT_PRICE_CACHE_PREFIX)
+        _seed_two_regime_price_cache(s3, "test-bucket", _PRICE_CACHE_NEW_PREFIX)
         # Pre-seed the artifact
         s3.put_object(Bucket="test-bucket", Key="regime/2405110200.json", Body=b"existing")
         result = bf.backfill_one(
@@ -220,7 +220,7 @@ class TestBackfillOne:
 
     def test_force_overwrites_existing(self) -> None:
         s3 = _FakeS3()
-        _seed_two_regime_price_cache(s3, "test-bucket", DEFAULT_PRICE_CACHE_PREFIX)
+        _seed_two_regime_price_cache(s3, "test-bucket", _PRICE_CACHE_NEW_PREFIX)
         s3.put_object(Bucket="test-bucket", Key="regime/2405110200.json", Body=b"stale")
         result = bf.backfill_one(
             saturday=Date(2024, 5, 11),
@@ -239,7 +239,7 @@ class TestBackfillOne:
 
     def test_dry_run_does_not_write(self) -> None:
         s3 = _FakeS3()
-        _seed_two_regime_price_cache(s3, "test-bucket", DEFAULT_PRICE_CACHE_PREFIX)
+        _seed_two_regime_price_cache(s3, "test-bucket", _PRICE_CACHE_NEW_PREFIX)
         result = bf.backfill_one(
             saturday=Date(2024, 5, 11),
             s3_client=s3,
@@ -258,7 +258,7 @@ class TestBackfillOne:
         not just the writer layer, so a refactor that bypasses the
         writer-side flag still can't drift."""
         s3 = _FakeS3()
-        _seed_two_regime_price_cache(s3, "test-bucket", DEFAULT_PRICE_CACHE_PREFIX)
+        _seed_two_regime_price_cache(s3, "test-bucket", _PRICE_CACHE_NEW_PREFIX)
         # Pre-seed a known latest.json sentinel
         sentinel = b'{"run_id": "LIVE_DO_NOT_OVERWRITE"}'
         s3.put_object(Bucket="test-bucket", Key="regime/latest.json", Body=sentinel)
@@ -300,7 +300,7 @@ class TestBackfillOne:
 class TestRunBackfill:
     def test_processes_all_saturdays_in_range(self) -> None:
         s3 = _FakeS3()
-        _seed_two_regime_price_cache(s3, "test-bucket", DEFAULT_PRICE_CACHE_PREFIX)
+        _seed_two_regime_price_cache(s3, "test-bucket", _PRICE_CACHE_NEW_PREFIX)
         results = bf.run_backfill(
             start=Date(2024, 5, 1),
             end=Date(2024, 5, 31),
@@ -319,7 +319,7 @@ class TestRunBackfill:
         """One bad date must not abort the rest. We patch backfill_one
         to fail on a specific date and verify the others still process."""
         s3 = _FakeS3()
-        _seed_two_regime_price_cache(s3, "test-bucket", DEFAULT_PRICE_CACHE_PREFIX)
+        _seed_two_regime_price_cache(s3, "test-bucket", _PRICE_CACHE_NEW_PREFIX)
 
         real_backfill_one = bf.backfill_one
 
