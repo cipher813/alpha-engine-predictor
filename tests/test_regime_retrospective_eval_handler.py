@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from regime.features import DEFAULT_PRICE_CACHE_PREFIX
+from regime.features import _PRICE_CACHE_NEW_PREFIX
 from regime.retrospective_eval_handler import (
     DEFAULT_RETROSPECTIVE_PREFIX,
     DEFAULT_SIGNALS_PREFIX,
@@ -288,7 +288,7 @@ class TestBuildEvalIndices:
 class TestProduceT1Eval:
     def _setup(self):
         s3 = _FakeS3()
-        _seed_two_regime_price_cache(s3, "test-bucket", DEFAULT_PRICE_CACHE_PREFIX)
+        _seed_two_regime_price_cache(s3, "test-bucket", _PRICE_CACHE_NEW_PREFIX)
         # Seed agent calls spanning the calm + stress halves
         sats = pd.date_range("2024-01-06", periods=40, freq="W-SAT")
         # Match the synthetic price-cache regime structure: first 20
@@ -369,7 +369,7 @@ class TestProduceT1Eval:
         """Lambda runs on a fresh bucket with no signals/ archive yet.
         Should not crash; should write artifact with n_pairings=0."""
         s3 = _FakeS3()
-        _seed_two_regime_price_cache(s3, "test-bucket", DEFAULT_PRICE_CACHE_PREFIX)
+        _seed_two_regime_price_cache(s3, "test-bucket", _PRICE_CACHE_NEW_PREFIX)
         # No agent-call archive seeded
         result = produce_t1_eval(
             s3_client=s3,
@@ -386,7 +386,7 @@ class TestProduceT1Eval:
         # Seed only VIX (no SPY)
         rng = np.random.default_rng(0)
         dates = pd.date_range("2024-01-01", periods=500, freq="B")
-        s3.put_parquet("test-bucket", f"{DEFAULT_PRICE_CACHE_PREFIX}VIX.parquet",
+        s3.put_parquet("test-bucket", f"{_PRICE_CACHE_NEW_PREFIX}VIX.parquet",
                        pd.DataFrame({"Close": rng.normal(15, 3, 500)}, index=dates))
         with pytest.raises(RuntimeError):
             produce_t1_eval(s3_client=s3, bucket="test-bucket")
@@ -407,7 +407,7 @@ class TestLambdaHandler:
         """Patch boto3 to return our fake S3, verify the produce path
         returns the expected response keys."""
         s3 = _FakeS3()
-        _seed_two_regime_price_cache(s3, "test-bucket", DEFAULT_PRICE_CACHE_PREFIX)
+        _seed_two_regime_price_cache(s3, "test-bucket", _PRICE_CACHE_NEW_PREFIX)
         sats = pd.date_range("2024-01-06", periods=20, freq="W-SAT")
         _seed_signals_archive(s3, "test-bucket", list(sats), ["bull"] * 20)
 
@@ -436,7 +436,7 @@ class TestLambdaHandler:
 
     def test_dry_run_action_response_shape(self, monkeypatch):
         s3 = _FakeS3()
-        _seed_two_regime_price_cache(s3, "test-bucket", DEFAULT_PRICE_CACHE_PREFIX)
+        _seed_two_regime_price_cache(s3, "test-bucket", _PRICE_CACHE_NEW_PREFIX)
 
         import boto3 as _boto3
         monkeypatch.setattr(_boto3, "client", lambda *_, **__: s3)

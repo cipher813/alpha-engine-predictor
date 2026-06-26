@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from regime.features import DEFAULT_PRICE_CACHE_PREFIX
+from regime.features import _PRICE_CACHE_NEW_PREFIX
 from regime.handler import (
     DEFAULT_HMM_FEATURE_COLUMNS,
     produce_regime_substrate,
@@ -70,7 +70,7 @@ def _seed_two_regime_price_cache(s3: _FakeS3, bucket: str, prefix: str) -> None:
 
 def test_produce_writes_substrate_artifact_and_sidecar() -> None:
     s3 = _FakeS3()
-    _seed_two_regime_price_cache(s3, "test-bucket", DEFAULT_PRICE_CACHE_PREFIX)
+    _seed_two_regime_price_cache(s3, "test-bucket", _PRICE_CACHE_NEW_PREFIX)
     result = produce_regime_substrate(
         s3_client=s3, bucket="test-bucket", write=True,
     )
@@ -86,7 +86,7 @@ def test_produce_writes_substrate_artifact_and_sidecar() -> None:
 
 def test_produce_dry_run_does_not_write() -> None:
     s3 = _FakeS3()
-    _seed_two_regime_price_cache(s3, "test-bucket", DEFAULT_PRICE_CACHE_PREFIX)
+    _seed_two_regime_price_cache(s3, "test-bucket", _PRICE_CACHE_NEW_PREFIX)
     result = produce_regime_substrate(
         s3_client=s3, bucket="test-bucket", write=False,
     )
@@ -97,7 +97,7 @@ def test_produce_dry_run_does_not_write() -> None:
 
 def test_produce_hmm_probs_sum_to_one() -> None:
     s3 = _FakeS3()
-    _seed_two_regime_price_cache(s3, "test-bucket", DEFAULT_PRICE_CACHE_PREFIX)
+    _seed_two_regime_price_cache(s3, "test-bucket", _PRICE_CACHE_NEW_PREFIX)
     result = produce_regime_substrate(s3_client=s3, bucket="test-bucket", write=False)
     probs = result["payload"]["hmm"]["probs"]
     assert sum(probs.values()) == pytest.approx(1.0, abs=1e-6)
@@ -114,7 +114,7 @@ def test_produce_drops_unavailable_hmm_features_before_fit() -> None:
     the handler must drop it before calling fit() — otherwise the
     HMM will raise on the NaN column. Pins graceful-degradation."""
     s3 = _FakeS3()
-    _seed_two_regime_price_cache(s3, "test-bucket", DEFAULT_PRICE_CACHE_PREFIX)
+    _seed_two_regime_price_cache(s3, "test-bucket", _PRICE_CACHE_NEW_PREFIX)
     # Request market_breadth as an HMM feature even though no breadth
     # source is wired yet — handler should drop it from the fit set.
     result = produce_regime_substrate(
@@ -137,9 +137,9 @@ def test_produce_raises_when_pin_feature_unavailable() -> None:
     handler trips the upstream-FRED-failure check before reaching the
     pin-feature check; either error is acceptable."""
     s3 = _FakeS3()
-    _seed_two_regime_price_cache(s3, "test-bucket", DEFAULT_PRICE_CACHE_PREFIX)
+    _seed_two_regime_price_cache(s3, "test-bucket", _PRICE_CACHE_NEW_PREFIX)
     # Remove SPY parquet so spy_20d_return goes all-NaN
-    del s3._objects[("test-bucket", f"{DEFAULT_PRICE_CACHE_PREFIX}SPY.parquet")]
+    del s3._objects[("test-bucket", f"{_PRICE_CACHE_NEW_PREFIX}SPY.parquet")]
     with pytest.raises(RuntimeError, match="(spy_20d_return is required|No macro feature history)"):
         produce_regime_substrate(s3_client=s3, bucket="test-bucket", write=False)
 
@@ -148,7 +148,7 @@ def test_produce_fit_window_metadata_populated() -> None:
     """Fit-window dates are surfaced in model_metadata so the dashboard
     + forensic replay scripts can verify which observations went in."""
     s3 = _FakeS3()
-    _seed_two_regime_price_cache(s3, "test-bucket", DEFAULT_PRICE_CACHE_PREFIX)
+    _seed_two_regime_price_cache(s3, "test-bucket", _PRICE_CACHE_NEW_PREFIX)
     result = produce_regime_substrate(s3_client=s3, bucket="test-bucket", write=False)
     md = result["payload"]["model_metadata"]
     assert md["fit_window_start"] is not None
@@ -168,7 +168,7 @@ def test_produce_assembles_weekly_drawdown_block() -> None:
     weekly-handler wiring) so the substrate the macro agent reads
     carries `drawdown` + the composed `effective_regime`."""
     s3 = _FakeS3()
-    _seed_two_regime_price_cache(s3, "test-bucket", DEFAULT_PRICE_CACHE_PREFIX)
+    _seed_two_regime_price_cache(s3, "test-bucket", _PRICE_CACHE_NEW_PREFIX)
     result = produce_regime_substrate(
         s3_client=s3, bucket="test-bucket", write=False,
     )
@@ -189,7 +189,7 @@ def test_produce_substrate_survives_drawdown_block_failure(monkeypatch) -> None:
     import regime.drawdown as dd
 
     s3 = _FakeS3()
-    _seed_two_regime_price_cache(s3, "test-bucket", DEFAULT_PRICE_CACHE_PREFIX)
+    _seed_two_regime_price_cache(s3, "test-bucket", _PRICE_CACHE_NEW_PREFIX)
     monkeypatch.setattr(
         dd, "block_from_history",
         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")),
