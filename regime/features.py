@@ -49,18 +49,17 @@ logger = logging.getLogger(__name__)
 DEFAULT_S3_BUCKET: str = "alpha-engine-research"
 DEFAULT_PRICE_CACHE_PREFIX: str = "predictor/price_cache/"
 
-# Wave-3 reader migration (ROADMAP L1401): producer write-both PR1
-# (alpha-engine-data#270, shipped 2026-05-19) seeded the new
-# ``reference/price_cache/`` prefix. During the ≥1-week soak window
-# (~2026-05-19 → 2026-05-26) every reader should consult the new
-# prefix first and fall back to legacy on miss. ``_read_parquet_close``
-# below iterates this list when the caller uses the legacy default;
-# explicit-prefix callers (tests, custom configs) opt out and get
-# single-prefix semantics. Wave-3 PR4 cutover drops the legacy entry
-# in a one-line edit here.
+# Wave-3 PR4 cutover (DONE): the producer (nousergon-data) now writes the
+# per-ticker price_cache parquets to ``reference/price_cache/`` ONLY and the
+# legacy ``predictor/price_cache/`` tree is removed live via ``aws s3 rm``.
+# The reader fallback chain therefore drops the legacy entry — reads resolve
+# from ``reference/price_cache/`` alone. ``DEFAULT_PRICE_CACHE_PREFIX`` is kept
+# as the production-default *sentinel* (callers pass it to opt into the chain);
+# ``_read_parquet_close`` iterates this list for that default, while explicit-
+# prefix callers (tests, custom configs) opt out and get single-prefix reads.
 _PRICE_CACHE_NEW_PREFIX: str = "reference/price_cache/"
 _PRICE_CACHE_FALLBACK_PREFIXES: tuple[str, ...] = (
-    _PRICE_CACHE_NEW_PREFIX, DEFAULT_PRICE_CACHE_PREFIX,
+    _PRICE_CACHE_NEW_PREFIX,
 )
 
 

@@ -134,13 +134,13 @@ def _load_prices_from_s3(
 
     s3 = s3_client or boto3.client("s3")
     prices: dict = {}
-    # Wave-3 reader migration (ROADMAP L1401): try ``reference/price_cache/``
-    # first, fall back to legacy ``predictor/price_cache/`` for the soak
-    # window. Mirrors regime/features._read_parquet_close's chain (PR #181)
-    # without importing from a deployed-Lambda module — analysis tools stay
-    # decoupled from Lambda concerns.
+    # Wave-3 PR4 cutover (DONE): price_cache parquets live at
+    # ``reference/price_cache/`` only — the legacy ``predictor/price_cache/``
+    # tree is removed live via ``aws s3 rm``. The legacy fallback is dropped.
+    # Mirrors regime/features._read_parquet_close's chain without importing
+    # from a deployed-Lambda module — analysis tools stay decoupled.
     price_cache_prefixes: tuple[str, ...] = (
-        "reference/price_cache/", "predictor/price_cache/",
+        "reference/price_cache/",
     )
     for ticker in tickers:
         df = None

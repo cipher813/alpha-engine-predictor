@@ -66,10 +66,11 @@ def _tiny_close_frame() -> pd.DataFrame:
 # ── Wave-3 price-cache read chain ──────────────────────────────────────────
 
 
-def test_load_prices_prefers_reference_prefix_over_legacy():
-    """The new ``reference/price_cache/`` prefix MUST be consulted first.
-    During the Wave-3 soak both prefixes hold byte-equal copies; reading
-    from new exercises the migration end-to-end.
+def test_load_prices_resolves_reference_and_never_consults_legacy():
+    """Wave-3 PR4 cutover (DONE): the price-cache read chain is
+    ``reference/price_cache/`` ONLY. The legacy ``predictor/price_cache/``
+    prefix is dropped and must NOT be consulted, even when a stale copy
+    still lingers under it pre-``aws s3 rm``.
     """
     payload = {
         "reference/price_cache/AAPL.parquet": _df_to_parquet_bytes(_tiny_close_frame()),
@@ -86,15 +87,17 @@ def test_load_prices_prefers_reference_prefix_over_legacy():
 
     out = _load_prices_from_s3("b", ["AAPL"], s3_client=s3)
     assert "AAPL" in out
-    assert seen_keys[0] == "reference/price_cache/AAPL.parquet", (
-        "Wave-3 read order: new prefix first."
+    assert seen_keys == ["reference/price_cache/AAPL.parquet"], (
+        "Post-cutover the read chain is reference-only."
     )
-    # Success on first prefix should short-circuit; legacy not consulted.
     assert "predictor/price_cache/AAPL.parquet" not in seen_keys
 
 
-def test_load_prices_falls_back_to_legacy_when_reference_missing():
-    """Legacy fallback fills gaps during the soak (or partial backfills)."""
+def test_load_prices_drops_ticker_present_only_under_legacy():
+    """Wave-3 PR4 cutover: with the legacy fallback gone, a ticker whose
+    parquet exists ONLY under ``predictor/price_cache/`` is invisible —
+    the reference miss is the end of the chain and the ticker is dropped.
+    """
     payload = {
         "predictor/price_cache/MSFT.parquet": _df_to_parquet_bytes(_tiny_close_frame()),
     }
@@ -108,11 +111,10 @@ def test_load_prices_falls_back_to_legacy_when_reference_missing():
     s3.get_object = _stub
 
     out = _load_prices_from_s3("b", ["MSFT"], s3_client=s3)
-    assert "MSFT" in out
-    assert seen_keys == [
-        "reference/price_cache/MSFT.parquet",
-        "predictor/price_cache/MSFT.parquet",
-    ], "Fallback order: new → legacy."
+    assert "MSFT" not in out
+    assert seen_keys == ["reference/price_cache/MSFT.parquet"], (
+        "Only the reference prefix is consulted; legacy is never tried."
+    )
 
 
 def test_load_prices_skips_ticker_absent_in_both_prefixes():
