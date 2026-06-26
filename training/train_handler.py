@@ -1102,38 +1102,55 @@ def _write_training_summary(
 ) -> None:
     """Annotate + persist the training ``result`` to S3 (dated + latest). Extracted
     from the inline Step-2d block so the ``meta_training`` phase can record the
-    dated summary as its L4524 artifact (the reload source). Non-blocking: a write
-    failure logs a WARN — the training itself already succeeded.
+    dated summary as its L4524 artifact (the reload source).
+
+    **Fail-loud (config#1234).** The dated/latest ``training_summary`` is the
+    training SSOT: the executor and dashboard read it, and the ``meta_training``
+    phase records the dated key as its L4524 artifact — so a swallowed write
+    failure is a *ghost success* (the SF/phase reports OK with no artifact). This
+    mirrors the research signals.json producer fix (crucible-research#312) and the
+    repo's own read-side convention (``_load_training_result``: 404→None, any other
+    S3 error→raise). The actual S3 PUT now RE-RAISES on failure; only the
+    best-effort prior-cycle ``_annotate_subsample_noise_floor`` enrichment (a
+    *read* of last cycle's latest.json, purely for a percent-change reference) is
+    kept non-fatal. The enforce-mode freshness monitor (config#1231) is the
+    registered-artifact backstop, but the producer must not silently lose the SSOT.
 
     config#1170 — for a zoo challenger (``spec`` set) the dated summary is written
     to the spec-namespaced key so it's that spec's OWN reload artifact, and the
     shared ``training_summary_latest.json`` champion pointer is NOT overwritten
     (only the base champion advances "latest")."""
+    import boto3 as _b3_sum
+    _s3_sum = _b3_sum.client("s3")
+    # Annotate subsample-noise-floor BEFORE the write — reads the PRIOR cycle's
+    # latest.json so the percent-change reference is genuinely prior-cycle rather
+    # than this-cycle. This enrichment is best-effort: a failure to read the
+    # prior cycle must NOT block persisting the current (load-bearing) summary.
     try:
-        import boto3 as _b3_sum
-        _s3_sum = _b3_sum.client("s3")
-        # Annotate subsample-noise-floor BEFORE the write — reads the PRIOR
-        # cycle's latest.json so the percent-change reference is genuinely
-        # prior-cycle rather than this-cycle.
         _annotate_subsample_noise_floor(result, _s3_sum, bucket)
-        _sum_body = json.dumps(result, indent=2, default=str).encode()
+    except Exception as _ann_err:  # noqa: BLE001 — prior-cycle read enrichment only
+        log.warning(
+            "subsample-noise-floor annotation skipped (non-fatal prior-cycle read): %s",
+            _ann_err,
+        )
+    # SSOT write — fail-loud (config#1234): a swallowed failure here is a ghost
+    # success for every downstream reader (executor/dashboard) + the phase artifact.
+    _sum_body = json.dumps(result, indent=2, default=str).encode()
+    _s3_sum.put_object(
+        Bucket=bucket,
+        Key=_training_summary_key(date_str, spec),
+        Body=_sum_body, ContentType="application/json",
+    )
+    if not spec:
         _s3_sum.put_object(
             Bucket=bucket,
-            Key=_training_summary_key(date_str, spec),
+            Key="predictor/metrics/training_summary_latest.json",
             Body=_sum_body, ContentType="application/json",
         )
-        if not spec:
-            _s3_sum.put_object(
-                Bucket=bucket,
-                Key="predictor/metrics/training_summary_latest.json",
-                Body=_sum_body, ContentType="application/json",
-            )
-        log.info(
-            "Training summary written to S3 (%s)",
-            "dated, spec-namespaced" if spec else "dated + latest",
-        )
-    except Exception as _sum_err:
-        log.warning("Training summary write failed (non-blocking): %s", _sum_err)
+    log.info(
+        "Training summary written to S3 (%s)",
+        "dated, spec-namespaced" if spec else "dated + latest",
+    )
 
 
 def _env_truthy(val: Optional[str]) -> bool:
