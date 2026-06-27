@@ -71,8 +71,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 # flow-doctor.yaml references EMAIL_SENDER / EMAIL_RECIPIENTS /
 # GMAIL_APP_PASSWORD, all populated by Lambda's `--environment` block
 # BEFORE the Python interpreter starts. Other secrets are pulled lazily
-# from SSM via alpha_engine_lib.secrets.get_secret() (per-process cached).
-from alpha_engine_lib.logging import setup_logging, monitor_handler
+# from SSM via krepis.secrets.get_secret() (per-process cached).
+from krepis.logging import setup_logging, monitor_handler
 _FLOW_DOCTOR_EXCLUDE_PATTERNS: list[str] = []
 _FLOW_DOCTOR_YAML = os.path.join(
     os.environ.get(
@@ -107,7 +107,7 @@ def handler(event: dict, context) -> dict:
     os.environ.setdefault("S3_BUCKET", "alpha-engine-research")
     os.environ.setdefault("XDG_CACHE_HOME", "/tmp")
     # setup_logging already ran at module-top (see comment near the
-    # alpha_engine_lib.logging import). Apply the standard log level here.
+    # krepis.logging import). Apply the standard log level here.
     logging.getLogger().setLevel(logging.INFO)
 
     # Preflight — fail fast on env / connectivity / ArcticDB freshness

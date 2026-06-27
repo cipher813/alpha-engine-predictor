@@ -23,7 +23,7 @@ from pathlib import Path
 
 import numpy as np
 
-from alpha_engine_lib.quant.stats.calibration import (
+from nousergon_lib.quant.stats.calibration import (
     expected_calibration_error as _lib_expected_calibration_error,
 )
 
@@ -244,7 +244,7 @@ def _expected_calibration_error(
     """Expected Calibration Error of ``predicted_probs`` vs ``actual_labels``.
 
     Thin wrapper over the fleet-canonical implementation in
-    ``alpha_engine_lib.quant.stats.calibration`` so the calibrator's fit-time
+    ``nousergon_lib.quant.stats.calibration`` so the calibrator's fit-time
     ECE (``ece_before``/``ece_after``) and the backtester's production-time ECE
     are computed by the SAME code on the SAME quantity (calibrated probability
     vs binary outcome) — the only way the two numbers are comparable as a

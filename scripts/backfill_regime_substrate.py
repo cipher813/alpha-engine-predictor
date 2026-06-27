@@ -95,7 +95,7 @@ def _generate_saturdays(start: Date, end: Date) -> list[Date]:
 
 def _artifact_exists(s3_client, bucket: str, prefix: str, run_id: str) -> bool:
     """HeadObject probe — cheap idempotency check."""
-    from alpha_engine_lib.eval_artifacts import eval_artifact_key
+    from nousergon_lib.eval_artifacts import eval_artifact_key
 
     key = eval_artifact_key(prefix, run_id)
     try:

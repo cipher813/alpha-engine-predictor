@@ -70,7 +70,7 @@ def pull_from_arcticdb(local_dir: Path) -> int:
     import pandas as pd
     import boto3
 
-    from alpha_engine_lib.arcticdb import open_universe_lib, open_macro_lib
+    from nousergon_lib.arcticdb import open_universe_lib, open_macro_lib
     universe = open_universe_lib(BUCKET)
     macro_lib = open_macro_lib(BUCKET)
 

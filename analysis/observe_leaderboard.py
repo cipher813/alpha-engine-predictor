@@ -265,7 +265,7 @@ def build_champion_realized_monitor(
     calendar_date = None
     trading_day = date_str
     try:
-        from alpha_engine_lib.dates import now_dual
+        from krepis.dates import now_dual
         dual = now_dual()
         calendar_date = dual.calendar_date
         trading_day = trading_day or (
@@ -383,7 +383,7 @@ def build_observe_leaderboard(
     calendar_date = None
     trading_day = date_str
     try:
-        from alpha_engine_lib.dates import now_dual
+        from krepis.dates import now_dual
         dual = now_dual()
         calendar_date = dual.calendar_date
         trading_day = trading_day or (

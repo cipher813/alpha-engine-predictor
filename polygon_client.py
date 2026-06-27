@@ -30,7 +30,7 @@ from datetime import date, datetime, timedelta
 import pandas as pd
 import requests
 
-from alpha_engine_lib.secrets import get_secret
+from krepis.secrets import get_secret
 
 logger = logging.getLogger(__name__)
 

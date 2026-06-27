@@ -22,7 +22,7 @@ from typing import Optional, Union
 # one place (see lib v0.5.5). Re-imported as a module-level attribute so
 # `patch.object(deploy_drift, "_fetch_origin_main_sha", ...)` keeps
 # working in tests.
-from alpha_engine_lib.preflight import _fetch_origin_main_sha  # noqa: F401
+from nousergon_lib.preflight import _fetch_origin_main_sha  # noqa: F401
 
 log = logging.getLogger(__name__)
 

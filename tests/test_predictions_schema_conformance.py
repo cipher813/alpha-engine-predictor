@@ -3,7 +3,7 @@
 Complements ``test_predictions_producer_contract.py`` (AST source-binding of the
 dict literals): that test pins *which keys the source emits*; this one validates
 *the assembled artifact* against the versioned Slot M contract in
-``alpha_engine_lib.contracts`` (lib v0.59.0) — the same schema executor/backtester
+``nousergon_lib.contracts`` (lib v0.59.0) — the same schema executor/backtester
 consumer fixtures and external slot implementations validate against.
 
 The payload is captured from the REAL envelope-assembly path
@@ -20,7 +20,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 contracts = pytest.importorskip(
-    "alpha_engine_lib.contracts",
+    "nousergon_lib.contracts",
     reason="needs alpha-engine-lib[contracts] >= 0.59.0",
 )
 

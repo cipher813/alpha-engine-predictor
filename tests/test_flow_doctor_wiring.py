@@ -235,7 +235,7 @@ class TestSetupLoggingAttach:
 
     def test_disabled_attaches_no_flow_doctor_handler(self, monkeypatch, reset_root_logger):
         monkeypatch.setenv("FLOW_DOCTOR_ENABLED", "0")
-        from alpha_engine_lib.logging import setup_logging
+        from krepis.logging import setup_logging
         setup_logging(
             "predictor-test-disabled",
             flow_doctor_yaml=str(REPO_ROOT / "flow-doctor.yaml"),
@@ -249,7 +249,7 @@ class TestSetupLoggingAttach:
     def test_enabled_attaches_flow_doctor_handler(
         self, stub_flow_doctor_env, reset_root_logger, temp_flow_doctor_yaml
     ):
-        from alpha_engine_lib.logging import setup_logging, get_flow_doctor
+        from krepis.logging import setup_logging, get_flow_doctor
         setup_logging(
             "predictor-test-enabled",
             flow_doctor_yaml=temp_flow_doctor_yaml,
@@ -264,7 +264,7 @@ class TestSetupLoggingAttach:
     def test_exclude_patterns_plumbed_to_handler(
         self, stub_flow_doctor_env, reset_root_logger, temp_flow_doctor_yaml
     ):
-        from alpha_engine_lib.logging import setup_logging
+        from krepis.logging import setup_logging
         patterns = [r"yfinance possibly delisted", r"polygon transient 5\d\d"]
         setup_logging(
             "predictor-test-patterns",

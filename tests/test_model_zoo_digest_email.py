@@ -94,7 +94,7 @@ def _capture_digest_send(monkeypatch):
         captured["n_calls"] = captured.get("n_calls", 0) + 1
         return True
 
-    monkeypatch.setattr("alpha_engine_lib.email_sender.send_email", _fake_send)
+    monkeypatch.setattr("krepis.email_sender.send_email", _fake_send)
     monkeypatch.setattr(cfg, "EMAIL_SENDER", "sender@example.com", raising=False)
     monkeypatch.setattr(cfg, "EMAIL_RECIPIENTS", ["ops@example.com"], raising=False)
     return captured

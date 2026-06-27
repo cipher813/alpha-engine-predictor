@@ -20,7 +20,7 @@ import arcticdb as adb  # Hard dep: matches run_inference.py pattern. No try/exc
                         # loud at cold start rather than silently degrading.
 import pandas as pd
 
-from alpha_engine_lib.trading_calendar import last_closed_trading_day
+from krepis.trading_calendar import last_closed_trading_day
 
 from inference.pipeline import PipelineContext, PipelineAbort
 
@@ -73,8 +73,8 @@ def _verify_arctic_fresh(universe_lib, date_str: str) -> None:
     gate read from `macro.SPY` instead; a transitional `macro_lib` fallback
     was kept for one cross-repo soak cycle and retired here.
 
-    Uses ``alpha_engine_lib.trading_calendar.last_closed_trading_day()`` —
-    the same primitive the system-wide ``alpha_engine_lib.dates.{trading_days_stale,
+    Uses ``krepis.trading_calendar.last_closed_trading_day()`` —
+    the same primitive the system-wide ``krepis.dates.{trading_days_stale,
     is_fresh_in_trading_days}`` chokepoint helpers delegate to. The
     comparison ``last_date >= expected_min`` is exactly the
     ``max_stale=0`` case of those helpers; spelled inline here so the
@@ -121,12 +121,12 @@ def _verify_arctic_fresh(universe_lib, date_str: str) -> None:
 def _connect_arctic(bucket: str) -> "tuple[object, object]":
     """Open the ArcticDB universe + macro libraries. Hard-fail on unreachable.
 
-    Delegates to ``alpha_engine_lib.arcticdb.open_universe_lib`` /
+    Delegates to ``nousergon_lib.arcticdb.open_universe_lib`` /
     ``open_macro_lib`` (L2771 chokepoint). ``PipelineAbort`` is preserved
     on the failure path so existing pipeline-level except handlers stay
     correctly typed.
     """
-    from alpha_engine_lib.arcticdb import open_universe_lib, open_macro_lib
+    from nousergon_lib.arcticdb import open_universe_lib, open_macro_lib
     try:
         return open_universe_lib(bucket), open_macro_lib(bucket)
     except Exception as exc:

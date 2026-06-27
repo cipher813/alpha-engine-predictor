@@ -252,7 +252,7 @@ class TestRunGate:
         assert latest_put["Bucket"] == bucket
         # Dated artifact path: predictor/variant_gates/triple_barrier/{run_id}.json
         # (FLAT layout — YYMMDDHHMM run_id encodes the date itself, no
-        # calendar_date sub-partition. Per alpha_engine_lib.eval_artifacts
+        # calendar_date sub-partition. Per nousergon_lib.eval_artifacts
         # canonical convention.)
         assert dated_put["Key"] == f"predictor/variant_gates/triple_barrier/{payload['run_id']}.json"
         assert "/2026-" not in dated_put["Key"]  # no ISO date sub-partition
@@ -314,7 +314,7 @@ class TestRunGate:
 
 
 class TestCanonicalLayout:
-    """Validates the alpha_engine_lib.eval_artifacts layout consumed here.
+    """Validates the nousergon_lib.eval_artifacts layout consumed here.
 
     The runner uses ``new_eval_run_id`` (YYMMDDHHMM) + ``eval_artifact_key``
     (flat layout, no date sub-partition) + ``eval_latest_key`` (sidecar).

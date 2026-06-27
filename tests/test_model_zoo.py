@@ -476,7 +476,7 @@ def test_inert_rotation_alerts_when_active_specs_but_zero_trained(monkeypatch):
     """The core config#1051 closes-when #2: ≥1 active promote-eligible spec exists
     but the rotation trains 0 challengers (empty selection) → WARN + named CW
     metric + SNS, distinct from 'trained-but-lost'."""
-    from alpha_engine_lib import alerts  # conftest autouse-stubs .publish
+    from krepis import alerts  # conftest autouse-stubs .publish
 
     cw_calls = []
     monkeypatch.setattr(mz, "_emit_challengers_trained_metric", lambda n: cw_calls.append(n))
