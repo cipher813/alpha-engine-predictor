@@ -114,7 +114,7 @@ class TestSlimCacheNaT:
 class TestArcticFreshnessGate:
     """_verify_arctic_fresh guards against stale/missing SPY in ArcticDB.
 
-    The freshness threshold is time-aware (see alpha_engine_lib.trading_calendar.
+    The freshness threshold is time-aware (see krepis.trading_calendar.
     last_closed_trading_day): pre-close it expects the prior trading day;
     post-close it expects today. Tests freeze wall-clock time to cover both.
     """
@@ -134,9 +134,9 @@ class TestArcticFreshnessGate:
 
     @staticmethod
     def _freeze_now(monkeypatch, dt):
-        """Freeze datetime.now() inside alpha_engine_lib.trading_calendar."""
+        """Freeze datetime.now() inside krepis.trading_calendar."""
         from datetime import datetime
-        from alpha_engine_lib import trading_calendar as tc
+        from krepis import trading_calendar as tc
 
         class _FrozenDatetime(datetime):
             @classmethod
@@ -231,7 +231,7 @@ class TestUniverseSPYFreshnessReadL1346:
     @staticmethod
     def _freeze_now(monkeypatch, dt):
         from datetime import datetime
-        from alpha_engine_lib import trading_calendar as tc
+        from krepis import trading_calendar as tc
 
         class _FrozenDatetime(datetime):
             @classmethod

@@ -66,7 +66,7 @@ from botocore.exceptions import ClientError
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from nousergon_lib.logging import monitor_handler, setup_logging
+from krepis.logging import monitor_handler, setup_logging
 from regime.features import (
     DEFAULT_PRICE_CACHE_PREFIX,
     fetch_macro_feature_history,
@@ -353,7 +353,7 @@ def produce_t1_eval(
         rolling_window_weeks=rolling_window_weeks,
     )
 
-    from nousergon_lib.dates import now_dual
+    from krepis.dates import now_dual
     from nousergon_lib.eval_artifacts import new_eval_run_id
 
     dual = now_dual()

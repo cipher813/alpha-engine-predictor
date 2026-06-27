@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from alpha_engine_lib.secrets import get_secret
+from krepis.secrets import get_secret
 
 import config as cfg
 from inference.pipeline import PipelineContext
@@ -1128,11 +1128,11 @@ def send_predictor_email(
 
     # Morning briefing HTML archival removed — no consumers read it (email delivers the content).
 
-    # SMTP/SES dispatch via the alpha_engine_lib.email_sender chokepoint
+    # SMTP/SES dispatch via the krepis.email_sender chokepoint
     # (L4356 — Gmail SMTP primary, SES fallback). Identical semantics to
     # the pre-consolidation inline path; never raises, returns False on
     # any failure mode.
-    from alpha_engine_lib.email_sender import send_email as _send_email
+    from krepis.email_sender import send_email as _send_email
     return _send_email(
         subject, plain_body,
         recipients=recipients, html=html_body,
@@ -1178,7 +1178,7 @@ def run(ctx: PipelineContext) -> None:
     # can see promotion state and per-component ICs without parsing manifest.
     # The l1_ic / l2_ic / confidence_calibration keys satisfy the
     # `predictor_decisions` row of the transparency inventory
-    # (alpha_engine_lib/transparency_inventory.yaml).
+    # (nousergon_lib/transparency_inventory.yaml).
     if ctx.inference_mode == "meta":
         metrics["promoted"] = gbm_meta.get("promoted")
         metrics["meta_val_ic"] = gbm_meta.get("meta_val_ic")

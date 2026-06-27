@@ -199,7 +199,7 @@ def _load_precomputed_features_from_arcticdb(
     inline compute_features. Those fallbacks masked a ``_run_gbm_inference``
     miswiring where ArcticDB was never actually consulted in production.
     """
-    from alpha_engine_lib.arcticdb import open_universe_lib
+    from nousergon_lib.arcticdb import open_universe_lib
     universe = open_universe_lib(ctx.bucket)
 
     precomputed: dict[str, pd.Series] = {}

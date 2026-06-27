@@ -3,7 +3,7 @@ Inference preflight — connectivity + freshness checks run at the top of
 the Lambda handler before any model load or feature read.
 
 Primitives — including ``check_deploy_drift`` — live in
-``alpha_engine_lib.preflight.BasePreflight``; this module only composes
+``nousergon_lib.preflight.BasePreflight``; this module only composes
 them into the sequence that matters for the predictor inference Lambda.
 
 Runs synchronously at cold start. Any failure raises ``RuntimeError``
@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 
-from alpha_engine_lib.preflight import BasePreflight
+from nousergon_lib.preflight import BasePreflight
 
 log = logging.getLogger(__name__)
 
