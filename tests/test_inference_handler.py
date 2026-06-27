@@ -56,6 +56,40 @@ def test_handler_check_coverage_returns_delta(stubbed_preflight, monkeypatch):
     fake_cov.compute_coverage_delta.assert_called_once()
 
 
+# ── action="check_drift" ────────────────────────────────────────────────────
+
+
+def test_handler_check_drift_writes_artifact(stubbed_preflight, monkeypatch):
+    """check_drift dispatches to monitoring.drift_detector.check_drift, returns
+    its structured result, and uses the light env+S3 preflight only — NOT the
+    full predict preflight and NOT the deploy-drift gate (config#1282)."""
+    fake_result = {
+        "date": "2026-06-26",
+        "status": "ok",
+        "severity": None,
+        "alerts": [],
+        "alert_details": [],
+        "skipped_checks": [],
+        "n_alerts": 0,
+    }
+    fake_dd = MagicMock()
+    fake_dd.check_drift = MagicMock(return_value=fake_result)
+    monkeypatch.setitem(sys.modules, "monitoring.drift_detector", fake_dd)
+
+    import inference.handler as h
+    result = h.handler({"action": "check_drift", "date": "2026-06-26"}, _fake_context())
+
+    assert result == fake_result
+    fake_dd.check_drift.assert_called_once()
+    call_kwargs = fake_dd.check_drift.call_args.kwargs
+    assert call_kwargs["date_str"] == "2026-06-26"
+    # Light preflight: env + S3 only, no full predict bootstrap, no drift gate.
+    stubbed_preflight.return_value.check_env_vars.assert_called_once_with("AWS_REGION")
+    stubbed_preflight.return_value.check_s3_bucket.assert_called_once()
+    stubbed_preflight.return_value.run.assert_not_called()
+    stubbed_preflight.return_value.run_for_drift_gate.assert_not_called()
+
+
 # ── action="check_deploy_drift" ─────────────────────────────────────────────
 
 

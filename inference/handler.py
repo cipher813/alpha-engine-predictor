@@ -71,8 +71,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 # flow-doctor.yaml references EMAIL_SENDER / EMAIL_RECIPIENTS /
 # GMAIL_APP_PASSWORD, all populated by Lambda's `--environment` block
 # BEFORE the Python interpreter starts. Other secrets are pulled lazily
-# from SSM via alpha_engine_lib.secrets.get_secret() (per-process cached).
-from alpha_engine_lib.logging import setup_logging, monitor_handler
+# from SSM via krepis.secrets.get_secret() (per-process cached).
+from krepis.logging import setup_logging, monitor_handler
 _FLOW_DOCTOR_EXCLUDE_PATTERNS: list[str] = []
 _FLOW_DOCTOR_YAML = os.path.join(
     os.environ.get(
@@ -107,7 +107,7 @@ def handler(event: dict, context) -> dict:
     os.environ.setdefault("S3_BUCKET", "alpha-engine-research")
     os.environ.setdefault("XDG_CACHE_HOME", "/tmp")
     # setup_logging already ran at module-top (see comment near the
-    # alpha_engine_lib.logging import). Apply the standard log level here.
+    # krepis.logging import). Apply the standard log level here.
     logging.getLogger().setLevel(logging.INFO)
 
     # Preflight — fail fast on env / connectivity / ArcticDB freshness
@@ -137,6 +137,14 @@ def handler(event: dict, context) -> dict:
         # All three are lightweight pre-spend SF gates (GitHub reads only) — run
         # the minimal preflight, not the full predictor bootstrap.
         _pf.run_for_drift_gate()
+    elif _action == "check_drift":
+        # Drift detection is a post-inference monitoring step: it reads the
+        # day's predictions/features and writes drift_{date}.json. It needs env
+        # + S3 reachability only — NOT model weights (it scores nothing) and NOT
+        # the deploy-drift gate (a stale-code halt must never silence the
+        # monitoring/observability arm). config#1282.
+        _pf.check_env_vars("AWS_REGION")
+        _pf.check_s3_bucket()
     else:
         _pf.run(skip_deploy_drift=_dry_run)
 
@@ -172,6 +180,24 @@ def handler(event: dict, context) -> dict:
             ", ".join(result["missing_tickers"][:10]) + (
                 "…" if len(result["missing_tickers"]) > 10 else ""
             ) if result["missing_tickers"] else "none",
+        )
+        return result
+
+    # ── Drift detection (daily EOD Step Function state, config#1282) ─────────
+    # Runs AFTER predictions are written so drift_{date}.json is produced every
+    # weekday EOD — matching the artifact's registered `eod_sf` (daily) cadence.
+    # Decouples the drift OUTPUT from the skippable, Saturday-only DriftDetection
+    # state (which froze the artifact at drift_2026-06-13.json). check_drift
+    # already writes predictor/metrics/drift_{date}.json and never raises on a
+    # detected-drift condition (it returns a structured result); a real error
+    # propagates so the SF Catch sees a true failure.
+    if action == "check_drift":
+        from monitoring.drift_detector import check_drift
+        result = check_drift(bucket=bucket, date_str=date_str)
+        log.info(
+            "Drift check %s: status=%s severity=%s n_alerts=%d → drift_%s.json",
+            result["date"], result["status"], result.get("severity"),
+            result.get("n_alerts", 0), result["date"],
         )
         return result
 

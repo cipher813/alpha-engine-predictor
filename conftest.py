@@ -1,7 +1,7 @@
 """Repo-root pytest fixtures and env defaults.
 
 Pins ``ALPHA_ENGINE_SECRETS_SOURCE=env`` for the test process so
-``alpha_engine_lib.secrets.get_secret()`` (post 2026-05-12 .env→SSM
+``krepis.secrets.get_secret()`` (post 2026-05-12 .env→SSM
 migration, PR 4 of the arc) reads from monkeypatched env vars only —
 never the real SSM Parameter Store. Set at module-import time (not
 just inside a fixture body) so it's in place before any test module
@@ -26,7 +26,7 @@ def _isolate_secrets_from_ssm(monkeypatch):
     """
     monkeypatch.setenv("ALPHA_ENGINE_SECRETS_SOURCE", "env")
     try:
-        from alpha_engine_lib.secrets import clear_cache
+        from krepis.secrets import clear_cache
     except ImportError:
         yield
         return
@@ -37,7 +37,7 @@ def _isolate_secrets_from_ssm(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _block_real_alert_publish(monkeypatch):
-    """Stub ``alpha_engine_lib.alerts.publish`` so NO predictor test fans out a
+    """Stub ``krepis.alerts.publish`` so NO predictor test fans out a
     real SNS / Telegram operator alert (L4571 added a promotion alert to the
     model-zoo cutover path). Mirrors the alpha-engine executor conftest; the
     lib's own ``PYTEST_CURRENT_TEST`` guard is the backup. See
@@ -45,7 +45,7 @@ def _block_real_alert_publish(monkeypatch):
     """
     try:
         from unittest.mock import MagicMock
-        from alpha_engine_lib import alerts
+        from krepis import alerts
     except ImportError:
         yield
         return

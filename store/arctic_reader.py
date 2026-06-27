@@ -50,7 +50,7 @@ def download_from_arctic(
     local_dir = str(local_dir)
     os.makedirs(local_dir, exist_ok=True)
 
-    from alpha_engine_lib.arcticdb import open_universe_lib, open_macro_lib
+    from nousergon_lib.arcticdb import open_universe_lib, open_macro_lib
     universe = open_universe_lib(bucket)
     macro_lib = open_macro_lib(bucket)
 

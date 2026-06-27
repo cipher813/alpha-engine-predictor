@@ -2076,7 +2076,7 @@ def run_meta_training(
     # the primary deliverable); the report card shows feature_drift_ks N/A until
     # a reference lands. Per the feedback_no_silent_fails secondary carve-out.
     try:
-        from alpha_engine_lib.dates import now_dual
+        from krepis.dates import now_dual
 
         from monitoring.feature_drift import (
             build_training_reference,

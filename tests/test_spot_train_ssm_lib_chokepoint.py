@@ -333,9 +333,10 @@ def test_model_zoo_heredoc_wires_flow_doctor_setup_logging():
     end = body.find("PYEOF\n$PY -m nousergon_lib.ssm_log_capture")
     assert end != -1, "model-zoo workload heredoc terminator not found"
     body = body[:end]
-    assert "from alpha_engine_lib.logging import setup_logging" in body, (
+    assert "from krepis.logging import setup_logging" in body, (
         "spot-model-zoo-weekly.py heredoc must import setup_logging from "
-        "alpha_engine_lib.logging."
+        "krepis.logging (flow-doctor wiring glue moved to MIT krepis at the "
+        "dual-import migration, config#1269)."
     )
     assert 'setup_logging("predictor-model-zoo"' in body, (
         "spot-model-zoo-weekly.py heredoc must call "

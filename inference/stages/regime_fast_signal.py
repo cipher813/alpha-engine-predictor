@@ -91,7 +91,7 @@ def _advance_drawdown(ctx: PipelineContext, s3, dual, run_id: str) -> None:
             seed_state,
             step as dd_step,
         )
-        from alpha_engine_lib.eval_artifacts import (
+        from nousergon_lib.eval_artifacts import (
             eval_artifact_key,
             eval_latest_key,
         )
@@ -221,8 +221,8 @@ def run(ctx: PipelineContext) -> None:
     try:
         import boto3
 
-        from alpha_engine_lib.dates import now_dual
-        from alpha_engine_lib.eval_artifacts import (
+        from krepis.dates import now_dual
+        from nousergon_lib.eval_artifacts import (
             eval_artifact_key,
             eval_latest_key,
             new_eval_run_id,

@@ -48,7 +48,7 @@ Output schema
 -------------
 Eval artifact written to ``regime/retrospective/{YYMMDDHHMM}.json`` +
 ``regime/retrospective/latest.json`` via the canonical
-``alpha_engine_lib.eval_artifacts`` shape. Carries per-week pairings
+``nousergon_lib.eval_artifacts`` shape. Carries per-week pairings
 (agent call vs smoothed label) and the 26-week rolling asymmetric-
 loss-weighted agreement rate that's the headline T1 metric.
 """

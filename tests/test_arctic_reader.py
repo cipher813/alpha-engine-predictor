@@ -12,7 +12,7 @@ import pytest
 def fake_arcticdb(monkeypatch):
     """Replace the ``arcticdb`` module singleton's ``Arctic`` class with a
     controllable mock. Patches at the singleton level so the
-    ``alpha_engine_lib.arcticdb._import_arcticdb()`` lazy-import path
+    ``nousergon_lib.arcticdb._import_arcticdb()`` lazy-import path
     (used by ``open_universe_lib`` / ``open_macro_lib``) picks up the
     mock. Without singleton-level patching, a lib-routed call would
     bypass the mock and hit real S3 (post-L2771 chokepoint migration)."""

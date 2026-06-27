@@ -2,7 +2,7 @@
 Training preflight — connectivity + freshness checks run at the top of
 ``train_handler.main`` before any download or training work starts.
 
-Primitives live in ``alpha_engine_lib.preflight.BasePreflight``; this
+Primitives live in ``nousergon_lib.preflight.BasePreflight``; this
 module only composes them into a training-specific sequence. Matches
 the ``PredictorPreflight`` pattern (inference/preflight.py) but with
 training-specific checks.
@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 
-from alpha_engine_lib.preflight import BasePreflight
+from nousergon_lib.preflight import BasePreflight
 
 log = logging.getLogger(__name__)
 

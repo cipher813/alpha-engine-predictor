@@ -1,7 +1,7 @@
 """Regression: no module in this repo reads a secret via ``os.environ.get``.
 
 After the 2026-05-12 ``.env`` → SSM migration (PR 4 of the arc), every
-secret-bearing call site routes through ``alpha_engine_lib.secrets.get_secret()``.
+secret-bearing call site routes through ``krepis.secrets.get_secret()``.
 This test re-greps the codebase on every CI run so a future commit can't
 silently re-introduce an ``os.environ.get("POLYGON_API_KEY")`` style read.
 
@@ -69,6 +69,6 @@ def test_no_secret_environ_reads():
                     violations.append((path.relative_to(_REPO_ROOT), lineno, name))
     assert not violations, (
         "Found os.environ.get reads of pinned secrets — use "
-        "`from alpha_engine_lib.secrets import get_secret` instead:\n"
+        "`from krepis.secrets import get_secret` instead:\n"
         + "\n".join(f"  {p}:{ln}  {name}" for p, ln, name in violations)
     )

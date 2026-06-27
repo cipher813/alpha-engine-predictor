@@ -14,7 +14,7 @@ from pathlib import Path
 
 import yaml
 
-from alpha_engine_lib.secrets import get_secret
+from krepis.secrets import get_secret
 
 _log = logging.getLogger(__name__)
 
@@ -284,7 +284,7 @@ DAILY_CLOSES_PERIOD = _data_cfg["daily_closes_period"]
 # never read in the predictor (audit during the trading-day freshness
 # arc). Freshness in the predictor is enforced by `_verify_arctic_fresh`
 # in `inference/stages/load_prices.py`, which uses
-# `alpha_engine_lib.dates.is_fresh_in_trading_days(max_stale=0)` — no
+# `krepis.dates.is_fresh_in_trading_days(max_stale=0)` — no
 # calendar-day knob to tune. The yaml key remains in `predictor.yaml`
 # for backwards-compat with other config readers but is unused here.
 SLIM_CACHE_LOOKBACK_DAYS = _data_cfg["slim_cache_lookback_days"]

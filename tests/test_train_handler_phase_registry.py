@@ -1,4 +1,4 @@
-"""Tests for the alpha_engine_lib.phase_registry adoption in train_handler
+"""Tests for the nousergon_lib.phase_registry adoption in train_handler
 (L4528 — predictor is the 3rd consumer of the lib phase framework, after the
 backtester + alpha-engine-data).
 
@@ -22,7 +22,7 @@ import pytest
 from botocore.exceptions import ClientError
 
 from training import train_handler
-from alpha_engine_lib.phase_registry import PhaseRegistry
+from nousergon_lib.phase_registry import PhaseRegistry
 
 
 # ── fake S3 (markers in `objects`, artifact existence in `artifacts`) ─────────
@@ -157,6 +157,49 @@ def test_meta_training_trains_then_records_summary(monkeypatch):
     assert _SUMMARY_KEY in fake.objects
     marker = json.loads(fake.objects["predictor/2026-06-13/.phases/meta_training.json"])
     assert marker["artifact_keys"] == [_SUMMARY_KEY]
+
+
+# ── _write_training_summary fail-loud contract (config#1234) ─────────────────
+
+
+def test_write_training_summary_reraises_on_s3_put_failure(monkeypatch):
+    """The training-summary write is the training SSOT (executor/dashboard read
+    it; the meta_training phase records it as its artifact). A swallowed write
+    failure is a ghost success — so a genuine S3 PUT error must RE-RAISE
+    (config#1234, mirroring crucible-research#312)."""
+    class _PutBoom(_FakeS3):
+        def put_object(self, Bucket, Key, Body, **kw):
+            raise self._err("AccessDenied")
+
+    fake = _PutBoom()
+    monkeypatch.setattr("boto3.client", lambda *a, **k: fake)
+    monkeypatch.setattr(train_handler, "_annotate_subsample_noise_floor", lambda *a, **k: None)
+
+    with pytest.raises(ClientError):
+        train_handler._write_training_summary(
+            {"promoted": True}, "alpha-engine-research", "2026-06-13",
+        )
+
+
+def test_write_training_summary_annotation_failure_is_non_fatal(monkeypatch):
+    """The prior-cycle subsample-noise-floor annotation is a best-effort READ of
+    last cycle's latest.json (a percent-change reference only). A failure there
+    must NOT block persisting the current (load-bearing) summary — the SSOT write
+    still happens."""
+    fake = _FakeS3()
+    monkeypatch.setattr("boto3.client", lambda *a, **k: fake)
+
+    def _boom(*a, **k):
+        raise RuntimeError("prior-cycle latest.json unreadable")
+    monkeypatch.setattr(train_handler, "_annotate_subsample_noise_floor", _boom)
+
+    train_handler._write_training_summary(
+        {"promoted": True, "test_ic": 0.06}, "alpha-engine-research", "2026-06-13",
+    )
+
+    # Dated + latest SSOT both written despite the annotation failure.
+    assert "predictor/metrics/training_summary_2026-06-13.json" in fake.objects
+    assert "predictor/metrics/training_summary_latest.json" in fake.objects
 
 
 def test_meta_training_auto_skips_and_reloads_when_summary_present(monkeypatch):

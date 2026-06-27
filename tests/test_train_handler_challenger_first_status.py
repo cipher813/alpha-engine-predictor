@@ -49,7 +49,7 @@ def _capture_subject(monkeypatch, result):
         captured["body"] = body
         return True
 
-    monkeypatch.setattr("alpha_engine_lib.email_sender.send_email", _fake_send)
+    monkeypatch.setattr("krepis.email_sender.send_email", _fake_send)
     monkeypatch.setattr(cfg, "EMAIL_SENDER", "sender@example.com")
     monkeypatch.setattr(cfg, "EMAIL_RECIPIENTS", ["ops@example.com"])
     ok = train_handler.send_training_email(result, "2026-06-13")
