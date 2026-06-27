@@ -503,6 +503,64 @@ def build_train_meta_features(
     return feats
 
 
+def select_non_noise_features(
+    meta_X,
+    meta_y,
+    row_dates,
+    feature_names: list[str],
+    ic_noise_threshold: float,
+) -> tuple[list[int], list[str], dict]:
+    """config#940: standalone-IC noise pruning for the L2 meta-feature set.
+
+    Computes each feature's standalone cross-sectional rank IC (the SAME
+    ``per_feature_standalone_ic`` already used as an OBSERVE diagnostic — no
+    refit, each column is an OOS L1 prediction or context feature) and flags a
+    feature as NOISE when its measurable ``|xsec_ic| < ic_noise_threshold``.
+
+    Returns ``(keep_idx, keep_names, report)`` where ``keep_idx`` indexes the
+    columns of ``meta_X`` to retain (in original order) and ``report`` carries
+    per-feature ``{xsec_ic, kept, reason}`` for the manifest/log.
+
+    Safety contract (the reason this is callable but only acted on behind
+    ``AUTO_PRUNE_NOISE_FEATURES``):
+
+    - A feature with an UNMEASURABLE IC (``xsec_ic is None`` — e.g. a constant
+      column with no cross-sectional variance, or too few finite dates) is
+      ALWAYS kept. Pruning is a positive evidence-of-noise action, never the
+      absence of evidence.
+    - If pruning would drop EVERY feature, nothing is pruned (a degenerate
+      empty feature set is never a valid model — surface it, don't ship it).
+    """
+    from training.leakfree_meta_ic import per_feature_standalone_ic
+
+    ics = per_feature_standalone_ic(meta_X, meta_y, row_dates, feature_names)
+    report: dict = {}
+    keep_idx: list[int] = []
+    for j, name in enumerate(feature_names):
+        xsec_ic = ics.get(name, {}).get("xsec_ic")
+        if xsec_ic is None:
+            kept, reason = True, "ic_unmeasurable"
+        elif abs(xsec_ic) < ic_noise_threshold:
+            kept, reason = False, "below_ic_noise_threshold"
+        else:
+            kept, reason = True, "above_ic_noise_threshold"
+        report[name] = {"xsec_ic": xsec_ic, "kept": kept, "reason": reason}
+        if kept:
+            keep_idx.append(j)
+
+    # Never ship a degenerate empty feature set: if every feature flagged as
+    # noise, prune nothing and let the model train on the full set (the
+    # operator can lower the threshold or fix upstream signal quality).
+    if not keep_idx:
+        for name in report:
+            report[name]["kept"] = True
+            report[name]["reason"] = "all_below_threshold_prune_skipped"
+        return list(range(len(feature_names))), list(feature_names), report
+
+    keep_names = [feature_names[j] for j in keep_idx]
+    return keep_idx, keep_names, report
+
+
 def _select_promotion_ic_series(cpcv_meta_ic, leakfree_meta_ic) -> tuple[list, str]:
     """L4565c: choose the IC distribution that feeds the W1.3 promotion battery
     (downside-Sortino + overfit-DSR), preferring the CPCV per-combo `ics`.
@@ -1959,6 +2017,55 @@ def run_meta_training(
         )
     meta_X = meta_X_all[canonical_finite_mask]
     meta_y = canonical_y_full[canonical_finite_mask]
+
+    # ── config#940: AUTO_PRUNE noise-detected features (DEFAULT OFF) ─────────
+    # The standalone per-feature IC ("is this column real cross-sectional alpha
+    # or noise?") has existed as an OBSERVE-only diagnostic since the W4 watch
+    # item (L4469). cfg.AUTO_PRUNE_NOISE_FEATURES + cfg.IC_NOISE_THRESHOLD were
+    # defined but had ZERO call sites — the auto-pruning was defined-but-unwired.
+    # This is the wiring: when the operator flips the flag on, features whose
+    # |standalone xsec-IC| < IC_NOISE_THRESHOLD are EXCLUDED from the L2 feature
+    # set BEFORE the champion fit — so the pruning flows into meta_X, the fitted
+    # /persisted meta_model._feature_names, the drift reference, every downstream
+    # leak-free/CPCV refit (all keyed off TRAIN_META_FEATURES/meta_X), and the
+    # manifest's l2_features. DEFAULT OFF ⇒ byte-identical to today; flipping the
+    # flag is the ONLY thing that changes behavior. Unmeasurable-IC features are
+    # always kept, and a would-be-empty feature set is never shipped (see
+    # select_non_noise_features).
+    feature_prune_report: dict = {"enabled": False}
+    if bool(getattr(cfg, "AUTO_PRUNE_NOISE_FEATURES", False)):
+        _prune_dates = [
+            r.get("date")
+            for r, _m in zip(oos_meta_rows, canonical_finite_mask) if _m
+        ]
+        _keep_idx, _keep_names, _prune_per_feature = select_non_noise_features(
+            meta_X, meta_y, _prune_dates, TRAIN_META_FEATURES,
+            float(getattr(cfg, "IC_NOISE_THRESHOLD", 0.005)),
+        )
+        _pruned = [f for f in TRAIN_META_FEATURES if f not in set(_keep_names)]
+        feature_prune_report = {
+            "enabled": True,
+            "ic_noise_threshold": float(getattr(cfg, "IC_NOISE_THRESHOLD", 0.005)),
+            "pruned": _pruned,
+            "kept": list(_keep_names),
+            "per_feature": _prune_per_feature,
+        }
+        if _pruned:
+            log.warning(
+                "config#940 AUTO_PRUNE: excluding %d noise feature(s) "
+                "(|xsec_ic| < %.4f) from the L2: %s",
+                len(_pruned),
+                float(getattr(cfg, "IC_NOISE_THRESHOLD", 0.005)),
+                _pruned,
+            )
+            meta_X = meta_X[:, _keep_idx]
+            TRAIN_META_FEATURES = _keep_names
+        else:
+            log.info(
+                "config#940 AUTO_PRUNE on but no features below IC noise "
+                "threshold %.4f — feature set unchanged.",
+                float(getattr(cfg, "IC_NOISE_THRESHOLD", 0.005)),
+            )
 
     # config#859: persist the training feature-drift reference (cross-sectional
     # META_FEATURES subsample) so daily inference can KS-test its feature
@@ -4031,6 +4138,11 @@ def run_meta_training(
                 # W4 watch + L4469 P2 (OBSERVE): is the meta IC real alpha +
                 # pre-2020 drag. NOT gated.
                 "meta_l1_standalone_alpha_ic": meta_l1_standalone_alpha_ic,
+                # config#940: which L2 features (if any) were excluded by the
+                # AUTO_PRUNE_NOISE_FEATURES standalone-IC noise filter. When the
+                # flag is OFF this records {"enabled": False} and l2_features is
+                # unchanged.
+                "feature_prune": feature_prune_report,
                 "meta_oos_ic_leakfree_no_expected_move": meta_oos_ic_leakfree_no_expected_move,
                 "meta_oos_ic_leakfree_post2020": meta_oos_ic_leakfree_post2020,
                 # W4.1 (OBSERVE): nonlinear-L2 shadow leak-free meta IC.
