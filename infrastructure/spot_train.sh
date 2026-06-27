@@ -54,6 +54,12 @@ export HOME="${HOME:-/home/ec2-user}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# #883 — captured BEFORE the flag-parse loop consumes "$@" so the mid-run
+# spot-reclaim relaunch can re-exec this script with the IDENTICAL argv
+# (--full-only / --model-zoo-spec <id> / --instance-type X / etc.). A
+# relaunched attempt MUST re-run under the same mode it was invoked with.
+_ORIG_ARGS=("$@")
+
 # ── Configuration ──────────────────────────────────────────────────────────────
 AWS_REGION="${AWS_REGION:-us-east-1}"
 S3_BUCKET="${S3_BUCKET:-alpha-engine-research}"
@@ -107,6 +113,29 @@ AMI_ID="ami-0c421724a94bba6d6"  # Amazon Linux 2023 x86_64 (Python 3.12, SSM age
 # Spot-side watchdog budget: meta-trainer typically completes 40-70 min;
 # include pip install + smoke + full run. 90 min with headroom.
 MAX_RUNTIME_SECONDS="${MAX_RUNTIME_SECONDS:-5400}"
+# #883 — bounded mid-run spot-reclaim relaunch. When AWS reclaims the spot
+# *mid-workload* (the 2026-05-30 DataPhase1 incident class:
+# instance-terminated-no-capacity / Server.SpotInstanceTermination), the
+# cleanup() EXIT trap relaunches a FRESH spot up to MAX_SPOT_ATTEMPTS, re-using
+# the S3-staged config + the same argv. The classify→decide DECISION is the lib
+# chokepoint `python -m nousergon_lib.ec2_spot relaunch-decision` (lib v0.65.0+,
+# now krepis.ec2_spot): ONLY a confirmed reclaim relaunches; a genuine workload
+# failure (OOM / crash / timeout) classifies as "other"/"unknown" and fails loud
+# — a blind retry would mask a real training bug. SPOT_ATTEMPT is threaded across
+# re-execs via the env (first run = 1).
+#
+# MAX_SPOT_ATTEMPTS ↔ per-attempt-budget coupling (#883 requirement): each
+# attempt costs ~7-min boot + up to MAX_RUNTIME_SECONDS of workload. The lib's
+# --sf-execution-timeout/--per-attempt-seconds guard refuses to advise a relaunch
+# the OUTER budget cannot absorb. The predictor Saturday retrain runs from a weekly
+# cron (`spot_train.sh --full-only`), NOT under a Step-Functions executionTimeout,
+# so there is no outer SF budget to couple to — SF_EXECUTION_TIMEOUT defaults empty
+# (guard inert; bound is MAX_SPOT_ATTEMPTS only). If this launcher is ever wired
+# under an SF state with an executionTimeout, set SF_EXECUTION_TIMEOUT to that
+# budget and the lib guard activates ((attempt+1)*MAX_RUNTIME_SECONDS must fit).
+MAX_SPOT_ATTEMPTS="${MAX_SPOT_ATTEMPTS:-2}"
+SPOT_ATTEMPT="${SPOT_ATTEMPT:-1}"
+SF_EXECUTION_TIMEOUT="${SF_EXECUTION_TIMEOUT:-}"
 # KEY_NAME is still passed to run-instances so emergency SSH stays possible
 # during the validation window (the SG's port 22 ingress is dropped only in
 # the migration's PR 3, after this PR validates against a Saturday SF).
@@ -165,6 +194,7 @@ echo "  Region        : $AWS_REGION"
 echo "  Branch        : $BRANCH"
 echo "  Mode          : $MODE"
 echo "  S3 bucket     : $S3_BUCKET"
+echo "  Spot attempt  : $SPOT_ATTEMPT/$MAX_SPOT_ATTEMPTS  (#883 — relaunch on confirmed mid-run reclaim)"
 echo ""
 
 # ── Preflight checks ──────────────────────────────────────────────────────────
@@ -214,6 +244,12 @@ S3_STAGING="s3://${S3_BUCKET}/${S3_STAGING_PREFIX}"
 # Cleanup — always terminate the instance + remove the S3 staging prefix.
 # (S3 lifecycle on tmp/ is the belt-and-suspenders if the trap never fires.)
 cleanup() {
+  # #883 — capture the dispatcher's exit status FIRST (a non-zero exit is what
+  # a mid-run spot reclaim surfaces as, once the SSM workload step fails). Every
+  # command below (echo / aws ... || true) would otherwise overwrite $? and a
+  # later `exit "$exit_code"` is required so the EXIT trap never masks a real
+  # failure as rc=0 (the L4485 class the sibling backtester also guards).
+  local exit_code=$?
   echo ""
   # Belt-and-suspenders (STEP 3): BEFORE terminating the spot, confirm where
   # each workload's spot-side log landed in S3. The spot SELF-SHIP via
@@ -238,10 +274,60 @@ cleanup() {
   echo "    (spot logs above are the FULL workload stdout/stderr — primary diagnostic on RC=-1/OOM)"
   echo "    Failure diagnostics record (if any): s3://${S3_BUCKET}/_spot_diagnostics/ae-predictor/${_logdate_now}.json"
   echo ""
+
+  # #883 — mid-run spot-reclaim relaunch DECISION (lib chokepoint). On a non-zero
+  # exit with a provisioned instance, ask the lib whether this was a confirmed AWS
+  # reclaim that warrants a fresh-spot relaunch. The lib's classify_termination
+  # (describe-instances) MUST run while the instance still exists, so decide HERE,
+  # BEFORE terminate-instances. exit 0 = relaunch; NO_RELAUNCH_EXIT_CODE (75) /
+  # any other = hold (fail loud). The actual `exec` happens AFTER teardown so the
+  # dead worker + its S3 staging are already cleaned when the fresh attempt starts.
+  local _spot_relaunch=0
+  if [ "$exit_code" -ne 0 ] && [ -n "${INSTANCE_ID:-}" ] && [ "$SPOT_ATTEMPT" -lt "$MAX_SPOT_ATTEMPTS" ]; then
+    local _decide_out _decide_rc
+    _decide_out="$("$LIB_PYTHON" -m nousergon_lib.ec2_spot relaunch-decision \
+      --instance-id "$INSTANCE_ID" \
+      --region "$AWS_REGION" \
+      --attempt "$SPOT_ATTEMPT" \
+      --max-attempts "$MAX_SPOT_ATTEMPTS" \
+      ${SF_EXECUTION_TIMEOUT:+--sf-execution-timeout "$SF_EXECUTION_TIMEOUT" --per-attempt-seconds "$MAX_RUNTIME_SECONDS"} \
+      2>/dev/null)"
+    _decide_rc=$?
+    echo "    spot relaunch-decision (attempt $SPOT_ATTEMPT/$MAX_SPOT_ATTEMPTS): rc=$_decide_rc ${_decide_out:+[$_decide_out]}"
+    if [ "$_decide_rc" -eq 0 ]; then
+      _spot_relaunch=1
+      # Fail-loud-but-recovering: record the absorbed interruption on a named
+      # CloudWatch surface so the retry is observable, never silent (mirrors the
+      # #349 data launcher's AlphaEngine/SpotInterruptionRetry metric).
+      aws cloudwatch put-metric-data \
+        --namespace "AlphaEngine" \
+        --metric-name "SpotInterruptionRetry" \
+        --dimensions "Process=predictor-training" \
+        --value 1 --unit "Count" \
+        --region "$AWS_REGION" 2>/dev/null || true
+    fi
+  fi
+
   echo "==> Terminating spot instance $INSTANCE_ID..."
   aws ec2 terminate-instances --instance-ids "$INSTANCE_ID" --region "$AWS_REGION" --output text > /dev/null 2>&1 || true
   aws s3 rm "$S3_STAGING" --recursive --quiet 2>/dev/null || true
   echo "  Instance terminated; S3 staging cleaned."
+
+  # #883 — on a classified reclaim, relaunch a FRESH spot with the SAME argv,
+  # threading the incremented SPOT_ATTEMPT via the env. `trap - EXIT` first so the
+  # exec'd process installs its own trap cleanly; exec replaces this PID so the
+  # relaunch is bounded by SPOT_ATTEMPT<MAX_SPOT_ATTEMPTS (re-checked above). The
+  # exec MUST stay in bash — it replaces the launcher's own PID and cannot be lifted.
+  if [ "$_spot_relaunch" = "1" ]; then
+    echo "==> Spot RECLAIMED by AWS mid-run — relaunching on a fresh spot (attempt $((SPOT_ATTEMPT + 1))/$MAX_SPOT_ATTEMPTS)"
+    trap - EXIT
+    SPOT_ATTEMPT=$((SPOT_ATTEMPT + 1)) exec bash "$0" ${_ORIG_ARGS[@]+"${_ORIG_ARGS[@]}"}
+  fi
+
+  # #883 — CRITICAL: re-exit with the captured status so a recovered cleanup path
+  # (the echos / `|| true` teardown above all succeed) can never mask a real
+  # failure as rc=0 to the cron/orchestration wrapper.
+  exit "$exit_code"
 }
 trap cleanup EXIT
 
