@@ -15,6 +15,10 @@ from pathlib import Path
 import yaml
 
 from krepis.secrets import get_secret
+# Canonical experiment-package config resolver (alpha-engine-config#1157): the
+# lift of the five inline _find_config / load_config / config_loader copies into
+# the shared-lib chokepoint. The predictor config search below delegates to it.
+from nousergon_lib.config import resolve_experiment_config
 
 _log = logging.getLogger(__name__)
 
@@ -24,14 +28,26 @@ _CONFIG_DIR = Path(__file__).parent / "config"
 # Experiment package (HARNESS_EXPERIMENT_CLASSIFICATION.md §3): beliefs load
 # from experiments/$ALPHA_ENGINE_EXPERIMENT_ID/predictor/ ahead of the legacy
 # top-level predictor/ (kept as fallback through the transition).
+#
+# Delegates to the canonical nousergon-lib resolver (resolve_experiment_config,
+# alpha-engine-config#1157). The repo-local fallback is the subdir-flattened
+# <repo>/config/predictor.yaml (the staged-image location), passed as
+# repo_local_fallback. _EXPERIMENT_ID is retained for the diagnostic logging
+# that names the active slot (assert_model_specs_loaded). Divergence reconciled
+# to the consensus order: the inline copy grouped candidates per-root
+# (root1-exp, root1-legacy, root2-exp, root2-legacy); the lib uses the
+# cross-repo-consensus per-layer order (all experiment-package, then all
+# legacy) — the correct precedence the other four consumers already used, so a
+# legacy copy under ~/ no longer shadows an experiment-package copy under
+# <repo>/.. .
 _EXPERIMENT_ID = os.environ.get("ALPHA_ENGINE_EXPERIMENT_ID", "reference")
-_CONFIG_SEARCH = [
-    Path.home() / "alpha-engine-config" / "experiments" / _EXPERIMENT_ID / "predictor" / "predictor.yaml",
-    Path.home() / "alpha-engine-config" / "predictor" / "predictor.yaml",
-    Path(__file__).parent.parent / "alpha-engine-config" / "experiments" / _EXPERIMENT_ID / "predictor" / "predictor.yaml",
-    Path(__file__).parent.parent / "alpha-engine-config" / "predictor" / "predictor.yaml",
-    _CONFIG_DIR / "predictor.yaml",
-]
+_CONFIG_SEARCH = resolve_experiment_config(
+    "predictor",
+    "predictor.yaml",
+    repo_root=Path(__file__).parent,
+    repo_local_fallback=_CONFIG_DIR / "predictor.yaml",
+    experiment_id=_EXPERIMENT_ID,
+)
 _CONFIG_PATH = next((p for p in _CONFIG_SEARCH if p.exists()), _CONFIG_DIR / "predictor.yaml")
 
 

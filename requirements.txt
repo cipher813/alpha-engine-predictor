@@ -22,10 +22,10 @@ scikit-learn>=1.3.0
 # modules (secrets/dates/logging/trading_calendar/alerts/email_sender/metrics +
 # the flow-doctor wiring glue) import from MIT ``krepis``; AGPL edge modules
 # (quant/arcticdb/contracts/preflight/phase_registry/eval_artifacts/agent_schemas/
-# risk_model) import from ``nousergon_lib``. nousergon-lib 0.69.0 depends on
+# risk_model) import from ``nousergon_lib``. nousergon-lib 0.70.0 depends on
 # krepis transitively, but the dual-import warrants a direct krepis pin too.
 krepis[flow_doctor]>=0.2.0
-nousergon-lib[arcticdb,flow-doctor,quant-xs,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.69.0
+nousergon-lib[arcticdb,flow-doctor,quant-xs,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.70.0
 
 # Training dependencies (not needed in Lambda)
 arcticdb>=6.11
