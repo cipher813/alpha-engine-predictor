@@ -54,7 +54,7 @@ from __future__ import annotations
 import logging
 from dataclasses import asdict, dataclass
 from io import BytesIO
-from typing import Any
+from typing import Any, Mapping
 
 import pandas as pd
 
@@ -182,15 +182,283 @@ def excess_tier_to_protective_severity(tier: str | None) -> int:
     return DRAWDOWN_PROTECTIVE_SEVERITY.get(tier, 0)
 
 
+# ── Signed continuous regime score (issue #1299) ─────────────────────────
+#
+# Convention (frozen fleet-wide, issue #1299): +1 = bull / risk-on,
+# 0 = neutral, -1 = bear / risk-off.
+#
+# The categorical `effective_regime` above is a *max-severity* merge whose
+# only bull/neutral-capable leg is the HMM argmax; every other leg is a
+# one-directional bear ratchet, and the natively-signed continuous head
+# (intensity_z) plus the HMM's own conviction (the posterior) never enter
+# the composition at all. `compose_regime_score` fixes the composition:
+# each head is defined as a signed contribution on [-1, 1], they are blended
+# with documented weights, intensity_z is folded in, and the HMM enters as a
+# posterior EXPECTATION (E = P(bull) - P(bear)) — keeping conviction while
+# demoting the stuck argmax.
+
+# Blend weights (v0 baseline — issue #1299 §2 stipulates these are a stated
+# 1/N-style baseline to be re-fit to forward 21d market-relative return by
+# the backtest decision artifact; they are down-weighted vs equal to avoid
+# triple-counting SPY, which the HMM / intensity_z / drawdown legs all load
+# on). Weights are renormalized over the heads that are actually present, so
+# a missing leg never silently biases the score toward 0.
+REGIME_SCORE_WEIGHTS: dict[str, float] = {
+    # Natively-signed, most market-grounded continuous head. Highest weight:
+    # it is the only leg that was previously EXCLUDED yet is the cleanest
+    # signed read of macro stress.
+    "intensity_z": 0.40,
+    # HMM posterior expectation (conviction-weighted, argmax demoted).
+    "hmm": 0.35,
+    # Downside-only drawdown legs — can only push toward bear ([-1, 0]),
+    # honest about what a drawdown measures. Down-weighted because they
+    # correlate with the SPY-driven heads above.
+    "drawdown_spy": 0.15,
+    "drawdown_excess": 0.10,
+}
+
+# tanh squash scale for intensity_z: intensity_z is a z-score in ~[-3, 3];
+# dividing by 2 puts a 1σ move at tanh(0.5)≈0.46 and a 2σ move at
+# tanh(1.0)≈0.76, so typical readings span most of [-1, 1] without
+# saturating on noise.
+INTENSITY_Z_TANH_SCALE: float = 2.0
+
+# HMM staleness demotion (issue #1299: "demote the stuck HMM argmax").
+# The audited cohort had a 56-week filter run-length — a documented
+# label-stability artifact, not 56 weeks of genuine signal. Beyond mapping
+# argmax→posterior expectation (which already drops the hard argmax), a HMM
+# stuck in the same state for many weeks has its conviction multiplicatively
+# discounted toward 0 (neutral) so it cannot single-handedly force the
+# blend. The discount is a soft ramp: full weight up to ``_grace`` weeks,
+# decaying to a ``_floor`` multiplier as it sticks. This keeps a freshly
+# transitioned, high-conviction HMM authoritative while neutering a stuck
+# one — exactly the defect the issue calls out.
+HMM_STALENESS_GRACE_WEEKS: int = 8
+HMM_STALENESS_HALFLIFE_WEEKS: float = 12.0
+HMM_STALENESS_FLOOR: float = 0.25
+
+# Categorical-projection thresholds on the signed score (issue #1299 §"Why
+# [-1,1]": symmetric gating). |score| < t_neutral ⇒ neutral; the band is
+# symmetric so the projection is sign-honest.
+REGIME_SCORE_NEUTRAL_BAND: float = 0.20
+
+# Downside-only tier ladders: SPY caution/risk_off and excess alpha_bleed
+# map into [-1, 0] (they can never vote positive).
+_SPY_TIER_SCORE: dict[str, float] = {
+    "risk_on": 0.0,
+    "caution": -0.5,
+    "risk_off": -1.0,
+}
+_EXCESS_TIER_SCORE: dict[str, float] = {
+    "risk_on": 0.0,
+    "alpha_bleed": -1.0,
+}
+
+
+def _tanh(x: float) -> float:
+    import math
+
+    return math.tanh(x)
+
+
+def hmm_staleness_discount(weeks_in_current_state: int | None) -> float:
+    """Multiplier in ``[HMM_STALENESS_FLOOR, 1.0]`` that demotes a STUCK
+    HMM argmax (issue #1299). Full weight (1.0) up to the grace window, then
+    an exponential decay toward ``HMM_STALENESS_FLOOR`` as the state sticks
+    (the audited cohort's 56-week run-length is the label-stability artifact
+    this neutralizes). ``None``/unknown ⇒ no discount (1.0)."""
+    if weeks_in_current_state is None:
+        return 1.0
+    try:
+        wk = int(weeks_in_current_state)
+    except (TypeError, ValueError):
+        return 1.0
+    if wk <= HMM_STALENESS_GRACE_WEEKS:
+        return 1.0
+    import math
+
+    over = wk - HMM_STALENESS_GRACE_WEEKS
+    decay = 0.5 ** (over / HMM_STALENESS_HALFLIFE_WEEKS)
+    return HMM_STALENESS_FLOOR + (1.0 - HMM_STALENESS_FLOOR) * decay
+
+
+def hmm_posterior_expectation(
+    probs: Mapping[str, float] | None,
+    *,
+    weeks_in_current_state: int | None = None,
+) -> float | None:
+    """HMM head as a signed posterior EXPECTATION on [-1, 1]:
+
+        E = (+1)·P(bull) + 0·P(neutral) + (-1)·P(bear)
+
+    Keeps the HMM's conviction while *demoting the stuck argmax* (issue
+    #1299): a stuck ``P(bear)=1.00`` argmax that previously dominated the
+    categorical max-severity merge now contributes only its posterior
+    expectation, and that expectation is further multiplicatively discounted
+    by ``hmm_staleness_discount(weeks_in_current_state)`` so a HMM stuck in
+    one state for many weeks (a documented label-stability artifact) decays
+    toward neutral instead of dominating the blend. Returns ``None`` when no
+    usable posterior is supplied (the leg drops out of the renormalized
+    blend rather than voting a fabricated 0).
+    """
+    if not probs:
+        return None
+    try:
+        p_bull = float(probs.get("bull", 0.0))
+        p_bear = float(probs.get("bear", 0.0))
+    except (TypeError, ValueError):
+        return None
+    expectation = max(-1.0, min(1.0, p_bull - p_bear))
+    return expectation * hmm_staleness_discount(weeks_in_current_state)
+
+
+def spy_tier_to_score(tier: str | None) -> float | None:
+    """SPY drawdown tier → downside-only signed contribution in [-1, 0].
+    Unknown/None ⇒ ``None`` (leg absent, drops out of the blend)."""
+    if tier is None:
+        return None
+    return _SPY_TIER_SCORE.get(tier)
+
+
+def excess_tier_to_score(tier: str | None) -> float | None:
+    """Excess (book-vs-market) tier → downside-only contribution in [-1, 0]."""
+    if tier is None:
+        return None
+    return _EXCESS_TIER_SCORE.get(tier)
+
+
+def intensity_z_to_score(intensity_z: float | None) -> float | None:
+    """Composite intensity z-score → signed [-1, 1] via tanh.
+
+    ``intensity_z`` MUST already be in the standardized fleet convention
+    (positive = risk-on / bull), i.e. the value carried in the substrate
+    payload's ``composite.intensity_z`` (sign standardized at the
+    substrate chokepoint — issue #1299 footgun note). ``tanh(z / s)`` is
+    natively zero-centered so neutral z ⇒ 0 score.
+    """
+    if intensity_z is None:
+        return None
+    try:
+        z = float(intensity_z)
+    except (TypeError, ValueError):
+        return None
+    import math
+
+    if not math.isfinite(z):
+        return None
+    return _tanh(z / INTENSITY_Z_TANH_SCALE)
+
+
+def regime_score_to_categorical(
+    score: float, *, neutral_band: float = REGIME_SCORE_NEUTRAL_BAND
+) -> str:
+    """Project the signed [-1, 1] score onto the legacy 3-class macro
+    vocabulary at documented symmetric thresholds, so existing categorical
+    consumers keep working unchanged:
+
+        score >  +neutral_band ⇒ "bull"
+        |score| ≤ neutral_band ⇒ "neutral"
+        score <  -neutral_band ⇒ "bear"
+    """
+    if score > neutral_band:
+        return "bull"
+    if score < -neutral_band:
+        return "bear"
+    return "neutral"
+
+
+def compose_regime_score(
+    *,
+    hmm_probs: Mapping[str, float] | None = None,
+    hmm_weeks_in_state: int | None = None,
+    intensity_z: float | None = None,
+    spy_tier: str | None = None,
+    excess_tier: str | None = None,
+    forced_bear: bool = False,
+    bocpd_change_signal: bool = False,
+    bocpd_confidence: float | None = None,
+    weights: Mapping[str, float] | None = None,
+) -> dict[str, Any]:
+    """Signed continuous regime score on [-1, 1] (issue #1299).
+
+    Each head is a signed contribution on [-1, 1]; they are blended with
+    ``REGIME_SCORE_WEIGHTS`` renormalized over the *present* heads. The HMM
+    enters as a posterior expectation (argmax demoted); ``intensity_z`` is
+    folded in (it was previously excluded); the two drawdown legs are
+    downside-only ([-1, 0]). BOCPD is NOT an axis vote — a detected change
+    signal is surfaced as an uncertainty flag for the hysteresis/gate layer.
+
+    The asymmetric protective floor is preserved: ``forced_bear`` clamps the
+    score to ``-1.0`` so a confirmed multi-signal bear (the substrate
+    ``vix_bear AND spy_30d_bear`` tail override) can never be washed out by
+    averaging.
+
+    Returns:
+        {
+          "regime_score": <float in [-1, 1]>,
+          "regime_score_categorical": <bull/neutral/bear projection>,
+          "head_scores": {head: signed contribution, present heads only},
+          "weights_used": {head: renormalized weight},
+          "forced_bear_floor_applied": <bool>,
+          "bocpd_change_signal": <bool>,
+        }
+    """
+    w = dict(weights or REGIME_SCORE_WEIGHTS)
+
+    raw_heads: dict[str, float | None] = {
+        "intensity_z": intensity_z_to_score(intensity_z),
+        "hmm": hmm_posterior_expectation(
+            hmm_probs, weeks_in_current_state=hmm_weeks_in_state
+        ),
+        "drawdown_spy": spy_tier_to_score(spy_tier),
+        "drawdown_excess": excess_tier_to_score(excess_tier),
+    }
+    head_scores = {k: v for k, v in raw_heads.items() if v is not None}
+
+    present_weight = sum(w.get(k, 0.0) for k in head_scores)
+    if present_weight > 0:
+        weights_used = {k: w.get(k, 0.0) / present_weight for k in head_scores}
+        score = sum(weights_used[k] * head_scores[k] for k in head_scores)
+    else:
+        weights_used = {}
+        score = 0.0
+
+    floor_applied = False
+    if forced_bear:
+        # Asymmetric protective floor — clamp defensive regardless of blend.
+        score = -1.0
+        floor_applied = True
+
+    score = max(-1.0, min(1.0, score))
+
+    return {
+        "regime_score": float(score),
+        "regime_score_categorical": regime_score_to_categorical(score),
+        "head_scores": head_scores,
+        "weights_used": weights_used,
+        "forced_bear_floor_applied": floor_applied,
+        "hmm_staleness_discount": hmm_staleness_discount(hmm_weeks_in_state),
+        "bocpd_change_signal": bool(bocpd_change_signal),
+        "bocpd_confidence": (
+            None if bocpd_confidence is None else float(bocpd_confidence)
+        ),
+    }
+
+
 def compose_effective_regime(
     *,
     hmm_argmax: str | None = None,
     spy_tier: str | None = None,
     excess_tier: str | None = None,
     forced_bear: bool = False,
+    hmm_probs: Mapping[str, float] | None = None,
+    hmm_weeks_in_state: int | None = None,
+    intensity_z: float | None = None,
+    bocpd_change_signal: bool = False,
+    bocpd_confidence: float | None = None,
 ) -> dict[str, Any]:
     """Compose effective regime (macro axis) + drawdown protective
-    state (separate axis).
+    state (separate axis) + the signed continuous regime score (issue #1299).
 
     Returns:
         {
@@ -199,7 +467,18 @@ def compose_effective_regime(
           "drawdown_tier": <raw SPY hysteresis state: risk_on/caution/risk_off, or None>,
           "drawdown_protective_severity": <0 | 1 | 2 ordinal across the drawdown axis>,
           "forced_bear": <bool>,
+          # Additive (issue #1299, S3-contract ADD-don't-rename):
+          "regime_score": <float in [-1, 1]>,
+          "regime_score_categorical": <bull/neutral/bear projection of the score>,
+          "regime_score_detail": {head_scores, weights_used, ...},
         }
+
+    Backward-compat contract (issue #1299 rollout step 1 — observe-first):
+    the legacy categorical ``effective_regime`` (most-protective over the
+    HMM argmax + bear-ratchet legs) is UNCHANGED — existing categorical
+    consumers see identical behaviour. The signed ``regime_score`` is added
+    ADDITIVELY alongside it (no rename, no behaviour change) so it can be
+    logged + backtested before any consumer cuts over.
 
     Type-system separation (v0.42.0 / 2026-05-28 —
     caution-regime-retirement-260528.md):
@@ -231,12 +510,34 @@ def compose_effective_regime(
         excess_tier_to_protective_severity(excess_tier),
     )
 
+    score_block = compose_regime_score(
+        hmm_probs=hmm_probs,
+        hmm_weeks_in_state=hmm_weeks_in_state,
+        intensity_z=intensity_z,
+        spy_tier=spy_tier,
+        excess_tier=excess_tier,
+        forced_bear=forced_bear,
+        bocpd_change_signal=bocpd_change_signal,
+        bocpd_confidence=bocpd_confidence,
+    )
+
     return {
         "effective_regime": effective,
         "drivers": drivers,
         "drawdown_tier": spy_tier,
         "drawdown_protective_severity": drawdown_severity,
         "forced_bear": forced_bear,
+        # Additive signed-continuous outputs (issue #1299).
+        "regime_score": score_block["regime_score"],
+        "regime_score_categorical": score_block["regime_score_categorical"],
+        "regime_score_detail": {
+            "head_scores": score_block["head_scores"],
+            "weights_used": score_block["weights_used"],
+            "forced_bear_floor_applied": score_block["forced_bear_floor_applied"],
+            "hmm_staleness_discount": score_block["hmm_staleness_discount"],
+            "bocpd_change_signal": score_block["bocpd_change_signal"],
+            "bocpd_confidence": score_block["bocpd_confidence"],
+        },
     }
 
 

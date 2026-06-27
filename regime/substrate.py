@@ -293,6 +293,12 @@ def build_regime_substrate(
         payload["drawdown"] = dict(drawdown_block)
         spy_leg = drawdown_block.get("spy") or {}
         excess_leg = drawdown_block.get("excess") or {}
+        # issue #1299: fold the HMM posterior (conviction, argmax demoted),
+        # the natively-signed composite intensity_z (sign already
+        # standardized to risk-on-positive at this chokepoint — see
+        # composite_block above), and the BOCPD change signal into the
+        # composition so the additive ``regime_score`` is a true blend, not
+        # the HMM-argmax-OR'd-with-bear-flags categorical merge.
         payload["effective_regime"] = compose_effective_regime(
             hmm_argmax=hmm_argmax,
             spy_tier=spy_leg.get("tier"),
@@ -300,6 +306,11 @@ def build_regime_substrate(
                 excess_leg.get("tier")
                 if excess_leg.get("available") else None
             ),
+            hmm_probs=hmm_block.get("probs"),
+            hmm_weeks_in_state=hmm_block.get("weeks_in_current_state"),
+            intensity_z=composite_block.get("intensity_z"),
+            bocpd_change_signal=bool(bocpd_block.get("change_signal")),
+            bocpd_confidence=bocpd_block.get("change_confidence"),
         )
 
     return payload
@@ -380,9 +391,18 @@ def write_regime_substrate(
         # drawdown leg is present (consumers reading latest.json get the
         # composed value without resolving the full artifact).
         if "effective_regime" in payload:
-            sidecar["effective_regime"] = payload["effective_regime"][
-                "effective_regime"
-            ]
+            eff = payload["effective_regime"]
+            sidecar["effective_regime"] = eff["effective_regime"]
+            # Additive (issue #1299): surface the signed continuous score +
+            # its categorical projection so consumers reading latest.json
+            # can observe/backtest the blend without resolving the full
+            # artifact. ADD, don't rename — the categorical field above is
+            # unchanged.
+            if "regime_score" in eff:
+                sidecar["regime_score"] = eff["regime_score"]
+                sidecar["regime_score_categorical"] = eff[
+                    "regime_score_categorical"
+                ]
         s3_client.put_object(
             Bucket=bucket,
             Key=latest_key,
