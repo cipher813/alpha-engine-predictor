@@ -15,12 +15,12 @@ Pipeline:
      neutral residual log-return per (date, ticker)
   4. Invoke ``validate_cutover_gate`` with 15% relative-lift threshold
   5. Write result JSON via the canonical lib helpers
-     (``alpha_engine_lib.eval_artifacts``):
+     (``nousergon_lib.eval_artifacts``):
      ``s3://{bucket}/predictor/variant_gates/triple_barrier/{run_id}.json``
      plus a ``latest.json`` operator-fetch sidecar at the prefix root.
 
 S3 layout (canonical eval-style flat layout codified in
-``alpha_engine_lib.eval_artifacts`` v0.8.0)::
+``nousergon_lib.eval_artifacts`` v0.8.0)::
 
     predictor/variant_gates/triple_barrier/
       ├── 2605160200.json                # YYMMDDHHMM run_id
@@ -82,8 +82,8 @@ log = logging.getLogger(__name__)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import config as cfg  # noqa: E402
-from alpha_engine_lib.dates import now_dual  # noqa: E402
-from alpha_engine_lib.eval_artifacts import (  # noqa: E402
+from krepis.dates import now_dual  # noqa: E402
+from nousergon_lib.eval_artifacts import (  # noqa: E402
     eval_artifact_key,
     eval_latest_key,
     new_eval_run_id,
@@ -210,7 +210,7 @@ def run_gate(
     """End-to-end Stage 3 cutover-gate evaluation.
 
     Default S3 layout — canonical eval-style flat layout codified in
-    ``alpha_engine_lib.eval_artifacts`` v0.8.0::
+    ``nousergon_lib.eval_artifacts`` v0.8.0::
 
         predictor/variant_gates/triple_barrier/
           {run_id}.json   ← per-invocation artifact (YYMMDDHHMM encodes date)
@@ -240,7 +240,7 @@ def run_gate(
             skips the corresponding S3 load.
         run_id: optional pre-minted run identifier (testing). When None,
             a fresh ``YYMMDDHHMM`` id is minted via
-            ``alpha_engine_lib.eval_artifacts.new_eval_run_id``.
+            ``nousergon_lib.eval_artifacts.new_eval_run_id``.
 
     Returns:
         dict-form gate result (asdict of VariantCutoverGateResult) plus
@@ -302,7 +302,7 @@ def run_gate(
         # First-class run identifier — same-minute collisions are by
         # design (production cron cadence makes them effectively
         # impossible; tests inject explicit run_ids). Per
-        # alpha_engine_lib.eval_artifacts.new_eval_run_id contract.
+        # nousergon_lib.eval_artifacts.new_eval_run_id contract.
         "run_id": run_id,
         "window_days": n_days,
         "horizon_days": horizon_days,

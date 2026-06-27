@@ -98,8 +98,8 @@ def test_preflight_only_does_not_invoke_training_or_promotion():
         "preflight-only must reuse the existing training/preflight.py "
         "TrainingPreflight (do not rebuild a parallel preflight)"
     )
-    assert "import alpha_engine_lib" in payload, (
-        "preflight-only must import alpha_engine_lib to catch lib-pin drift"
+    assert "import nousergon_lib" in payload, (
+        "preflight-only must import nousergon_lib to catch lib-pin drift"
     )
     assert "list_symbols()" in payload, (
         "preflight-only must do a read-only ArcticDB universe probe"

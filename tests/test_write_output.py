@@ -543,7 +543,7 @@ class TestReadExistingPredictions:
 
 
 class TestSubstrateInventoryKeys:
-    """`predictor_decisions` row in alpha_engine_lib.transparency_inventory
+    """`predictor_decisions` row in nousergon_lib.transparency_inventory
     asserts l1_ic, l2_ic, confidence_calibration keys are present in
     predictor/metrics/latest.json. These tests pin the contract."""
 

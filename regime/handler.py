@@ -65,7 +65,7 @@ from regime.features import (
     current_features_from_history,
     fetch_macro_feature_history,
 )
-from nousergon_lib.logging import monitor_handler, setup_logging
+from krepis.logging import monitor_handler, setup_logging
 from regime.hmm import HMMRegimeClassifier
 from regime.substrate import (
     DEFAULT_S3_BUCKET,

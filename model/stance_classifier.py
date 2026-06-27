@@ -4,7 +4,7 @@ dominant discrete label.
 
 Stance taxonomy: 4-element closed vocabulary (``momentum`` / ``value`` /
 ``quality`` / ``catalyst``) defined in
-``alpha_engine_lib.agent_schemas.StanceLiteral``. Loadings shape lives
+``nousergon_lib.agent_schemas.StanceLiteral``. Loadings shape lives
 in ``StanceLoadings``. This module's job: assign loadings + dominant
 stance to each ticker the predictor scores so the executor can route
 to stance-appropriate gates without the LLM agents needing to self-tag.
@@ -39,7 +39,7 @@ from typing import Any
 
 import numpy as np
 
-from alpha_engine_lib.agent_schemas import STANCE_NAMES, StanceLiteral
+from nousergon_lib.agent_schemas import STANCE_NAMES, StanceLiteral
 
 # Cold-start scale parameters. Each parameter sets the "width" of the
 # corresponding smooth function so a feature value at the half-point
@@ -262,7 +262,7 @@ def classify_stance(
 
     ``loadings_dict`` is a dict of 4 floats in [0, 1] summing to 1.0
     (the softmax of raw per-stance scores). It matches the field shape
-    of ``alpha_engine_lib.agent_schemas.StanceLoadings``.
+    of ``nousergon_lib.agent_schemas.StanceLoadings``.
 
     ``dominant_stance`` is ``argmax(loadings_dict)`` — the simple-
     consumer routing label. Ties broken in canonical ``STANCE_NAMES``

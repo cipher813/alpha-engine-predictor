@@ -7,7 +7,7 @@
 #
 # Communication is via `aws ssm send-command` (IAM-authenticated, CloudTrail-
 # audited) — NOT SSH/SCP. Config is staged through S3; secrets are read on
-# the spot via alpha_engine_lib.secrets.get_secret() (SSM Parameter Store),
+# the spot via krepis.secrets.get_secret() (SSM Parameter Store),
 # so there is no `.env` SCP and no `~/.ssh/alpha-engine-key.pem` dependency
 # in the workflow. (PR 2 of the spot-train-260512 SSH/SCP→SSM migration;
 # canonical plan: alpha-engine-docs/private/spot-train-260512.md.)
@@ -413,11 +413,11 @@ log = logging.getLogger('preflight-only')
 #    Importing train_handler transitively imports the lib + training stack
 #    WITHOUT invoking main(), so no training runs.
 log.info('[1/3] Importing training package...')
-import alpha_engine_lib  # lib-pin presence (version asserted by requirements.txt pin)
+import nousergon_lib  # lib-pin presence (version asserted by requirements.txt pin)
 from training import train_handler  # noqa: F401  (import-only; main() NOT called)
 from training import model_zoo  # noqa: F401  (L4544 rotation path; import-only)
 from training.preflight import TrainingPreflight
-log.info('       OK — alpha_engine_lib + training.train_handler + model_zoo import clean')
+log.info('       OK — nousergon_lib + training.train_handler + model_zoo import clean')
 
 # 2. Reuse the EXISTING training preflight (env vars + S3 bucket
 #    *reachability*; check_s3_bucket is a read/head, no object write).
@@ -449,7 +449,7 @@ print()
 print('=' * 60)
 print('  PREFLIGHT-ONLY RESULT: PASS')
 print('=' * 60)
-print(f'  Imports:        alpha_engine_lib + training stack clean')
+print(f'  Imports:        nousergon_lib + training stack clean')
 print(f'  TrainingPreflight: PASS (env + S3 reachable)')
 print(f'  ArcticDB:       {n} universe symbols (probe {probe} latest={latest})')
 print(f'  Training:       SKIPPED (no run_meta_training call)')
@@ -615,7 +615,7 @@ import logging
 # NOTE keep this heredoc free of apostrophes per the bash 3.2 note above.
 import os.path as _osp
 _FD_YAML = _osp.join(_osp.abspath("."), "flow-doctor-model-zoo.yaml")
-from alpha_engine_lib.logging import setup_logging
+from krepis.logging import setup_logging
 setup_logging("predictor-model-zoo", flow_doctor_yaml=_FD_YAML, exclude_patterns=[])
 
 import config as cfg
@@ -632,7 +632,7 @@ log.info('model_zoo spot probe: MODEL_SPECS=%d  config=%s  ALPHA_ENGINE_EXPERIME
 # config#1051: pass a real trading_day so leaderboard / trial_log key on a date,
 # not null (the 6/13 leaderboard had date=null). now_dual is backward-looking.
 try:
-    from alpha_engine_lib.dates import now_dual
+    from krepis.dates import now_dual
     _td = now_dual().trading_day
     date_str = _td.isoformat() if hasattr(_td, 'isoformat') else str(_td)
 except Exception:
@@ -707,7 +707,7 @@ bucket = os.environ.get('S3_BUCKET', 'alpha-engine-research')
 import logging
 import os.path as _osp
 _FD_YAML = _osp.join(_osp.abspath("."), "flow-doctor-model-zoo.yaml")
-from alpha_engine_lib.logging import setup_logging
+from krepis.logging import setup_logging
 setup_logging("predictor-model-zoo", flow_doctor_yaml=_FD_YAML, exclude_patterns=[])
 
 import config as cfg
@@ -723,7 +723,7 @@ if not spec_id:
     raise SystemExit('MODEL_ZOO_SPEC_ID not set on the spot')
 
 try:
-    from alpha_engine_lib.dates import now_dual
+    from krepis.dates import now_dual
     _td = now_dual().trading_day
     date_str = _td.isoformat() if hasattr(_td, 'isoformat') else str(_td)
 except Exception:
@@ -783,7 +783,7 @@ bucket = os.environ.get('S3_BUCKET', 'alpha-engine-research')
 import logging
 import os.path as _osp
 _FD_YAML = _osp.join(_osp.abspath("."), "flow-doctor-model-zoo.yaml")
-from alpha_engine_lib.logging import setup_logging
+from krepis.logging import setup_logging
 setup_logging("predictor-model-zoo", flow_doctor_yaml=_FD_YAML, exclude_patterns=[])
 
 import config as cfg
@@ -796,7 +796,7 @@ log.info('model_zoo select probe: MODEL_SPECS=%d  config=%s  ALPHA_ENGINE_EXPERI
          getattr(cfg, '_EXPERIMENT_ID', os.environ.get('ALPHA_ENGINE_EXPERIMENT_ID', 'reference')))
 
 try:
-    from alpha_engine_lib.dates import now_dual
+    from krepis.dates import now_dual
     _td = now_dual().trading_day
     date_str = _td.isoformat() if hasattr(_td, 'isoformat') else str(_td)
 except Exception:

@@ -3,7 +3,7 @@ regime/substrate.py — regime substrate orchestrator + S3 writer.
 
 Assembles HMM + composite + BOCPD + guardrail outputs into the canonical
 ``regime_substrate.json`` payload and writes it via the canonical
-``alpha_engine_lib.eval_artifacts`` shape (YYMMDDHHMM run_id + latest.json
+``nousergon_lib.eval_artifacts`` shape (YYMMDDHHMM run_id + latest.json
 sidecar pointer).
 
 The Lambda handler is a thin wrapper that:
@@ -170,7 +170,7 @@ def build_regime_substrate(
         ``new_eval_run_id()`` from the lib.
     calendar_date, trading_day
         Dual-tracked dates per ``DATE_CONVENTIONS.md``. When None,
-        derived via ``alpha_engine_lib.dates.now_dual()``.
+        derived via ``krepis.dates.now_dual()``.
     fit_window_start, fit_window_end
         Diagnostic metadata about the HMM's training window. Optional.
     hmm_weights_s3_key
@@ -181,8 +181,8 @@ def build_regime_substrate(
     -------
     Substrate JSON payload as a dict. Serializable via ``json.dumps``.
     """
-    from alpha_engine_lib.dates import now_dual
-    from alpha_engine_lib.eval_artifacts import new_eval_run_id
+    from krepis.dates import now_dual
+    from nousergon_lib.eval_artifacts import new_eval_run_id
 
     if run_id is None:
         run_id = new_eval_run_id()
@@ -345,7 +345,7 @@ def write_regime_substrate(
     Returns dict with ``artifact_key`` and (when written)
     ``latest_key``.
     """
-    from alpha_engine_lib.eval_artifacts import (
+    from nousergon_lib.eval_artifacts import (
         eval_artifact_key,
         eval_latest_key,
     )
@@ -415,7 +415,7 @@ def read_regime_substrate(
     been written yet. Used by the macro economist agent (Stage C) and
     the predictor L2 feature loader (Stage D).
     """
-    from alpha_engine_lib.eval_artifacts import eval_latest_key
+    from nousergon_lib.eval_artifacts import eval_latest_key
 
     latest_key = eval_latest_key(prefix)
     try:

@@ -62,7 +62,7 @@ from pathlib import Path
 #
 # exclude_patterns starts empty by deliberate convention; add patterns only
 # after observing real ERROR-level noise during rotation runs.
-from alpha_engine_lib.logging import setup_logging
+from krepis.logging import setup_logging
 _FLOW_DOCTOR_EXCLUDE_PATTERNS: list[str] = []
 _FLOW_DOCTOR_YAML = str(
     Path(__file__).resolve().parent.parent / "flow-doctor-model-zoo.yaml"
@@ -1123,7 +1123,7 @@ def _alert_promotion(bucket, date_str, leaderboard, winner_vid, prior_vid) -> No
             f"governor caps the first-day book move.\n"
             f"  REVERT (if it misbehaves): {revert}"
         )
-        from alpha_engine_lib import alerts as _alerts
+        from krepis import alerts as _alerts
         _alerts.publish(
             message=msg, severity="warning",
             source="alpha-engine-predictor/training/model_zoo.py::run_rotation_and_select",
@@ -1192,7 +1192,7 @@ def _alert_inert_rotation(bucket, date_str, *, n_active, n_selected, results) ->
         cfg_path, exp_id,
     )
     try:
-        from alpha_engine_lib import alerts as _alerts
+        from krepis import alerts as _alerts
         _alerts.publish(
             message=msg, severity="warning",
             source="alpha-engine-predictor/training/model_zoo.py::run_rotation_and_select",
@@ -1216,7 +1216,7 @@ def _alert_observe_recommendation(bucket, date_str, leaderboard, winner_vid) -> 
             f"review predictor/model_zoo/leaderboard/{date_str}.json; promote with "
             f"`python -m model.registry --bucket {bucket} --promote {winner_vid}`."
         )
-        from alpha_engine_lib import alerts as _alerts
+        from krepis import alerts as _alerts
         _alerts.publish(
             message=msg, severity="info",
             source="alpha-engine-predictor/training/model_zoo.py::run_rotation_and_select",
@@ -1291,7 +1291,7 @@ def send_zoo_digest_email(leaderboard: dict, bucket: str, date_str: str | None,
         challenger).
 
     Reuses the train_handler SMTP/SES email chokepoint
-    (``alpha_engine_lib.email_sender.send_email`` via train_handler) — NOT a
+    (``krepis.email_sender.send_email`` via train_handler) — NOT a
     hand-rolled mailer. Returns True on send success, False if email is not
     configured. Raising is the caller's concern (see run_rotation_and_select's
     try/except — a digest-send failure is logged + recorded, never aborts the
@@ -1495,7 +1495,7 @@ def send_zoo_digest_email(leaderboard: dict, bucket: str, date_str: str | None,
     subject = _digest_subject(leaderboard, date_str)
     # REUSE the train_handler SMTP/SES chokepoint (Gmail primary, SES fallback)
     # — same mailer the per-run training email uses. NOT a hand-rolled sender.
-    from alpha_engine_lib.email_sender import send_email as _send_email
+    from krepis.email_sender import send_email as _send_email
     return _send_email(
         subject, plain_body,
         recipients=recipients, html=html_body,
@@ -1529,7 +1529,7 @@ def run_rotation_and_select(
     # passed no --date). Backward-looking dual-track per DATE_CONVENTIONS.
     if date_str is None:
         try:
-            from alpha_engine_lib.dates import now_dual
+            from krepis.dates import now_dual
             _td = now_dual().trading_day
             date_str = _td.isoformat() if hasattr(_td, "isoformat") else str(_td)
             log.info("model_zoo: no date passed — defaulting to trading_day %s", date_str)
@@ -1629,7 +1629,7 @@ def select_and_finalize(
         mode = "cutover" if auto_promote_winner else "observe"
     if date_str is None:
         try:
-            from alpha_engine_lib.dates import now_dual
+            from krepis.dates import now_dual
             _td = now_dual().trading_day
             date_str = _td.isoformat() if hasattr(_td, "isoformat") else str(_td)
             log.info("model_zoo select: no date passed — defaulting to trading_day %s", date_str)
@@ -1783,7 +1783,7 @@ def run_select_only(
     leaderboard dict."""
     if date_str is None:
         try:
-            from alpha_engine_lib.dates import now_dual
+            from krepis.dates import now_dual
             _td = now_dual().trading_day
             date_str = _td.isoformat() if hasattr(_td, "isoformat") else str(_td)
             log.info("model_zoo select: no date passed — defaulting to trading_day %s", date_str)

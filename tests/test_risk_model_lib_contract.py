@@ -1,8 +1,8 @@
-"""Consumer contract: predictor's risk_model shim ⇄ alpha_engine_lib.quant.factor_risk_xs.
+"""Consumer contract: predictor's risk_model shim ⇄ nousergon_lib.quant.factor_risk_xs.
 
 The factor-risk math (C.2a) was lifted to the shared lib (LV1-AE leverage arc,
 2026-06-03); ``risk_model/__init__.py`` is now a re-export shim over
-``alpha_engine_lib.quant.factor_risk_xs``. This pins the contract the predictor
+``nousergon_lib.quant.factor_risk_xs``. This pins the contract the predictor
 depends on so a lib version that drops/renames a consumed symbol fails here rather
 than at Saturday training time. The exhaustive math tests live in the lib
 (``test_quant_factor_risk_xs.py`` there); ``test_risk_model_persist.py`` exercises
@@ -29,7 +29,7 @@ def test_shim_re_exports_public_surface():
 
 
 def test_shim_is_identity_with_lib():
-    from alpha_engine_lib.quant import factor_risk_xs
+    from nousergon_lib.quant import factor_risk_xs
 
     assert risk_model.build_factor_risk_model is factor_risk_xs.build_factor_risk_model
 

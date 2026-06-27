@@ -51,7 +51,7 @@ def test_send_training_email_survives_fold_without_n_train(monkeypatch):
 
     # Stub the SMTP/SES chokepoint so no real email fires; the point is that
     # building the body (which dereferences each fold) does not raise.
-    import alpha_engine_lib.email_sender as es
+    import krepis.email_sender as es
     import config as cfg
     monkeypatch.setattr(es, "send_email", _fake_send)
     monkeypatch.setattr(cfg, "EMAIL_SENDER", "x@y.z", raising=False)

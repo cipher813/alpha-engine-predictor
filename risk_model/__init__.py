@@ -1,7 +1,7 @@
 """risk_model — Barra-style structural factor risk model (C.2a).
 
 **Re-export shim.** The pure-math implementation was lifted to the shared
-``alpha_engine_lib.quant.factor_risk_xs`` (LV1-AE leverage arc, 2026-06-03) so the
+``nousergon_lib.quant.factor_risk_xs`` (LV1-AE leverage arc, 2026-06-03) so the
 predictor and robodashboard consume one Σ=B·F·Bᵀ+D engine instead of parallel
 reimplementations. This shim preserves the predictor's ``risk_model`` import
 surface — ``training/risk_model_persist.py`` and any other consumer keep working
@@ -15,7 +15,7 @@ alpha-engine-data C.1, give Σ = B·F·Bᵀ + D for the constrained MVO solver
 
 from __future__ import annotations
 
-from alpha_engine_lib.quant.factor_risk_xs import (
+from nousergon_lib.quant.factor_risk_xs import (
     _MIN_OBS_OVER_K,
     build_factor_returns_series,
     build_factor_risk_model,

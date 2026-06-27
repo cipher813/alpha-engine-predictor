@@ -3,7 +3,7 @@
 Closes the cross-repo "calendar-day arithmetic in freshness checks" defect
 class surfaced by the 2026-05-24 Sunday SF recovery: every post-Saturday
 redrive trips a calendar-day gate even when the data carries the most
-recent NYSE close. Lifted into ``alpha_engine_lib.dates`` (v0.27.0) as the
+recent NYSE close. Lifted into ``krepis.dates`` (v0.27.0) as the
 ``trading_days_stale`` + ``is_fresh_in_trading_days`` chokepoint.
 
 This test walks the repo's production Python and rejects calendar-day
@@ -84,7 +84,7 @@ def _violations_in_file(path: pathlib.Path) -> list[tuple[str, int, str]]:
 
 def test_no_calendar_days_in_freshness_functions():
     """Production freshness functions must not use ``.days`` calendar
-    arithmetic. Use ``alpha_engine_lib.dates.{trading_days_stale,
+    arithmetic. Use ``krepis.dates.{trading_days_stale,
     is_fresh_in_trading_days}`` instead, or add an inline
     ``# noqa: trading-day`` marker with a comment explaining why the
     calendar-day semantic is correct at that specific call site.
@@ -97,7 +97,7 @@ def test_no_calendar_days_in_freshness_functions():
 
     assert not all_violations, (
         "Calendar-day arithmetic found in freshness-named functions. Use "
-        "alpha_engine_lib.dates.{trading_days_stale, is_fresh_in_trading_days} "
+        "krepis.dates.{trading_days_stale, is_fresh_in_trading_days} "
         "instead, or add `# noqa: trading-day` with a comment explaining "
         "why calendar days are correct at that site.\n"
         + "\n".join(all_violations)

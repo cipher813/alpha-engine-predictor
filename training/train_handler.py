@@ -62,7 +62,7 @@ from email.mime.text import MIMEText
 from pathlib import Path
 from typing import Optional
 
-from alpha_engine_lib.secrets import get_secret
+from krepis.secrets import get_secret
 
 # Structured logging + flow-doctor singleton via alpha-engine-lib (shared
 # pattern across all 5 entrypoints; see executor/main.py for reference).
@@ -74,8 +74,8 @@ from alpha_engine_lib.secrets import get_secret
 #
 # exclude_patterns starts empty by deliberate convention; add patterns
 # only after observing real ERROR-level noise during training runs.
-from alpha_engine_lib.logging import setup_logging, guard_entrypoint
-from alpha_engine_lib.phase_registry import PhaseRegistry
+from krepis.logging import setup_logging, guard_entrypoint
+from nousergon_lib.phase_registry import PhaseRegistry
 _FLOW_DOCTOR_EXCLUDE_PATTERNS: list[str] = []
 _FLOW_DOCTOR_YAML = str(
     Path(__file__).resolve().parent.parent / "flow-doctor-training.yaml"
@@ -924,10 +924,10 @@ def send_training_email(result: dict, date_str: str) -> bool:
             + f"{feat_health_plain}\n"
         )
 
-    # SMTP/SES dispatch via the alpha_engine_lib.email_sender chokepoint
+    # SMTP/SES dispatch via the krepis.email_sender chokepoint
     # (L4356 — Gmail SMTP primary, SES fallback). Same semantics as the
     # pre-consolidation inline path.
-    from alpha_engine_lib.email_sender import send_email as _send_email
+    from krepis.email_sender import send_email as _send_email
     return _send_email(
         subject, plain_body,
         recipients=recipients, html=html_body,
@@ -1243,7 +1243,7 @@ def _main_impl(
         # Mirror model_zoo's default: resolve the trading_day via now_dual,
         # falling back to calendar only if the lib lookup fails.
         try:
-            from alpha_engine_lib.dates import now_dual
+            from krepis.dates import now_dual
             _td = now_dual().trading_day
             date_str = _td.isoformat() if hasattr(_td, "isoformat") else str(_td)
             log.info("train_handler: no date passed — defaulting to trading_day %s", date_str)
@@ -1253,7 +1253,7 @@ def _main_impl(
                         "fell back to calendar date %s", date_str, exc_info=True)
 
     # setup_logging already ran at module-top (see comment near the
-    # alpha_engine_lib.logging import). Apply standard log level here.
+    # krepis.logging import). Apply standard log level here.
     logging.getLogger().setLevel(logging.INFO)
 
     # config#1170 — the zoo-challenger spec namespace (None for the base

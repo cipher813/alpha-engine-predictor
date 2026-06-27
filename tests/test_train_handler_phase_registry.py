@@ -1,4 +1,4 @@
-"""Tests for the alpha_engine_lib.phase_registry adoption in train_handler
+"""Tests for the nousergon_lib.phase_registry adoption in train_handler
 (L4528 — predictor is the 3rd consumer of the lib phase framework, after the
 backtester + alpha-engine-data).
 
@@ -22,7 +22,7 @@ import pytest
 from botocore.exceptions import ClientError
 
 from training import train_handler
-from alpha_engine_lib.phase_registry import PhaseRegistry
+from nousergon_lib.phase_registry import PhaseRegistry
 
 
 # ── fake S3 (markers in `objects`, artifact existence in `artifacts`) ─────────

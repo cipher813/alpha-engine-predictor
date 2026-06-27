@@ -84,7 +84,7 @@ def _pool_fixture(monkeypatch, *, auto_promote, base_ic, variant_ic):
     monkeypatch.setattr(reg, "promote_to_champion",
                         lambda s3c, b, vid, **k: promotes.append(vid))
     alerts_sent = []
-    import alpha_engine_lib.alerts as _alerts
+    import krepis.alerts as _alerts
     monkeypatch.setattr(_alerts, "publish",
                         lambda **kw: alerts_sent.append(kw) or None)
 
