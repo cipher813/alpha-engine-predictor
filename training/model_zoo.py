@@ -87,6 +87,14 @@ _LEADERBOARD_PREFIX = "predictor/model_zoo/leaderboard"
 # search breadth once rotations accumulate).
 _TRIAL_LOG_KEY = "predictor/model_zoo/trial_log.json"
 
+# Deep-link target for the digest email → console Model Zoo page. The slug is
+# pinned in crucible-dashboard app.py (url_path="model-zoo") and guarded by
+# tests/test_model_zoo_page.py; the page honors ?date=YYYY-MM-DD, keyed by this
+# rotation's date_str (the last completed trading day — e.g. Friday for a
+# Saturday run), so the email link lands on the exact cycle it describes.
+_CONSOLE_BASE_URL = "https://console.nousergon.ai"
+MODEL_ZOO_SLUG = "model-zoo"
+
 # Only these cfg knobs may be overridden by a spec — fail loud on anything else
 # so a spec can't set arbitrary attributes on the config module. Extend ONLY
 # after confirming the trainer reads the knob via cfg.X at call time.
@@ -1345,6 +1353,14 @@ def send_zoo_digest_email(leaderboard: dict, bucket: str, date_str: str | None,
                       if baseline_src == "champion_arch_fresh"
                       else "stale serving snapshot (no champion-arch this run)")
 
+    # Deep-link to the console Model Zoo page for the full cross-week detail
+    # (candidate DSR battery, PBO, promotion trajectory, realized scorecard).
+    # Keyed by THIS rotation's date_str so the link opens the exact cycle.
+    console_url = (
+        f"{_CONSOLE_BASE_URL}/{MODEL_ZOO_SLUG}?date={date_str}"
+        if date_str else f"{_CONSOLE_BASE_URL}/{MODEL_ZOO_SLUG}"
+    )
+
     # Base champion-arch enrichment (training_summary fields; all optional).
     base_version = base.get("model_version")
     base_oos = base.get("meta_model_oos_ic")
@@ -1431,6 +1447,7 @@ def send_zoo_digest_email(leaderboard: dict, bucket: str, date_str: str | None,
     plain_body = (
         f"Alpha Engine — Model-Zoo Rotation Digest ({date_str})\n"
         f"Mode: {mode}\n"
+        f"View full rotation on the console: {console_url}\n"
         f"\n=== SERVING CHAMPION (live model now — CPCV is a STALE snapshot) ===\n"
         f"  CPCV mean IC: {_fmt_ic(serving_ic)}  (forward_days={serving_fwd}; "
         f"served_version={serving_ver}; promoted/served on {serving_date})\n"
@@ -1456,6 +1473,10 @@ def send_zoo_digest_email(leaderboard: dict, bucket: str, date_str: str | None,
         f'<html><body style="font-family:sans-serif;font-size:13px;color:#222;max-width:640px;">'
         f'<h2 style="margin-bottom:4px;">Model-Zoo Rotation Digest — {date_str}</h2>'
         f'<p style="color:#555;font-size:12px;margin-top:0;">Mode: <b>{mode}</b></p>'
+        f'<p style="font-size:12px;margin:2px 0 12px;">&#9654; '
+        f'<a href="{console_url}">View the full rotation on the console</a> '
+        f'<span style="color:#999;">(cross-week detail, DSR battery, PBO, '
+        f'promotion trajectory)</span></p>'
         f'<h3 style="margin-bottom:2px;">Serving champion '
         f'<span style="font-size:11px;font-weight:normal;color:#999;">'
         f'(live model now — CPCV is a STALE snapshot)</span></h3>'

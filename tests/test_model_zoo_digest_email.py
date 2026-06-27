@@ -186,6 +186,30 @@ def test_digest_renders_three_labeled_groups_no_double_count(monkeypatch):
     assert "Challengers (1)" in html
 
 
+def test_digest_includes_console_deeplink(monkeypatch):
+    """The digest deep-links to the console Model Zoo page, keyed by THIS
+    rotation's date_str (the trading-day key) so the link opens the exact cycle.
+    The slug must equal crucible-dashboard's pinned url_path ("model-zoo")."""
+    captured = _capture_digest_send(monkeypatch)
+    s3 = _FakeS3({})
+    leaderboard = {
+        "date": "2026-06-26", "mode": "cutover",
+        "champion": {"forward_days": 21, "cpcv_mean_ic": 0.13},
+        "candidates": [
+            {"spec_id": "resid", "cpcv_mean_ic": 0.18, "forward_days": 21,
+             "passes_gate": True, "eligible": True, "reason": "eligible"},
+        ],
+        "winner_version_id": "resid-v", "promoted": "resid-v",
+    }
+    ok = mz.send_zoo_digest_email(leaderboard, "bkt", "2026-06-26", s3=s3)
+    assert ok is True
+    expected = "https://console.nousergon.ai/model-zoo?date=2026-06-26"
+    assert expected in captured["plain"]
+    assert f'href="{expected}"' in captured["html"]
+    # The slug constant is the cross-repo contract with the dashboard page.
+    assert mz.MODEL_ZOO_SLUG == "model-zoo"
+
+
 def test_digest_no_promotion_says_so(monkeypatch):
     captured = _capture_digest_send(monkeypatch)
     s3 = _FakeS3({})  # no base summary → champion section uses CPCV only
