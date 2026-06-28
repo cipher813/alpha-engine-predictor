@@ -14,7 +14,7 @@
 # in lockstep with requirements.txt.
 # Bumped to >=0.4.0 (config#1300, console_url) — kept in lockstep with requirements.txt.
 krepis[flow_doctor]>=0.4.0
-nousergon-lib[arcticdb,flow_doctor,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.70.0
+nousergon-lib[arcticdb,flow_doctor,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.72.0
 numpy>=1.24.0,<2
 pandas>=2.0.0
 pyarrow>=14.0.0

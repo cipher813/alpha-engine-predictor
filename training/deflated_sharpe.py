@@ -245,78 +245,11 @@ def deflated_sharpe_ratio(
     }
 
 
-def cscv_pbo(ic_matrix, *, spec_ids=None, min_splits: int = 4) -> dict:
-    """CSCV Probability of Backtest Overfitting over an aligned trial matrix
-    (Bailey, Borwein, López de Prado & Zhu 2014) — ROADMAP L4582 (OBSERVE).
-
-    This is the model-*selection* overfitting lens the W1.3 battery deferred as
-    W1.3b: ``deflated_sharpe_ratio`` asks "is THIS model's IC real?";
-    ``cscv_pbo`` asks "when we pick the best of N trials, how often is that
-    pick a mistake?". Target: PBO < 0.2 before any public DSR/selection claim.
-
-    ``ic_matrix`` is shape ``(n_splits, n_trials)`` — one row per CPCV
-    combination, one column per model spec, all evaluated on the SAME data
-    vintage so rows align (the zoo's same-rotation candidates satisfy this; a
-    stale champion manifest does NOT and must be excluded by the caller).
-    The classic CSCV partitions one return series into S blocks; here the CPCV
-    combinations ARE the resampled evaluation splits, so we run the symmetric
-    selection test as leave-one-combination-out:
-
-    for each held-out combo c: pick the spec with the best mean IC over the
-    OTHER combos (in-sample selection), read the pick's relative rank
-    ``w ∈ (0,1)`` among specs at combo c (out-of-sample), ``lambda = logit(w)``;
-    ``PBO = frac(lambda <= 0)`` — the probability the in-sample winner lands in
-    the bottom half out-of-sample.
-
-    Returns ``status="insufficient"`` (with the reason inline) rather than a
-    fabricated number when there are <2 specs or <``min_splits`` clean rows —
-    mirrors the honest-N/A posture of the rest of this module.
-    """
-    from scipy.stats import rankdata as _rankdata
-
-    m = np.asarray(ic_matrix, dtype=float)
-    if m.ndim != 2 or m.shape[1] < 2:
-        return {
-            "status": "insufficient",
-            "reason": "needs >=2 aligned specs",
-            "n_splits": 0,
-            "n_specs": int(m.shape[1]) if m.ndim == 2 else 0,
-            "pbo": float("nan"),
-        }
-    clean = m[np.isfinite(m).all(axis=1)]
-    n_splits, n_specs = clean.shape
-    if n_splits < min_splits:
-        return {
-            "status": "insufficient",
-            "reason": f"{n_splits} clean splits < min_splits={min_splits}",
-            "n_splits": int(n_splits),
-            "n_specs": int(n_specs),
-            "pbo": float("nan"),
-        }
-    ids = list(spec_ids) if spec_ids is not None else list(range(n_specs))
-    logits: list[float] = []
-    selected_counts: dict = {}
-    total = clean.sum(axis=0)
-    for c in range(n_splits):
-        is_mean = (total - clean[c]) / (n_splits - 1)   # IS = all combos but c
-        s_star = int(np.argmax(is_mean))
-        selected_counts[ids[s_star]] = selected_counts.get(ids[s_star], 0) + 1
-        # OOS relative rank of the IS pick at the held-out combo. rankdata
-        # average-ties so a degenerate all-equal row yields w=0.5 (logit 0,
-        # counted as underperformance — conservative).
-        w = float(_rankdata(clean[c])[s_star]) / (n_specs + 1)
-        logits.append(math.log(w / (1.0 - w)))
-    lam = np.asarray(logits, dtype=float)
-
-    def _r(v, p=6):
-        return round(float(v), p) if np.isfinite(v) else float("nan")
-
-    return {
-        "status": "ok",
-        "n_splits": int(n_splits),
-        "n_specs": int(n_specs),
-        "spec_ids": ids,
-        "pbo": _r(float((lam <= 0).mean())),
-        "mean_logit": _r(float(lam.mean())),
-        "selected_counts": selected_counts,
-    }
+# ── cscv_pbo: lifted to the shared lib (config#1318) ─────────────────────────
+# The CSCV Probability of Backtest Overfitting math (ROADMAP L4582) was the
+# fleet's first PBO adopter; with the backtester as the second adopter it is now
+# consolidated into nousergon_lib.quant.stats.pbo (mirrors the dsr lift). The
+# local body is deleted; this re-export preserves the
+# ``from training.deflated_sharpe import cscv_pbo`` import surface
+# (training/model_zoo.py + tests/test_l4582_selection_pbo_trials.py rely on it).
+from nousergon_lib.quant.stats.pbo import cscv_pbo  # noqa: E402,F401
