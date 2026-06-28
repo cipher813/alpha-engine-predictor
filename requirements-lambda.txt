@@ -12,7 +12,8 @@
 # Dual-import (config#1269): MIT krepis serves the commodity modules + flow-doctor
 # wiring glue; nousergon-lib serves the AGPL edge modules. Direct krepis pin kept
 # in lockstep with requirements.txt.
-krepis[flow_doctor]>=0.2.0
+# Bumped to >=0.4.0 (config#1300, console_url) — kept in lockstep with requirements.txt.
+krepis[flow_doctor]>=0.4.0
 nousergon-lib[arcticdb,flow_doctor,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.72.0
 numpy>=1.24.0,<2
 pandas>=2.0.0
