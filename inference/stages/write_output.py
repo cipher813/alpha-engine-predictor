@@ -402,11 +402,25 @@ def write_predictions(
     # The gate's metrics ride along with the standard metrics.json write
     # in observe-only mode, so we get a forensic record of "would this
     # have blocked today's invocation" without risk to live trading.
-    from model.output_distribution_gate import validate_live_batch_distribution
+    # config#1373: the BLOCKING verdict is now the recalibration-invariant
+    # output-health gate (NaN/saturation rate + post-level-neutralization
+    # predicted_alpha dispersion collapse + sign skew). It no longer halts on
+    # isotonic-p_up uniqueness/modal-fraction — that is a calibrator staircase
+    # artifact that false-halted a healthy low-dispersion book on 2026-06-29
+    # (GE -8%). The legacy p_up-shape gate is still computed below, observe-only,
+    # so the staircase coarseness stays visible for the calibration-method soak
+    # (config#1176) but never gates allocation.
+    from model.output_distribution_gate import (
+        validate_live_batch_distribution,
+        validate_live_batch_invariant_health,
+    )
     inference_gate_blocking = bool(
         getattr(cfg, "OUTPUT_DISTRIBUTION_GATE_INFERENCE_BLOCKING", False)
     )
-    inference_gate_result = validate_live_batch_distribution(predictions)
+    inference_gate_result = validate_live_batch_invariant_health(predictions)
+    # Observe-only: the legacy isotonic-p_up shape gate, recorded for forensics
+    # (would-it-have-blocked trail) but NOT used as the halt verdict.
+    legacy_p_up_gate = validate_live_batch_distribution(predictions)
     if not inference_gate_result.passed:
         log.error(
             "Output-distribution gate FAILED at inference-time on %d-row batch: %s "
@@ -472,6 +486,16 @@ def write_predictions(
         "metrics": inference_gate_result.metrics,
         "blocking": inference_gate_blocking,
         "would_have_blocked_if_blocking": not inference_gate_result.passed,
+        "verdict_basis": "invariant_output_health",  # config#1373
+        # Observe-only legacy isotonic-p_up shape gate — recorded so the
+        # would-it-have-blocked staircase-coarseness trail stays visible, but
+        # it does NOT drive the halt verdict (config#1373 / config#1176).
+        "legacy_p_up_shape_gate": {
+            "passed": legacy_p_up_gate.passed,
+            "failed_check": legacy_p_up_gate.failed_check,
+            "reason": legacy_p_up_gate.reason,
+            "metrics": legacy_p_up_gate.metrics,
+        },
     }
 
     output = {

@@ -271,6 +271,231 @@ def validate_live_batch_distribution(
     )
 
 
+def validate_live_batch_invariant_health(
+    predictions: list[dict],
+    *,
+    min_batch_size: int = 5,
+    max_nonfinite_rate: float = 0.20,
+    max_alpha_modal_fraction: float = 0.90,
+    max_sign_skew: float = 0.97,
+    max_saturation_rate: float = 0.25,
+    floor: float = 0.011,
+    ceiling: float = 0.989,
+) -> OutputDistributionGateResult:
+    """Inference-time circuit-breaker that halts ONLY on recalibration-invariant
+    *broken-output* signals — never on benign isotonic-``p_up`` coarseness.
+
+    Redesign per config#1373 (2026-06-29 GE-drop false-halt). The legacy
+    inference gate (``validate_live_batch_distribution``) halts on isotonic
+    ``p_up`` *uniqueness / modal-fraction*. That signal is an artifact of the
+    calibrator's staircase quantization: on a low-dispersion-but-perfectly-
+    healthy day the level-neutralized ``predicted_alpha`` the optimizer actually
+    trades on is cleanly differentiated, yet the isotonic map collapses it onto
+    a handful of ``p_up`` steps — tripping the gate and false-halting the book.
+    The executor hold-book was re-grounded on ``predicted_alpha`` dispersion in
+    crucible-executor#308; this re-grounds the *predictor-side* circuit-breaker
+    on the same invariant so the predictor stops EMITTING a calibration-artifact
+    halt verdict that any downstream consumer could trip on.
+
+    Only **recalibration-invariant** brokenness halts here — failures that are
+    real regardless of which calibrator (isotonic vs Platt, config#1176) maps
+    alpha->p_up:
+
+    1. **Non-finite tradable signal** — fraction of NaN / +/-inf
+       ``predicted_alpha`` above ``max_nonfinite_rate``. A non-finite tradable
+       signal is broken under any calibrator.
+    2. **Tradable-signal collapse** — a single ``predicted_alpha`` value holds
+       ``max_alpha_modal_fraction`` or more of the batch, i.e. the model emitted
+       an essentially CONSTANT tradable signal (the 2026-04-28 compression
+       class), measured on ``predicted_alpha`` directly rather than on its
+       isotonic image. Note: a *low-dispersion-but-differentiated* book (many
+       distinct small alphas — the 2026-06-29 GE case) has a tiny modal fraction
+       and correctly PASSES; handling genuinely low-CONVICTION days by *sizing
+       down* (not halting) is the separate conviction-scaling concern, owned by
+       the sizing layer per config#1373 item-2, NOT this circuit-breaker.
+    3. **Sign skew** — fraction of one ``sign(predicted_alpha)`` at or above
+       ``max_sign_skew``. Level-neutralization demeans alpha cross-sectionally,
+       so an all-one-sign tradable signal is degenerate by construction
+       (the 2026-05-04 false-collapse class), invariant to the calibrator.
+    4. **Calibrator saturation** — fraction of ``p_up`` clipped to the
+       calibrator floor/ceiling above ``max_saturation_rate``. Retained from
+       the legacy gate because hard floor/ceiling clipping reflects a wide
+       alpha band crushed to the bounds — a genuine output-health failure, not
+       a quantization artifact (config#1373 item-1 "NaN/saturation rate").
+
+    The legacy isotonic-``p_up`` shape stats (``n_unique_p_up``,
+    ``modal_fraction``, ``stdev_p_up``) are still COMPUTED and returned in
+    ``metrics`` as **observe-only** telemetry (so the staircase coarseness
+    remains visible for the calibration-method soak), but they NEVER drive the
+    pass/fail verdict.
+
+    Pass-on-thin-batch: empty / sub-``min_batch_size`` batches return
+    ``passed=True`` (early-cutover coverage is incomplete by design), matching
+    ``validate_live_batch_distribution``.
+
+    Args:
+        predictions: per-ticker dicts. Halt logic reads ``predicted_alpha``
+            (the level-neutralized tradable signal); ``p_up`` is used for the
+            saturation check and observe-only shape stats. Rows missing
+            ``predicted_alpha`` degrade gracefully (excluded from the tradable-
+            signal checks, not treated as broken).
+    """
+    import math
+
+    import numpy as np
+
+    if not predictions or len(predictions) < min_batch_size:
+        return OutputDistributionGateResult(
+            passed=True,
+            failed_check=None,
+            reason=(
+                f"batch size {len(predictions) if predictions else 0} "
+                f"below min_batch_size={min_batch_size} — gate does not fire"
+            ),
+            metrics={"batch_size": len(predictions) if predictions else 0},
+        )
+
+    # --- Tradable signal: predicted_alpha (recalibration-invariant) ----------
+    raw_alphas = [p.get("predicted_alpha") for p in predictions]
+    present = [a for a in raw_alphas if a is not None and isinstance(a, (int, float))]
+    n_present = len(present)
+    n_nonfinite = sum(1 for a in present if not math.isfinite(float(a)))
+    finite_alphas = np.array(
+        [float(a) for a in present if math.isfinite(float(a))], dtype=float
+    )
+    nonfinite_rate = float(n_nonfinite / n_present) if n_present else 0.0
+
+    # Modal concentration of the tradable signal (round to absorb FP noise).
+    if finite_alphas.size:
+        rounded_alpha = np.round(finite_alphas, 9)
+        _av, _ac = np.unique(rounded_alpha, return_counts=True)
+        alpha_modal_fraction = float(_ac.max() / finite_alphas.size)
+        n_unique_alpha = int(len(_av))
+        alpha_stdev = float(np.std(finite_alphas))
+        n_pos = int(np.sum(finite_alphas > 0))
+        n_neg = int(np.sum(finite_alphas < 0))
+        n_signed = n_pos + n_neg
+        alpha_sign_skew = (
+            float(max(n_pos, n_neg) / n_signed) if n_signed > 0 else 0.0
+        )
+    else:
+        alpha_modal_fraction = 0.0
+        n_unique_alpha = 0
+        alpha_stdev = 0.0
+        alpha_sign_skew = 0.0
+
+    # --- Calibrator saturation on p_up (output-health, not shape coarseness) --
+    p_ups = np.array([
+        p.get("p_up") for p in predictions
+        if p.get("p_up") is not None and isinstance(p.get("p_up"), (int, float))
+    ], dtype=float)
+    n_saturated = int(np.sum((p_ups <= floor) | (p_ups >= ceiling))) if p_ups.size else 0
+    saturation_rate = float(n_saturated / p_ups.size) if p_ups.size else 0.0
+
+    # --- Observe-only isotonic-p_up shape stats (NEVER drive the verdict) -----
+    if p_ups.size:
+        rounded_p = np.round(p_ups, 6)
+        _uv, _uc = np.unique(rounded_p, return_counts=True)
+        n_unique_p_up = int(len(_uv))
+        p_up_modal_fraction = float(_uc.max() / p_ups.size)
+        stdev_p_up = float(np.std(p_ups))
+    else:
+        n_unique_p_up = 0
+        p_up_modal_fraction = 0.0
+        stdev_p_up = 0.0
+
+    metrics = {
+        "batch_size": len(predictions),
+        "n_predictions_total": len(predictions),
+        # Recalibration-invariant tradable-signal health (drives the verdict):
+        "n_alpha_present": n_present,
+        "n_unique_alpha": n_unique_alpha,
+        "alpha_nonfinite_rate": round(nonfinite_rate, 4),
+        "alpha_modal_fraction": round(alpha_modal_fraction, 4),
+        "alpha_stdev": round(alpha_stdev, 8),
+        "alpha_sign_skew": round(alpha_sign_skew, 4),
+        # Calibrator output-health (drives the verdict):
+        "saturation_rate": round(saturation_rate, 4),
+        # Observe-only isotonic shape stats (do NOT drive the verdict):
+        "n_unique_p_up": n_unique_p_up,
+        "modal_fraction": round(p_up_modal_fraction, 4),
+        "stdev_p_up": round(stdev_p_up, 6),
+    }
+
+    source_label = f"live inference batch ({len(predictions)} tickers)"
+
+    # Check 1: non-finite tradable signal.
+    if n_present >= min_batch_size and nonfinite_rate > max_nonfinite_rate:
+        reason = (
+            f"{nonfinite_rate:.2%} of predicted_alpha non-finite "
+            f"({n_nonfinite}/{n_present}) on {source_label} (max "
+            f"{max_nonfinite_rate:.0%}) — tradable signal is broken"
+        )
+        log.warning("Invariant output-health gate FAILED — %s", reason)
+        return OutputDistributionGateResult(
+            passed=False, failed_check="alpha_nonfinite_rate", reason=reason,
+            metrics=metrics,
+        )
+
+    # Check 2: tradable-signal collapse (essentially constant predicted_alpha).
+    if finite_alphas.size >= min_batch_size and alpha_modal_fraction >= max_alpha_modal_fraction:
+        reason = (
+            f"predicted_alpha collapsed — one value holds "
+            f"{alpha_modal_fraction:.0%} of {finite_alphas.size} finite tickers "
+            f"(>= {max_alpha_modal_fraction:.0%}) on {source_label}; the tradable "
+            f"signal is essentially constant (2026-04-28-class compression)"
+        )
+        log.warning("Invariant output-health gate FAILED — %s", reason)
+        return OutputDistributionGateResult(
+            passed=False, failed_check="alpha_collapse", reason=reason,
+            metrics=metrics,
+        )
+
+    # Check 3: sign skew on the (demeaned) tradable signal.
+    if finite_alphas.size >= min_batch_size and alpha_sign_skew >= max_sign_skew:
+        reason = (
+            f"predicted_alpha sign skew {alpha_sign_skew:.2%} >= "
+            f"{max_sign_skew:.0%} on {source_label} — degenerate one-sided "
+            f"tradable signal (2026-05-04-class false collapse)"
+        )
+        log.warning("Invariant output-health gate FAILED — %s", reason)
+        return OutputDistributionGateResult(
+            passed=False, failed_check="alpha_sign_skew", reason=reason,
+            metrics=metrics,
+        )
+
+    # Check 4: calibrator saturation (clip-to-bounds).
+    if p_ups.size >= min_batch_size and saturation_rate > max_saturation_rate:
+        reason = (
+            f"saturation rate {saturation_rate:.2%} exceeds "
+            f"{max_saturation_rate:.0%} ({n_saturated}/{p_ups.size} p_up at "
+            f"floor/ceiling on {source_label}) — calibrator clipping a wide "
+            f"alpha band to its bounds"
+        )
+        log.warning("Invariant output-health gate FAILED — %s", reason)
+        return OutputDistributionGateResult(
+            passed=False, failed_check="saturation_rate", reason=reason,
+            metrics=metrics,
+        )
+
+    log.info(
+        "Invariant output-health gate PASSED — alpha: %d unique (modal %.0f%%, "
+        "nonfinite %.1f%%, sign-skew %.0f%%), saturation %.1f%%  |  "
+        "[observe-only] isotonic p_up: %d unique, modal %.0f%%, stdev %.4f",
+        n_unique_alpha, alpha_modal_fraction * 100, nonfinite_rate * 100,
+        alpha_sign_skew * 100, saturation_rate * 100,
+        n_unique_p_up, p_up_modal_fraction * 100, stdev_p_up,
+    )
+    return OutputDistributionGateResult(
+        passed=True, failed_check=None,
+        reason=(
+            "all recalibration-invariant output-health checks passed "
+            "(isotonic p_up shape recorded observe-only)"
+        ),
+        metrics=metrics,
+    )
+
+
 def validate_stratified_per_regime(
     predictions: list[dict],
     regimes: list[str],
