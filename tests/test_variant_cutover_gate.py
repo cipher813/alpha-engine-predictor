@@ -337,3 +337,119 @@ class TestValidateCutoverGate:
 def variant_field_in_reason(reason: str, variant_field: str) -> bool:
     """Helper — the reason string should mention the variant field name."""
     return variant_field in reason
+
+
+class TestCliMainFillsRealizedAlpha:
+    """The generic CLI ``main()`` must compute realized_alpha from S3 price
+    data + horizon alignment (regression: it previously emitted a TODO
+    warning and always returned an insufficient-data verdict because
+    realized_alpha was never filled, so the Stage 1d / 2d cutover gates
+    could not be evaluated ad-hoc). Refs config#805.
+    """
+
+    @staticmethod
+    def _price_series(n_days=80, start=100.0, drift=0.0):
+        import numpy as np
+        import pandas as pd
+        idx = pd.bdate_range("2026-01-01", periods=n_days)
+        vals = start * np.exp(np.cumsum(np.full(n_days, drift)))
+        return pd.Series(vals, index=idx)
+
+    def _patch_cli(self, monkeypatch, pairs, prices, sector_map):
+        import analysis.variant_cutover_gate as gate
+        import analysis.triple_barrier_cutover_runner as runner
+
+        monkeypatch.setattr(
+            gate, "_load_prediction_history",
+            lambda *a, **k: [dict(p) for p in pairs],
+        )
+        monkeypatch.setattr(
+            runner, "_load_sector_map_from_s3",
+            lambda *a, **k: dict(sector_map),
+        )
+        monkeypatch.setattr(
+            runner, "_load_prices_from_s3",
+            lambda *a, **k: dict(prices),
+        )
+
+    def _build_pairs(self):
+        # Variant carries strictly more signal than baseline against the
+        # realized forward return so the gate has a real (non-neutral)
+        # verdict to render. 150 (date, ticker) rows on one prediction date
+        # with closed forward windows.
+        import numpy as np
+        rng = np.random.default_rng(7)
+        n = 150
+        pairs = []
+        prices = {"SPY": self._price_series(drift=0.0)}
+        sector_map = {}
+        # Realized forward alpha is encoded by giving each ticker a price
+        # series whose forward return is proportional to a latent signal;
+        # the variant tracks that signal more tightly than the baseline.
+        for i in range(n):
+            t = f"T{i:03d}"
+            signal = rng.normal()
+            # ticker price with a forward drift proportional to signal so
+            # realized_alpha (vs flat SPY) correlates with `signal`.
+            drift = 0.001 * signal
+            prices[t] = self._price_series(drift=drift)
+            pairs.append({
+                "date": "2026-01-02",
+                "ticker": t,
+                "predicted_alpha": 0.2 * signal + 0.9 * rng.normal(),
+                "expected_move_macro_aug": 0.8 * signal + 0.2 * rng.normal(),
+                "realized_alpha": None,
+            })
+        return pairs, prices, sector_map
+
+    def test_main_fills_realized_and_returns_real_verdict(self, monkeypatch, capsys):
+        import json
+        import pytest
+        import analysis.variant_cutover_gate as gate
+
+        pairs, prices, sector_map = self._build_pairs()
+        self._patch_cli(monkeypatch, pairs, prices, sector_map)
+        monkeypatch.setattr(sys, "argv", [
+            "variant_cutover_gate",
+            "--baseline", "predicted_alpha",
+            "--variant", "expected_move_macro_aug",
+            "--window", "5", "--horizon", "21",
+        ])
+        with pytest.raises(SystemExit) as ei:
+            gate.main()
+        # Exit code is 0 (pass) or 2 (fail) — NOT 1 (no-history) and the
+        # verdict must be a real IC comparison, not the old TODO stub.
+        assert ei.value.code in (0, 2)
+        out = json.loads(capsys.readouterr().out)
+        # realized_alpha was actually computed → enough pairs cleared the
+        # min_pairs floor, so the reason is a PASS/FAIL verdict, never
+        # "insufficient data".
+        assert out["n_pairs"] >= 100
+        assert "insufficient data" not in out["reason"]
+        assert out["baseline_field"] == "predicted_alpha"
+        assert out["variant_field"] == "expected_move_macro_aug"
+
+    def test_main_honors_horizon_arg(self, monkeypatch):
+        import pytest
+        import analysis.variant_cutover_gate as gate
+
+        captured = {}
+        pairs, prices, sector_map = self._build_pairs()
+        self._patch_cli(monkeypatch, pairs, prices, sector_map)
+
+        real_fn = gate.compute_realized_alpha_for_pairs
+
+        def _spy(pairs_arg, horizon_days, **k):
+            captured["horizon"] = horizon_days
+            return real_fn(pairs_arg, horizon_days=horizon_days, **k)
+
+        monkeypatch.setattr(gate, "compute_realized_alpha_for_pairs", _spy)
+        monkeypatch.setattr(sys, "argv", [
+            "variant_cutover_gate",
+            "--baseline", "predicted_alpha",
+            "--variant", "expected_move_macro_aug",
+            "--window", "5", "--horizon", "5",
+        ])
+        with pytest.raises(SystemExit):
+            gate.main()
+        assert captured["horizon"] == 5

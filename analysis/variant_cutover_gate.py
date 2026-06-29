@@ -520,6 +520,15 @@ def main():
         help="Trailing window of days to load prediction history. Default: 30.",
     )
     parser.add_argument(
+        "--horizon", type=int, default=cfg.FORWARD_DAYS,
+        help=(
+            "Forward window (trading days) for the realized-alpha label. "
+            f"Default: cfg.FORWARD_DAYS ({cfg.FORWARD_DAYS}) — the canonical "
+            "fixed-horizon ground truth, so the lift is measured on the "
+            "institutionally-defined axis rather than the variant's own target."
+        ),
+    )
+    parser.add_argument(
         "--threshold", type=float, default=1.15,
         help="Relative lift threshold for cutover. Default: 1.15 (15%%).",
     )
@@ -541,10 +550,34 @@ def main():
         )
         sys.exit(1)
 
-    log.warning(
-        "TODO: realized_alpha computation not implemented in this PR; "
-        "gate will return insufficient-data verdict until a downstream "
-        "step fills realized_alpha from price data + horizon alignment."
+    # Fill realized_alpha from S3 price data + horizon alignment so the
+    # generic CLI can actually return a pass/fail verdict for any variant
+    # (Stage 1d ``expected_move_macro_aug``, Stage 2d ``expected_move_risk_aug``,
+    # etc.) — Stage 3 already has a dedicated end-to-end runner
+    # (analysis.triple_barrier_cutover_runner). Reuse that runner's S3
+    # price/sector loaders (lazy import — the runner imports FROM this
+    # module, so a top-level import here would be circular).
+    from analysis.triple_barrier_cutover_runner import (
+        _load_prices_from_s3,
+        _load_sector_map_from_s3,
+    )
+
+    sector_map = _load_sector_map_from_s3(args.bucket)
+    tickers_in_pairs = {p["ticker"] for p in pairs if p.get("ticker")}
+    bench_symbols = set(sector_map.values()) | {"SPY"}
+    prices_by_ticker = _load_prices_from_s3(
+        args.bucket, tickers_in_pairs | bench_symbols,
+    )
+    n_realized_filled = compute_realized_alpha_for_pairs(
+        pairs,
+        horizon_days=args.horizon,
+        prices_by_ticker=prices_by_ticker,
+        sector_map=sector_map,
+    )
+    log.info(
+        "Realized alpha filled for %d/%d pairs (horizon=%dd; remainder are "
+        "either unrealized — forward window not closed — or missing price data)",
+        n_realized_filled, len(pairs), args.horizon,
     )
 
     result = validate_cutover_gate(
