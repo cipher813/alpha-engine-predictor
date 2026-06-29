@@ -1237,6 +1237,48 @@ def _alert_observe_recommendation(bucket, date_str, leaderboard, winner_vid) -> 
         log.warning("model_zoo: observe alert failed", exc_info=True)
 
 
+def _alert_champion_chasing_noise(bucket, date_str, monitor) -> None:
+    """config#971/L4539: the champion realized-edge NOISE monitor flagged the
+    PROMOTED champion's trailing realized rank-IC as non-positive
+    (``chasing_noise == True``). Relative-best promotion has NO absolute-
+    significance gate and realized-edge AUTO-demote is NOT live, so a champion
+    that shows no realized predictive edge will keep trading capital until the
+    operator MANUALLY remediates (rotate to the best challenger / retrain / hold).
+
+    The monitor itself is measurement-only (it never promotes/demotes/allocates);
+    historically its verdict landed only in leaderboard.json. This surfaces the
+    alarm on the operator-surveillance channels so the manual-remediation
+    decision is actionable the day it happens — the missing actuator-side half of
+    the #971 'underperforming champion' remediation philosophy. Telegram + SNS
+    via the fleet alerts chokepoint; never raises (observability off a rotation
+    path that has already promoted)."""
+    try:
+        champ = (monitor or {}).get("champion") or {}
+        ic = champ.get("realized_rank_ic")
+        n = champ.get("n_matured_outcomes")
+        weeks = champ.get("n_weeks_coverage")
+        msg = (
+            f"[predictor] Champion NOISE WATCH ({date_str}): the live champion's "
+            f"realized 21d rank-IC is {ic} (<= 0) over {n} matured outcomes / "
+            f"{weeks} weeks — it shows NO realized predictive edge.\n"
+            f"  Relative-best promotion has no absolute-significance gate and "
+            f"realized-edge auto-demote is NOT live (L4539), so this champion keeps "
+            f"trading capital until you remediate MANUALLY.\n"
+            f"  Operator remediation philosophy (config#971): rotate to the best "
+            f"current challenger, force a retrain, or hold-and-monitor.\n"
+            f"  Detail: predictor/model_zoo/observe_leaderboard/{date_str}.json "
+            f"(kind=champion_realized_monitor)."
+        )
+        from krepis import alerts as _alerts
+        _alerts.publish(
+            message=msg, severity="warning",
+            source="alpha-engine-predictor/training/model_zoo.py::run_rotation_and_select",
+            dedup_key=f"model_zoo_champion_chasing_noise_{date_str}",
+        )
+    except Exception:  # noqa: BLE001 — alert failure must not fail the SF
+        log.warning("model_zoo: champion chasing-noise alert failed", exc_info=True)
+
+
 def _read_base_training_summary(s3, bucket: str, date_str: str | None) -> dict:
     """Best-effort read of the base champion-arch retrain's training summary
     (``predictor/metrics/training_summary_{date}.json``, else ``_latest``) to
@@ -1757,6 +1799,13 @@ def select_and_finalize(
                 "n_matured_outcomes": (_mon.get("champion") or {}).get("n_matured_outcomes"),
                 "chasing_noise": _mon.get("chasing_noise"),
             }
+            # config#971/L4539: the monitor is measurement-only and historically its
+            # verdict landed only in leaderboard.json. When it asserts the PROMOTED
+            # champion has non-positive realized edge (chasing_noise == True), raise a
+            # loud operator alarm — realized-edge auto-demote isn't live, so manual
+            # remediation (rotate / retrain / hold) depends on the operator SEEING this.
+            if _mon.get("chasing_noise") is True:
+                _alert_champion_chasing_noise(bucket, date_str, _mon)
         except Exception:  # noqa: BLE001 — monitor is observability off a path that already promoted
             log.warning("model_zoo: champion realized-edge monitor failed", exc_info=True)
     finally:
