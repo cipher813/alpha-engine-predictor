@@ -33,6 +33,7 @@ ARCTIC_PREFIX = "arcticdb"
 def download_from_arctic(
     bucket: str,
     local_dir: str | os.PathLike,
+    universe_lib: str = "universe",
 ) -> int:
     """
     Read all universe + macro symbols from ArcticDB and write as parquets
@@ -44,21 +45,51 @@ def download_from_arctic(
     columns alongside OHLCV. build_regression_arrays() in dataset.py
     detects these and skips inline compute_features().
 
+    Parameters
+    ----------
+    universe_lib : str
+        ArcticDB library to read the per-ticker stock universe from. Default
+        ``"universe"`` (the canonical production library — live behaviour,
+        unchanged: opened via the lib's ``open_universe_lib`` chokepoint). A
+        total-return SHADOW run (PR7-7b) passes ``"universe_crsp"`` — the
+        scratch library ne-data (#554) builds on a clean CRSP total-return
+        basis (``Close`` = split-adjusted level + a new ``total_return_close``
+        column, with the 53 features RECOMPUTED on the total-return series
+        under the SAME column names). The macro library is always ``"macro"``
+        regardless of basis.
+
     Returns the number of files written.
     """
     t0 = time.time()
     local_dir = str(local_dir)
     os.makedirs(local_dir, exist_ok=True)
 
-    from nousergon_lib.arcticdb import open_universe_lib, open_macro_lib
-    universe = open_universe_lib(bucket)
+    from nousergon_lib.arcticdb import (
+        open_universe_lib, open_macro_lib, open_arctic,
+    )
+    if universe_lib == "universe":
+        # Preserve the live chokepoint exactly (its RuntimeError wrapping).
+        universe = open_universe_lib(bucket)
+    else:
+        # Shadow basis — open the named scratch library directly.
+        arctic = open_arctic(bucket)
+        try:
+            universe = arctic.get_library(universe_lib)
+        except Exception as exc:
+            raise RuntimeError(
+                f"ArcticDB {universe_lib!r} library open failed on bucket "
+                f"{bucket!r}: {exc}"
+            ) from exc
     macro_lib = open_macro_lib(bucket)
 
     n_written = 0
 
     # Write stock tickers from universe library
     symbols = universe.list_symbols()
-    log.info("[data_source=arcticdb] Reading %d universe symbols...", len(symbols))
+    log.info(
+        "[data_source=arcticdb] Reading %d symbols from library '%s'...",
+        len(symbols), universe_lib,
+    )
 
     for i, ticker in enumerate(symbols):
         try:

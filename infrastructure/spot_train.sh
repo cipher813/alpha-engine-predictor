@@ -155,6 +155,11 @@ REPO_URL="https://github.com/nousergon/crucible-predictor.git"  # public repo, n
 # Parse flags
 MODE="both"  # both | full-only | smoke-only | preflight-only | model-zoo-weekly | model-zoo-spec | model-zoo-select
 MODEL_ZOO_SPEC_ID=""  # set by --model-zoo-spec <id>
+# PR7-7b — evidence-only total-return shadow basis (e.g. "crsp"). When set, the
+# full-training run reads the scratch universe_crsp lib + labels off
+# total_return_close + isolates all outputs under *_shadow/{basis}/ + is
+# hard-blocked from promoting the live champion. Empty = live run (unchanged).
+SHADOW_BASIS=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --full-only) MODE="full-only" ;;
@@ -169,10 +174,37 @@ while [ $# -gt 0 ]; do
     # config#1083 PARALLEL fan-out: run ONLY the selection over whatever specs
     # registered for the date (the SF ModelZooSelect joins after the Map).
     --model-zoo-select) MODE="model-zoo-select" ;;
+    # PR7-7b: evidence-only shadow retrain on an alternate basis (crsp).
+    --shadow-basis) shift; SHADOW_BASIS="$1" ;;
     --instance-type) shift; INSTANCE_TYPE="$1" ;;
   esac
   shift
 done
+
+# PR7-7b — the shadow retrain is the base champion-arch pipeline on an alternate
+# basis, so it only composes with the full-training path. Reject combining it
+# with the model-zoo modes (those have their own per-spec namespacing) up front.
+if [ -n "$SHADOW_BASIS" ]; then
+  case "$MODE" in
+    both|full-only) : ;;
+    *) echo "ERROR: --shadow-basis only composes with --full-only (got MODE=$MODE)" >&2; exit 2 ;;
+  esac
+  if [ "$SHADOW_BASIS" != "crsp" ]; then
+    echo "ERROR: --shadow-basis: only 'crsp' is supported (got '$SHADOW_BASIS')" >&2
+    exit 2
+  fi
+fi
+
+# The full-training heredoc is single-quoted and cannot interpolate a bash var,
+# so compute the shadow env-export line HERE and prepend it to the heredoc body
+# (interpolating prefix + quoted body), exactly like DEFER_EMAIL_EXPORT below.
+# train_handler.main() reads CRSP_SHADOW_ENABLED / SHADOW_BASIS (TrainingIOSpec.
+# resolve). Empty when --shadow-basis unset, so a live run is byte-equivalent.
+if [ -n "$SHADOW_BASIS" ]; then
+  SHADOW_EXPORT="export CRSP_SHADOW_ENABLED=true SHADOW_BASIS=${SHADOW_BASIS}"$'\n'
+else
+  SHADOW_EXPORT=""
+fi
 
 # config#1083 — fail loud if --model-zoo-spec was given without a spec id (the
 # Map iteration must carry an explicit spec; a blank id is a wiring bug).
@@ -193,6 +225,7 @@ echo "  AMI           : $AMI_ID"
 echo "  Region        : $AWS_REGION"
 echo "  Branch        : $BRANCH"
 echo "  Mode          : $MODE"
+echo "  Shadow basis  : ${SHADOW_BASIS:-<none> (live)}"
 echo "  S3 bucket     : $S3_BUCKET"
 echo "  Spot attempt  : $SPOT_ATTEMPT/$MAX_SPOT_ATTEMPTS  (#883 — relaunch on confirmed mid-run reclaim)"
 echo ""
@@ -926,7 +959,7 @@ echo ""
 echo "═══════════════════════════════════════════════════════════════"
 echo "  FULL TRAINING (dry_run=False)"
 echo "═══════════════════════════════════════════════════════════════"
-run_ssm "full-training" "${DEFER_EMAIL_EXPORT}$(cat <<'TRAIN'
+run_ssm "full-training" "${DEFER_EMAIL_EXPORT}${SHADOW_EXPORT}$(cat <<'TRAIN'
 set -eo pipefail
 export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1 ALPHA_ENGINE_DEPLOYED=1 ALPHA_ENGINE_EXPERIMENT_ID=reference S3_BUCKET=alpha-engine-research
 cd /home/ec2-user/predictor

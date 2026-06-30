@@ -94,7 +94,10 @@ log = logging.getLogger(__name__)
 _SUBSAMPLE_NOISE_FLOOR_PCT = 30.0
 
 
-def _annotate_subsample_noise_floor(result: dict, s3, bucket: str) -> None:
+def _annotate_subsample_noise_floor(
+    result: dict, s3, bucket: str,
+    latest_key: str = "predictor/metrics/training_summary_latest.json",
+) -> None:
     """Annotate `result["short_history_subsample"][*]` with `n_pct_change_vs_prior`
     and WARN-log on >|`_SUBSAMPLE_NOISE_FLOOR_PCT`| swing.
 
@@ -117,7 +120,7 @@ def _annotate_subsample_noise_floor(result: dict, s3, bucket: str) -> None:
         try:
             prior_obj = s3.get_object(
                 Bucket=bucket,
-                Key="predictor/metrics/training_summary_latest.json",
+                Key=latest_key,
             )
             prior = json.loads(prior_obj["Body"].read())
         except Exception as e:
@@ -992,9 +995,17 @@ def _cfg_default_label(_cfg) -> str:
     return "v3.0-meta"
 
 
-def _training_summary_key(date_str: str, spec: "str | None") -> str:
-    """The training-summary S3 key for this run — spec-namespaced for a zoo
-    challenger (config#1170), the legacy date-only key for the base champion."""
+def _training_summary_key(
+    date_str: str, spec: "str | None", io: "TrainingIOSpec | None" = None,
+) -> str:
+    """The training-summary S3 key for this run.
+
+    PR7-7b — a SHADOW run (``io.is_shadow``) writes to the io spec's isolated
+    ``predictor/metrics_shadow/{basis}/`` key (shadow is never simultaneously a
+    zoo spec). Otherwise: spec-namespaced for a zoo challenger (config#1170),
+    the legacy date-only key for the base champion."""
+    if io is not None and io.is_shadow:
+        return io.summary_key(date_str)
     if spec:
         return _TRAINING_SUMMARY_KEY_SPEC.format(spec=spec, date=date_str)
     return _TRAINING_SUMMARY_KEY.format(date=date_str)
@@ -1009,6 +1020,7 @@ def _build_registry(
     force_phases: str = "",
     force: bool = False,
     spec: "str | None" = None,
+    marker_prefix_override: "str | None" = None,
 ) -> "PhaseRegistry | None":
     """Construct the training :class:`PhaseRegistry` (markers under
     ``predictor/{date}/.phases/`` + watchdog), or ``None`` in dry-run.
@@ -1047,8 +1059,13 @@ def _build_registry(
         log.warning("phase watchdog caps unavailable (%s) — running unwatchdogged", _cap_err)
         hard_caps = {}
     # config#1170 — per-spec marker prefix for zoo challengers; the base champion
-    # (spec is None) keeps the spec-less "predictor" prefix.
-    marker_prefix = f"predictor/model_zoo/{spec}" if spec else "predictor"
+    # (spec is None) keeps the spec-less "predictor" prefix. PR7-7b — a shadow run
+    # passes marker_prefix_override so its phase markers never collide with the
+    # live run's markers for the same date.
+    if marker_prefix_override:
+        marker_prefix = marker_prefix_override
+    else:
+        marker_prefix = f"predictor/model_zoo/{spec}" if spec else "predictor"
     return PhaseRegistry(
         date=date_str,
         bucket=bucket,
@@ -1069,7 +1086,10 @@ def _maybe_phase(reg: "PhaseRegistry | None", name: str, **log_ctx):
     return reg.phase(name, supports_auto_skip=False, **log_ctx)
 
 
-def _load_training_result(bucket: str, date_str: str, spec: "str | None" = None) -> "dict | None":
+def _load_training_result(
+    bucket: str, date_str: str, spec: "str | None" = None,
+    io: "TrainingIOSpec | None" = None,
+) -> "dict | None":
     """Reload a prior run's ``result`` dict from the persisted training summary
     so a recovery that AUTO-SKIPS the ~90-min ``meta_training`` phase can still
     drive the downstream summary/risk-model/gate/email/health stages. The summary
@@ -1082,7 +1102,7 @@ def _load_training_result(bucket: str, date_str: str, spec: "str | None" = None)
     import boto3
     from botocore.exceptions import ClientError
 
-    key = _training_summary_key(date_str, spec)
+    key = _training_summary_key(date_str, spec, io=io)
     try:
         obj = boto3.client("s3").get_object(Bucket=bucket, Key=key)
         return json.loads(obj["Body"].read())
@@ -1099,6 +1119,7 @@ def _load_training_result(bucket: str, date_str: str, spec: "str | None" = None)
 
 def _write_training_summary(
     result: dict, bucket: str, date_str: str, spec: "str | None" = None,
+    io: "TrainingIOSpec | None" = None,
 ) -> None:
     """Annotate + persist the training ``result`` to S3 (dated + latest). Extracted
     from the inline Step-2d block so the ``meta_training`` phase can record the
@@ -1126,8 +1147,15 @@ def _write_training_summary(
     # latest.json so the percent-change reference is genuinely prior-cycle rather
     # than this-cycle. This enrichment is best-effort: a failure to read the
     # prior cycle must NOT block persisting the current (load-bearing) summary.
+    # PR7-7b — a shadow run reads/writes its OWN isolated latest pointer so it
+    # never reads the live champion's prior cycle for the noise-floor reference
+    # nor overwrites the live "latest".
+    _latest_key = (
+        io.summary_latest_key if (io is not None and io.is_shadow)
+        else "predictor/metrics/training_summary_latest.json"
+    )
     try:
-        _annotate_subsample_noise_floor(result, _s3_sum, bucket)
+        _annotate_subsample_noise_floor(result, _s3_sum, bucket, latest_key=_latest_key)
     except Exception as _ann_err:  # noqa: BLE001 — prior-cycle read enrichment only
         log.warning(
             "subsample-noise-floor annotation skipped (non-fatal prior-cycle read): %s",
@@ -1138,18 +1166,23 @@ def _write_training_summary(
     _sum_body = json.dumps(result, indent=2, default=str).encode()
     _s3_sum.put_object(
         Bucket=bucket,
-        Key=_training_summary_key(date_str, spec),
+        Key=_training_summary_key(date_str, spec, io=io),
         Body=_sum_body, ContentType="application/json",
     )
-    if not spec:
+    # The "latest" pointer advances for the base champion AND for a shadow run
+    # (its own isolated latest); a zoo challenger (spec set, non-shadow) never
+    # touches a "latest".
+    _shadow = io is not None and io.is_shadow
+    if _shadow or not spec:
         _s3_sum.put_object(
             Bucket=bucket,
-            Key="predictor/metrics/training_summary_latest.json",
+            Key=_latest_key,
             Body=_sum_body, ContentType="application/json",
         )
     log.info(
         "Training summary written to S3 (%s)",
-        "dated, spec-namespaced" if spec else "dated + latest",
+        "shadow dated + latest" if _shadow
+        else ("dated, spec-namespaced" if spec else "dated + latest"),
     )
 
 
@@ -1170,8 +1203,18 @@ def main(
     force_phases: str = "",
     force: bool = False,
     send_email: bool = True,
+    shadow_basis: Optional[str] = None,
 ) -> dict:
     """Top-level training entrypoint.
+
+    ``shadow_basis`` (PR7-7b): when set (e.g. ``"crsp"``) — or when the
+    ``CRSP_SHADOW_ENABLED`` env is truthy (``SHADOW_BASIS`` selects the basis,
+    default ``crsp``) — the run becomes an EVIDENCE-ONLY shadow: it reads the
+    scratch ``universe_crsp`` library, labels off ``total_return_close``,
+    writes every artifact under disjoint ``*_shadow/{basis}/`` prefixes, and is
+    hard-blocked from promoting the live champion or entering the model-zoo
+    pool. ``None`` + no env (the default) = the live production run, byte-
+    identical to before. See :class:`training.io_spec.TrainingIOSpec`.
 
     Thin wrapper around :func:`_main_impl` that runs the body inside
     ``guard_entrypoint()`` so an uncaught ``raise`` from the spot-train
@@ -1204,11 +1247,25 @@ def main(
             "email to the model-zoo digest (training_summary S3 write unaffected)."
         )
         send_email = False
+    # Resolve the data-basis + output-path + promotion-eligibility spec from the
+    # explicit arg, falling back to CRSP_SHADOW_ENABLED/SHADOW_BASIS env (the
+    # spot heredoc flips shadow mode with an env export, mirroring
+    # PREDICTOR_DEFER_TRAINING_EMAIL). live() when neither selects shadow.
+    from training.io_spec import TrainingIOSpec
+    io = TrainingIOSpec.resolve(shadow_basis)
+    if io.is_shadow:
+        log.info(
+            "SHADOW TRAINING RUN (basis=%s) — universe_lib=%s close_col=%s; "
+            "outputs isolated under %s / %s; promotion + model-zoo registration "
+            "DISABLED (evidence-only).",
+            io.shadow_basis, io.universe_lib, io.close_col,
+            io.weights_prefix, io.summary_key_tmpl,
+        )
     with guard_entrypoint():
         return _main_impl(
             bucket, date_str=date_str, dry_run=dry_run,
             skip_phases=skip_phases, force_phases=force_phases, force=force,
-            send_email=send_email,
+            send_email=send_email, io=io,
         )
 
 
@@ -1221,6 +1278,7 @@ def _main_impl(
     force_phases: str = "",
     force: bool = False,
     send_email: bool = True,
+    io: "TrainingIOSpec | None" = None,
 ) -> dict:
     """
     Entry point called from inference/handler.py for the "train" action.
@@ -1256,6 +1314,12 @@ def _main_impl(
     # krepis.logging import). Apply standard log level here.
     logging.getLogger().setLevel(logging.INFO)
 
+    # PR7-7b: default to the live spec when called directly (e.g.
+    # inference/handler.py "train" action) without an explicit io.
+    from training.io_spec import TrainingIOSpec
+    if io is None:
+        io = TrainingIOSpec.live()
+
     # config#1170 — the zoo-challenger spec namespace (None for the base
     # champion). Derived from cfg.MODEL_VERSION_LABEL, which model_zoo sets per
     # spec via spec_overrides around this main() call. Namespaces the phase
@@ -1273,6 +1337,9 @@ def _main_impl(
         bucket, date_str, dry_run,
         skip_phases=skip_phases, force_phases=force_phases, force=force,
         spec=spec_ns,
+        marker_prefix_override=(
+            f"predictor/shadow/{io.shadow_basis}" if io.is_shadow else None
+        ),
     )
 
     # Preflight — fail fast on env / connectivity / ArcticDB staleness
@@ -1294,7 +1361,9 @@ def _main_impl(
     from store.arctic_reader import download_from_arctic
     log.info("[data_source=arcticdb] Loading universe from ArcticDB...")
     with _maybe_phase(reg, "data_load"):
-        n_files = download_from_arctic(bucket=bucket, local_dir=tmp_cache)
+        n_files = download_from_arctic(
+            bucket=bucket, local_dir=tmp_cache, universe_lib=io.universe_lib,
+        )
         if n_files == 0:
             raise RuntimeError(
                 f"ArcticDB returned zero files for training — "
@@ -1324,12 +1393,13 @@ def _main_impl(
     def _train_and_summarize() -> dict:
         _r = run_meta_training(
             data_dir=str(tmp_cache), bucket=bucket, date_str=date_str, dry_run=dry_run,
+            io=io,
         )
         # Slim cache write + feature-store registry upload are handled by
         # alpha-engine-data (Phase 1) — nothing to do here.
         log.info("Slim cache write: skipped (handled by alpha-engine-data)")
         if not dry_run:
-            _write_training_summary(_r, bucket, date_str, spec_ns)
+            _write_training_summary(_r, bucket, date_str, spec_ns, io=io)
         return _r
 
     if reg is None:
@@ -1337,7 +1407,7 @@ def _main_impl(
     else:
         with reg.phase("meta_training", supports_auto_skip=True) as ctx:
             if ctx.skipped:
-                result = _load_training_result(bucket, date_str, spec_ns)
+                result = _load_training_result(bucket, date_str, spec_ns, io=io)
                 if result is None:
                     raise RuntimeError(
                         "meta_training marker is ok but the training summary is absent "
@@ -1350,7 +1420,7 @@ def _main_impl(
                 )
             else:
                 result = _train_and_summarize()
-                ctx.record_artifact(_training_summary_key(date_str, spec_ns))
+                ctx.record_artifact(_training_summary_key(date_str, spec_ns, io=io))
 
     # Step 2d2: Factor-risk-model F + D weekly persistence (ROADMAP C.2b).
     # Reads the per-ticker parquets the train_handler already populated
@@ -1370,7 +1440,16 @@ def _main_impl(
     # untraceable. C.2b ships the weekly persistence so by the time
     # C.3 reads ``risk_model/{date}/``, there are ≥4 weeks of F + D
     # accumulated.
-    if not dry_run:
+    # PR7-7b: skipped on a shadow run — risk_model_persist writes to the SHARED
+    # live ``risk_model/{date}/`` keys, which an evidence-only run must not
+    # touch. It is also irrelevant to the champion-vs-shadow IC comparison.
+    if not dry_run and not io.write_side_artifacts:
+        log.info(
+            "Shadow run (basis=%s) — skipping risk_model_persist (writes shared "
+            "live risk_model/ keys; out of scope for the IC comparison).",
+            io.shadow_basis,
+        )
+    elif not dry_run:
         try:
             from training.risk_model_persist import (
                 build_and_persist_risk_model,
@@ -1406,7 +1485,16 @@ def _main_impl(
     # inference path needs to write meta_alpha_tb fields + the 21d
     # forward window needs to close), the gate naturally returns an
     # insufficient-data verdict per ``min_pairs=100``.
-    if not dry_run:
+    # PR7-7b: skipped on a shadow run — the cutover gate writes to the shared
+    # live ``predictor/variant_gates/`` key and reads the live inference
+    # prediction stream; neither applies to an evidence-only basis comparison.
+    if not dry_run and not io.write_side_artifacts:
+        log.info(
+            "Shadow run (basis=%s) — skipping triple-barrier cutover gate "
+            "(writes shared live variant_gates/ keys).",
+            io.shadow_basis,
+        )
+    elif not dry_run:
         try:
             from analysis.triple_barrier_cutover_runner import run_gate as _run_tb_gate
             with _maybe_phase(reg, "triple_barrier_gate"):

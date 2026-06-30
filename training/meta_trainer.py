@@ -753,6 +753,8 @@ def run_meta_training(
     bucket: str,
     date_str: str,
     dry_run: bool = False,
+    *,
+    io: "TrainingIOSpec | None" = None,
 ) -> dict:
     """
     Train all Layer 1 + meta-model, validate with walk-forward, promote to S3.
@@ -763,11 +765,26 @@ def run_meta_training(
     bucket   : S3 bucket for model uploads.
     date_str : Training date (YYYY-MM-DD).
     dry_run  : Skip S3 writes if True.
+    io : TrainingIOSpec or None
+        Data-basis + output-path + promotion-eligibility bundle. ``None``
+        resolves to :meth:`TrainingIOSpec.live` — the production default,
+        byte-identical to the pre-shadow behaviour (reads ``Close``, writes
+        the live ``predictor/weights/meta/`` prefix, eligible for promotion +
+        model-zoo registration). A SHADOW spec (e.g. ``TrainingIOSpec.shadow
+        ("crsp")``) labels off ``total_return_close``, writes every artifact
+        under disjoint ``*_shadow/crsp/`` prefixes, and is hard-blocked from
+        ever touching the live champion or the model-zoo pool — see the
+        promotion-gate + registry-snapshot guards below.
 
     Returns
     -------
     dict with per-model ICs, meta-model IC, walk-forward results.
     """
+    from training.io_spec import TrainingIOSpec
+    if io is None:
+        io = TrainingIOSpec.live()
+    close_col = io.close_col
+
     import config as cfg
     from model.gbm_scorer import GBMScorer
     from model.regime_predictor import RegimePredictor
@@ -794,17 +811,34 @@ def run_meta_training(
     # was deleted 2026-04-15 per ROADMAP P2 to eliminate the predictor/
     # data-module feature logic duplication. See PR #NN.
 
-    # Load reference series
-    def _load_close(fn):
+    # Load reference series. ``col`` selects the price basis: the macro index
+    # legs (VIX/TNX/…) always read "Close" (they are levels, not total-return
+    # instruments and come from the unchanged macro library), while the
+    # benchmark legs of the market-relative label (SPY + sector ETFs) read
+    # ``close_col`` so a total-return shadow run residualizes on the same
+    # total-return basis as the stock leg.
+    def _load_close(fn, col: str = "Close"):
         p = data_path / fn
         if not p.exists():
             return None
         d = _load_ticker_parquet(p)
-        if d.empty or "Close" not in d.columns:
+        if d.empty:
             return None
-        return d["Close"].astype(float)
+        if col not in d.columns:
+            if col != "Close" and "Close" in d.columns:
+                # Shadow basis requested but the alternate column is absent —
+                # fail loud rather than silently mixing a total-return stock
+                # leg with a split-adjusted-level benchmark leg.
+                raise RuntimeError(
+                    f"{fn}: shadow basis column {col!r} absent (have "
+                    f"{list(d.columns)[:8]}…) — the scratch library must emit "
+                    "it on the benchmark leg so the market-relative label is "
+                    "total-return on both legs."
+                )
+            return None
+        return d[col].astype(float)
 
-    spy_series = _load_close("SPY.parquet")
+    spy_series = _load_close("SPY.parquet", col=close_col)
     vix_series = _load_close("VIX.parquet")
     vix3m_series = _load_close("VIX3M.parquet")
     tnx_series = _load_close("TNX.parquet")
@@ -831,7 +865,7 @@ def run_meta_training(
 
     sector_etf_cache = {}
     for etf_sym in set(sector_map.values()):
-        s = _load_close(f"{etf_sym}.parquet")
+        s = _load_close(f"{etf_sym}.parquet", col=close_col)
         if s is not None:
             sector_etf_cache[etf_sym] = s
 
@@ -939,8 +973,12 @@ def run_meta_training(
         if len(raw_df) < _MIN_HISTORY_ROWS:
             reject_too_short.append((ticker, len(raw_df)))
             continue
-        if "Close" in raw_df.columns:
-            all_close_prices[ticker] = raw_df["Close"].astype(float)
+        # Regime-breadth close series — read the active basis (total-return
+        # column on a shadow run) so breadth is computed on the same basis as
+        # the label; fall back to "Close" if the alternate column is absent.
+        _breadth_col = close_col if close_col in raw_df.columns else "Close"
+        if _breadth_col in raw_df.columns:
+            all_close_prices[ticker] = raw_df[_breadth_col].astype(float)
         missing = [c for c in _required_features if c not in raw_df.columns]
         if missing:
             reject_missing_features.append((ticker, ",".join(missing[:3])))
@@ -952,6 +990,7 @@ def run_meta_training(
                 raw_df, forward_days=cfg.FORWARD_DAYS,
                 up_threshold=cfg.UP_THRESHOLD, down_threshold=cfg.DOWN_THRESHOLD,
                 benchmark_returns=sector_etf_s if sector_etf_s is not None else spy_series,
+                close_col=close_col,
             )
             # Stage 3 PR 2: parallel triple-barrier alpha label, vol-scaled
             # barriers (LdP Ch. 3.4). Sector-neutral residual log-returns;
@@ -965,6 +1004,7 @@ def run_meta_training(
                 vol_window=cfg.TRIPLE_BARRIER_VOL_WINDOW,
                 vol_multiplier=cfg.TRIPLE_BARRIER_VOL_MULTIPLIER,
                 min_periods=cfg.TRIPLE_BARRIER_MIN_PERIODS,
+                close_col=close_col,
             )
             # Task B: parallel touch-order meta-label on the same barriers.
             labeled = compute_triple_barrier_touch_labels(
@@ -974,6 +1014,7 @@ def run_meta_training(
                 vol_window=cfg.TRIPLE_BARRIER_VOL_WINDOW,
                 vol_multiplier=cfg.TRIPLE_BARRIER_VOL_MULTIPLIER,
                 min_periods=cfg.TRIPLE_BARRIER_MIN_PERIODS,
+                close_col=close_col,
             )
         except Exception as exc:
             reject_label_error.append((ticker, f"{type(exc).__name__}: {exc}"))
@@ -1007,7 +1048,7 @@ def run_meta_training(
         # Shift -N means "close N rows ahead". At the tail of the
         # history the value is NaN; rows with NaN are excluded from
         # the corresponding-horizon IC only.
-        close_for_horizon = raw_df["Close"].astype(float)
+        close_for_horizon = raw_df[close_col].astype(float)
         bench_for_horizon = sector_etf_s if sector_etf_s is not None else spy_series
         if bench_for_horizon is not None:
             bench_aligned = bench_for_horizon.reindex(close_for_horizon.index, method="ffill")
@@ -1037,7 +1078,7 @@ def run_meta_training(
         # convention). Always emitted (the column is harmless extra data); the
         # observe gate controls only META_FEATURES inclusion downstream.
         resid_mom_df = compute_residual_momentum_features(
-            raw_df["Close"].astype(float),
+            raw_df[close_col].astype(float),
             benchmark_close=(sector_etf_s if sector_etf_s is not None else spy_series),
             spy_close=spy_series,
             beta_window=cfg.RESID_MOM_BETA_WINDOW,
@@ -3706,6 +3747,15 @@ def run_meta_training(
     # champion on an inflated in-sample IC, then flushed the live book to SPY).
     gate_passed = promoted
     promoted = False
+    # Shadow runs are EVIDENCE-ONLY — hard-block live promotion regardless of
+    # the gate outcome. Belt-and-suspenders atop the unconditional
+    # challenger-first ``promoted = False`` above: if challenger-first is ever
+    # relaxed, an ``allow_live_promote=False`` (shadow) run still can never
+    # overwrite the live champion. Combined with the disjoint ``io`` output
+    # prefixes + the registry-snapshot skip below, a shadow run cannot, by
+    # construction, touch what production serves.
+    if not io.allow_live_promote:
+        promoted = False
     # Promotion-blocker reason string. Resolved from the SAME gate booleans
     # the live `promoted` formula above uses, so it can never disagree with
     # the actual outcome. Persisted into training_summary so downstream
@@ -3765,7 +3815,11 @@ def run_meta_training(
         with tempfile.TemporaryDirectory() as tmp:
             import boto3 as _b3
             s3_up = _b3.client("s3")
-            prefix = cfg.META_WEIGHTS_PREFIX  # "predictor/weights/meta/"
+            # Output prefix/keys come from the IO spec — the live prefix for a
+            # production run, the disjoint shadow prefix for an evidence run.
+            prefix = io.weights_prefix  # live: "predictor/weights/meta/"
+            manifest_key = io.manifest_key
+            feature_list_key = io.feature_list_key
 
             # Save all models
             # isotonic_calibrator.pkl — binary P(UP) head on meta output.
@@ -3915,7 +3969,7 @@ def run_meta_training(
                 served_version, served_date = _this_version, date_str
             else:
                 served_version, served_date = _read_live_served_identity(
-                    s3_up, bucket, cfg.META_MANIFEST_KEY
+                    s3_up, bucket, manifest_key
                 )
             log.info(
                 "Served champion identity for manifest: version=%s date=%s "
@@ -3924,6 +3978,13 @@ def run_meta_training(
             # Write manifest
             manifest = {
                 "date": date_str,
+                # PR7-7b: marks an evidence-only shadow run (e.g. "crsp"
+                # total-return basis). ``None`` for a live production run. Lets
+                # the comparison/cutover tooling tell a shadow manifest apart
+                # from the live champion manifest without path inspection.
+                "shadow_basis": io.shadow_basis,
+                "label_close_col": io.close_col,
+                "universe_lib": io.universe_lib,
                 # L4488c: the model-zoo spec sets MODEL_VERSION_LABEL so each
                 # variant registers under its own version_id ({label}-{date}-{fp})
                 # — distinct challengers on the leaderboard. Default = base label.
@@ -4215,11 +4276,11 @@ def run_meta_training(
                 ),
             }
             s3_up.put_object(
-                Bucket=bucket, Key=cfg.META_MANIFEST_KEY,
+                Bucket=bucket, Key=manifest_key,
                 Body=json.dumps(manifest, indent=2).encode(),
                 ContentType="application/json",
             )
-            log.info("Manifest written to s3://%s/%s", bucket, cfg.META_MANIFEST_KEY)
+            log.info("Manifest written to s3://%s/%s", bucket, manifest_key)
 
             # feature_list.json — inference-universe disclosure (ROADMAP P2,
             # added 2026-05-05; closed 2026-05-12). Single source of truth
@@ -4248,13 +4309,13 @@ def run_meta_training(
                 },
             }
             s3_up.put_object(
-                Bucket=bucket, Key=cfg.META_FEATURE_LIST_KEY,
+                Bucket=bucket, Key=feature_list_key,
                 Body=json.dumps(feature_list, indent=2).encode(),
                 ContentType="application/json",
             )
             log.info(
                 "Feature list written to s3://%s/%s",
-                bucket, cfg.META_FEATURE_LIST_KEY,
+                bucket, feature_list_key,
             )
 
             # Phase 0 model registry (champion/challenger governance): snapshot
@@ -4275,57 +4336,71 @@ def run_meta_training(
             # archive first. Without this, no challenger ever exists to shadow —
             # the exact Phase-0 gap that left the registry holding only the
             # champion (found 2026-06-02).
-            try:
-                from model.registry import resolve_code_sha, snapshot_to_registry
-
-                # Lineage completeness (config#708): stamp the producing code
-                # revision and use the single-source descriptive version label
-                # (cfg.MODEL_VERSION_LABEL) rather than a bare hardcoded default,
-                # so registry lineage never drifts from the configured label.
-                _code_sha = resolve_code_sha()
-                _model_version = manifest.get("version", cfg.MODEL_VERSION_LABEL)
-
-                if promoted:
-                    _vid = snapshot_to_registry(
-                        s3_up, bucket,
-                        model_version=_model_version,
-                        date=date_str, stage="champion",
-                        code_sha=_code_sha,
-                    )
-                    log.info(
-                        "Phase-0 registry snapshot (champion): predictor/registry/%s/",
-                        _vid,
-                    )
-                else:
-                    _arch_prefix = f"{cfg.META_WEIGHTS_PREFIX}archive/{date_str}/"
-                    # Complete the archived candidate bundle: the archive has the
-                    # weights but not the two REQUIRED_CONTRACT_FILES. Copy the
-                    # candidate's manifest + feature_list (live keys = candidate's
-                    # values on a non-promoted run) so the bundle is reproducible.
-                    for _live_key, _fname in (
-                        (cfg.META_MANIFEST_KEY, "manifest.json"),
-                        (cfg.META_FEATURE_LIST_KEY, "feature_list.json"),
-                    ):
-                        s3_up.copy_object(
-                            Bucket=bucket,
-                            Key=f"{_arch_prefix}{_fname}",
-                            CopySource={"Bucket": bucket, "Key": _live_key},
-                        )
-                    _vid = snapshot_to_registry(
-                        s3_up, bucket,
-                        model_version=_model_version,
-                        date=date_str, stage="challenger",
-                        source_prefix=_arch_prefix,
-                        code_sha=_code_sha,
-                    )
-                    log.info(
-                        "Phase-0 registry snapshot (challenger): predictor/registry/%s/",
-                        _vid,
-                    )
-            except Exception as _reg_err:
-                log.warning(
-                    "Phase-0 registry snapshot failed (non-blocking): %s", _reg_err,
+            # SHADOW runs do NOT enter the model-zoo registry — registration is
+            # what makes a trained model a challenger that `select_winner` can
+            # later promote to champion. A CRSP-basis evidence run must never
+            # be promotable, so we skip the snapshot entirely (this is the
+            # third independent guard, alongside the disjoint output prefixes
+            # and the forced ``promoted = False``).
+            if not io.register_in_zoo:
+                log.info(
+                    "Shadow run (basis=%s) — skipping model-zoo registry "
+                    "snapshot; the shadow model is evidence-only and never "
+                    "enters the champion/challenger selection pool.",
+                    io.shadow_basis,
                 )
+            else:
+                try:
+                    from model.registry import resolve_code_sha, snapshot_to_registry
+
+                    # Lineage completeness (config#708): stamp the producing code
+                    # revision and use the single-source descriptive version label
+                    # (cfg.MODEL_VERSION_LABEL) rather than a bare hardcoded default,
+                    # so registry lineage never drifts from the configured label.
+                    _code_sha = resolve_code_sha()
+                    _model_version = manifest.get("version", cfg.MODEL_VERSION_LABEL)
+
+                    if promoted:
+                        _vid = snapshot_to_registry(
+                            s3_up, bucket,
+                            model_version=_model_version,
+                            date=date_str, stage="champion",
+                            code_sha=_code_sha,
+                        )
+                        log.info(
+                            "Phase-0 registry snapshot (champion): predictor/registry/%s/",
+                            _vid,
+                        )
+                    else:
+                        _arch_prefix = f"{prefix}archive/{date_str}/"
+                        # Complete the archived candidate bundle: the archive has the
+                        # weights but not the two REQUIRED_CONTRACT_FILES. Copy the
+                        # candidate's manifest + feature_list (live keys = candidate's
+                        # values on a non-promoted run) so the bundle is reproducible.
+                        for _live_key, _fname in (
+                            (manifest_key, "manifest.json"),
+                            (feature_list_key, "feature_list.json"),
+                        ):
+                            s3_up.copy_object(
+                                Bucket=bucket,
+                                Key=f"{_arch_prefix}{_fname}",
+                                CopySource={"Bucket": bucket, "Key": _live_key},
+                            )
+                        _vid = snapshot_to_registry(
+                            s3_up, bucket,
+                            model_version=_model_version,
+                            date=date_str, stage="challenger",
+                            source_prefix=_arch_prefix,
+                            code_sha=_code_sha,
+                        )
+                        log.info(
+                            "Phase-0 registry snapshot (challenger): predictor/registry/%s/",
+                            _vid,
+                        )
+                except Exception as _reg_err:
+                    log.warning(
+                        "Phase-0 registry snapshot failed (non-blocking): %s", _reg_err,
+                    )
 
             # Track 4-of-N of audit Phase 1 horizon battery (2026-05-07):
             # persist OOS meta-rows to S3 so the standalone analysis module
@@ -4347,7 +4422,7 @@ def run_meta_training(
                 _buf = _io.BytesIO()
                 _df_rows.to_parquet(_buf, index=False)
                 _buf.seek(0)
-                _oos_key = f"predictor/diagnostics/oos_rows/{date_str}.parquet"
+                _oos_key = io.oos_rows_key(date_str)
                 s3_up.put_object(
                     Bucket=bucket, Key=_oos_key,
                     Body=_buf.getvalue(),
@@ -4357,7 +4432,7 @@ def run_meta_training(
                 # default-read the most recent run without knowing the date.
                 _buf.seek(0)
                 s3_up.put_object(
-                    Bucket=bucket, Key="predictor/diagnostics/oos_rows/latest.parquet",
+                    Bucket=bucket, Key=io.oos_rows_latest_key,
                     Body=_buf.getvalue(),
                     ContentType="application/octet-stream",
                 )
