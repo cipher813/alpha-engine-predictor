@@ -50,6 +50,7 @@ def compute_labels(
     adaptive_window: int = 63,
     adaptive_up_pct: float = 65,
     adaptive_down_pct: float = 35,
+    close_col: str = "Close",
 ) -> pd.DataFrame:
     """
     Append forward-return labels to a featured DataFrame.
@@ -75,6 +76,18 @@ def compute_labels(
         Pass a sector ETF Close (e.g. XLK for Information Technology) for
         sector-neutral (idiosyncratic) alpha.
 
+        NOTE: the basis of this benchmark series is the CALLER's choice — on a
+        total-return shadow run the caller passes the benchmark's
+        ``total_return_close`` series so BOTH legs of the market-relative
+        label are on the same total-return basis (see ``close_col``).
+    close_col : str
+        Column to read the stock price level from. Default ``"Close"``
+        (split-adjusted level — live behaviour, unchanged). A total-return
+        shadow run passes ``"total_return_close"`` so the forward-return label
+        is computed on the total-return basis. The benchmark leg must be passed
+        on the SAME basis via ``benchmark_returns`` so the market-relative
+        label is total-return on both legs.
+
     Returns
     -------
     pd.DataFrame
@@ -98,7 +111,13 @@ def compute_labels(
         return df
 
     df = df.copy()
-    close = df["Close"].astype(float)
+    if close_col not in df.columns:
+        raise KeyError(
+            f"compute_labels: close_col={close_col!r} not found in DataFrame "
+            f"columns {list(df.columns)[:8]}… — on a total-return shadow run "
+            "the scratch library must emit 'total_return_close'."
+        )
+    close = df[close_col].astype(float)
 
     # Stock forward return: (future price / current price) - 1
     future_close = close.shift(-forward_days)
@@ -187,6 +206,7 @@ def compute_triple_barrier_alpha_labels(
     vol_multiplier: float = 2.0,
     min_periods: int = 10,
     column_name: str = "triple_barrier_alpha_21d",
+    close_col: str = "Close",
 ) -> pd.DataFrame:
     """Append vol-scaled triple-barrier alpha labels to a featured DataFrame.
 
@@ -247,7 +267,7 @@ def compute_triple_barrier_alpha_labels(
         return df
 
     df = df.copy()
-    close = df["Close"].astype(float)
+    close = df[close_col].astype(float)
     stock_log_ret = np.log(close / close.shift(1))
 
     if benchmark_returns is not None:
@@ -285,6 +305,7 @@ def compute_triple_barrier_touch_labels(
     min_periods: int = 10,
     timeout_policy: str = "nan",
     column_name: str = "triple_barrier_touch_21d",
+    close_col: str = "Close",
 ) -> pd.DataFrame:
     """Append vol-scaled triple-barrier *touch-order* meta-labels (Task B).
 
@@ -314,7 +335,7 @@ def compute_triple_barrier_touch_labels(
         return df
 
     df = df.copy()
-    close = df["Close"].astype(float)
+    close = df[close_col].astype(float)
     stock_log_ret = np.log(close / close.shift(1))
 
     if benchmark_returns is not None:

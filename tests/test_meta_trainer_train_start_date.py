@@ -103,7 +103,7 @@ class TestFilterAppliedToLabeled:
         # front-of-window.
         src = _src("training/meta_trainer.py")
         filter_pos = src.find("labeled = labeled.loc[labeled.index >= _cutoff_ts]")
-        sidecar_pos = src.find("close_for_horizon = raw_df[\"Close\"]")
+        sidecar_pos = src.find("close_for_horizon = raw_df[close_col]")
         assert filter_pos > 0 and sidecar_pos > 0
         assert filter_pos < sidecar_pos
 

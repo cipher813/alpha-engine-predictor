@@ -29,7 +29,7 @@ def test_computes_defer_export_from_dispatcher_env():
 def test_full_training_runssm_prepends_defer_export():
     text = _SCRIPT.read_text()
     # The full-training run_ssm body is prefixed with ${DEFER_EMAIL_EXPORT}.
-    assert 'run_ssm "full-training" "${DEFER_EMAIL_EXPORT}$(cat <<\'TRAIN\'' in text
+    assert 'run_ssm "full-training" "${DEFER_EMAIL_EXPORT}${SHADOW_EXPORT}$(cat <<\'TRAIN\'' in text
 
 
 def test_defer_export_empty_when_unset_keeps_bare_run_equivalent():

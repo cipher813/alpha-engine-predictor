@@ -29,8 +29,9 @@ def _patch_impl(monkeypatch):
     seen = {}
 
     def _fake_impl(bucket, *, date_str=None, dry_run=False, skip_phases="",
-                  force_phases="", force=False, send_email=True):
+                  force_phases="", force=False, send_email=True, io=None):
         seen["send_email"] = send_email
+        seen["io"] = io
         return {"status": "ok"}
 
     monkeypatch.setattr(th, "_main_impl", _fake_impl)

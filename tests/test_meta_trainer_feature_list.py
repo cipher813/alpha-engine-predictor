@@ -56,7 +56,11 @@ class TestProducerSourceContract:
         src = _src("training/meta_trainer.py")
         # The write block has to land at the manifest-write site so a
         # successful retrain produces both artifacts atomically.
-        assert "META_FEATURE_LIST_KEY" in src
+        # PR7-7b: the feature-list key is now resolved from the IO spec
+        # (``feature_list_key = io.feature_list_key``); the live spec resolves
+        # it to cfg.META_FEATURE_LIST_KEY so the contract is preserved, while a
+        # shadow run isolates it under predictor/weights_shadow/{basis}/.
+        assert "feature_list_key = io.feature_list_key" in src
         # W2 (L4469): the L2 feature list now reflects TRAIN_META_FEATURES (the
         # observe-gated list — identical to META_FEATURES while the residual-
         # momentum gate is closed) so the artifact records what the L2 was
@@ -100,8 +104,9 @@ class TestProducerSourceContract:
     def test_emit_writes_to_s3_with_json_content_type(self):
         src = _src("training/meta_trainer.py")
         # Same put_object shape as the manifest write — JSON body, JSON
-        # content-type, named S3 key constant.
-        assert "Key=cfg.META_FEATURE_LIST_KEY" in src
+        # content-type. PR7-7b: the key is the io-resolved local
+        # ``feature_list_key`` (live → cfg.META_FEATURE_LIST_KEY).
+        assert "Key=feature_list_key," in src
         assert "ContentType=\"application/json\"" in src
 
 
