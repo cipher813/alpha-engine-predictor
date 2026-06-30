@@ -21,6 +21,13 @@ training exceeding Lambda's 15-minute timeout.
     weekday Step Function's first state (DeployDriftCheck) to halt the
     pipeline when infrastructure code has been merged but not deployed.
 
+  action == "check_trading_day":
+    NYSE holiday gate for the weekday SF (pure calendar, no preflight).
+    Returns {is_trading_day, check_date, day_name, marker, ...} computed
+    from nousergon_lib.trading_calendar BEFORE StartExecutorEC2. Replaces
+    the prior on-box SSM trading_calendar check whose stdout was unreliably
+    captured on a cold-booted instance (config#1430).
+
   action == "check_pipeline_contract":
     Validate PIPELINE_CONTRACT.yaml's self-consistency + every artifact_id ∈
     ARTIFACT_REGISTRY.yaml, fetched from GitHub raw. Used by the Saturday Step
@@ -109,6 +116,20 @@ def handler(event: dict, context) -> dict:
     # setup_logging already ran at module-top (see comment near the
     # krepis.logging import). Apply the standard log level here.
     logging.getLogger().setLevel(logging.INFO)
+
+    # ── Trading-day gate (weekday SF, runs BEFORE StartExecutorEC2) ─────────
+    # Pure NYSE-calendar math — deliberately returns BEFORE preflight so the
+    # gate cannot be broken by env / connectivity / ArcticDB / model issues.
+    # Replaces the prior on-box SSM trading_calendar check (config#1430).
+    if event.get("action") == "check_trading_day":
+        from inference.trading_day_gate import check_trading_day
+        _r = check_trading_day(event.get("date"))
+        log.info(
+            "Trading-day gate: %s (%s) -> %s%s",
+            _r["check_date"], _r["day_name"], _r["marker"],
+            "" if _r["is_trading_day"] else f" (next: {_r.get('next_trading_day')})",
+        )
+        return _r
 
     # Preflight — fail fast on env / connectivity / ArcticDB freshness
     # before loading models or touching inference. See PR #5 and
