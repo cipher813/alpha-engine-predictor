@@ -1419,18 +1419,22 @@ def run_meta_training(
         conn = sqlite3.connect(str(db_tmp))
         # score_date pulled in 2026-04-28 (PR #56) so the walk-forward
         # calibrator below can filter to entries dated <= train_end_date
-        # per fold and avoid leaking forward beat_spy_10d outcomes into
-        # earlier folds' research_calibrator_prob lookups.
+        # per fold and avoid leaking forward outcomes into earlier folds'
+        # research_calibrator_prob lookups.
+        # config#1456: the calibrator target is beat_spy_21d (the canonical
+        # horizon). The 10d/30d outcome columns were retired in the
+        # canonical-alpha cutover (dead since April) — training on beat_spy_10d
+        # silently starved this L1 calibrator to March-only data.
         sp_df = pd.read_sql_query(
-            "SELECT score, beat_spy_10d, score_date FROM score_performance "
-            "WHERE beat_spy_10d IS NOT NULL AND score IS NOT NULL "
+            "SELECT score, beat_spy_21d, score_date FROM score_performance "
+            "WHERE beat_spy_21d IS NOT NULL AND score IS NOT NULL "
             "AND score_date IS NOT NULL",
             conn,
         )
         conn.close()
         if not sp_df.empty:
             research_scores = sp_df["score"].to_numpy()
-            research_beat_spy = sp_df["beat_spy_10d"].to_numpy().astype(int)
+            research_beat_spy = sp_df["beat_spy_21d"].to_numpy().astype(int)
             research_score_dates = pd.to_datetime(
                 sp_df["score_date"]
             ).to_numpy().astype("datetime64[D]")

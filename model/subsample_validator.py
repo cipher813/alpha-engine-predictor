@@ -155,7 +155,7 @@ def validate_research_calibrator(
     scores
         1-D array of historical research scores from score_performance.
     beat_spy
-        1-D array of binary outcomes (beat_spy_10d, 1=hit / 0=miss).
+        1-D array of binary outcomes (beat_spy_21d, 1=hit / 0=miss).
     score_dates
         1-D ``datetime64`` array same length as scores; used to sort
         rows for the time-based holdout.

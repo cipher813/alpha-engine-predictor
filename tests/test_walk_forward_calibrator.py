@@ -4,7 +4,7 @@ for per-fold research_calibrator fitting (PR #56, 2026-04-28).
 
 Pre-PR-#56 the calibrator was fit ONCE on the full ``score_performance``
 history before the walk-forward loop and reused across every fold. That
-allowed forward outcomes (post-train_end_date beat_spy_10d entries) to
+allowed forward outcomes (post-train_end_date beat_spy_21d entries) to
 shape ``research_calibrator_prob`` for earlier folds — minor leakage
 that PR #55 explicitly noted as a follow-up. PR #56 fits a fold-local
 calibrator inside the walk-forward loop using only score_performance
@@ -36,7 +36,7 @@ class TestWalkForwardCalibratorSource:
         # Allow any whitespace, including newlines, between "SELECT" and
         # the column list since pd.read_sql_query takes a multi-line string
         pattern = re.compile(
-            r"SELECT\s+score,\s+beat_spy_10d,\s+score_date\s+FROM\s+score_performance",
+            r"SELECT\s+score,\s+beat_spy_21d,\s+score_date\s+FROM\s+score_performance",
             re.IGNORECASE,
         )
         assert pattern.search(meta_trainer_source), (
