@@ -62,6 +62,24 @@ jobs:
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
 
+      # deploy.sh's canary + alert steps run `python3 -m krepis.aws` /
+      # `python3 -m krepis.alerts` directly on THIS runner (not inside the
+      # Lambda's Docker image) — krepis is the shared throttle-aware invoke
+      # CLI (config#1494). The runner's stock Python has no project packages,
+      # so without this step every canary invoke dies with
+      # `ModuleNotFoundError: No module named 'krepis'` (surfaced 2026-07-01,
+      # config#1494 follow-up: PR #324 wired the CLI call but never installed
+      # it on the caller). Pin matches requirements.txt's `krepis[flow_doctor]
+      # >=0.7.0` floor; setup-python pins the interpreter so the pip install
+      # target doesn't drift with GH's ubuntu-latest image updates.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install krepis (runner-side canary + alert CLI)
+        run: pip install "krepis[flow_doctor]>=0.7.0"
+
       - name: Deploy inference Lambda (alpha-engine-predictor-inference)
         working-directory: alpha-engine-predictor
         env:
