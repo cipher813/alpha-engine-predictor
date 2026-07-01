@@ -257,24 +257,30 @@ echo "  Published version: ${VERSION}"
 # Invoke the version directly so a broken image cannot reach the live alias.
 # If the canary fails, live keeps pointing at the prior good version.
 #
-# `aws lambda invoke` writes two streams:
-#   - the response *payload* to the file positional arg ($CANARY_OUT)
+# Invoke via the shared ``krepis.aws invoke-canary`` CLI (config#1494, published
+# in krepis 0.7.0) instead of a bare ``aws lambda invoke``. The CLI retries ONLY
+# on the throttle/concurrency signal with bounded backoff+jitter and writes two
+# streams, exactly as ``aws lambda invoke`` did:
+#   - the response *payload* to --out ($CANARY_OUT)
 #   - the invoke API *metadata* JSON (StatusCode / FunctionError / ExecutedVersion)
 #     to stdout
 # Unhandled Lambda exceptions set FunctionError="Unhandled" on the *metadata*
 # stream — NOT on the payload. The 2026-05-11 v138 ImportError surfaced as
 # `statusCode=0, FunctionError=` (empty) because the prior implementation
-# parsed FunctionError from the payload file and discarded stdout.
+# parsed FunctionError from the payload file and discarded stdout. boto3 path —
+# no ``--cli-binary-format``/base64. A non-zero CLI exit (non-throttle boto
+# error or throttle exhaustion) leaves $CANARY_META empty, so the promote gate
+# below refuses to promote — live stays on the prior good version.
 echo ""
 echo "==> Running canary invocation against :${VERSION} (dry_run=true)..."
 CANARY_OUT=$(mktemp)
-CANARY_META=$(aws lambda invoke \
+CANARY_META=$(python3 -m krepis.aws invoke-canary \
   --function-name "${LAMBDA_FUNCTION}:${VERSION}" \
   --payload '{"dry_run": true}' \
-  --cli-binary-format raw-in-base64-out \
-  --cli-read-timeout 300 \
+  --out "$CANARY_OUT" \
   --region "${AWS_REGION}" \
-  "$CANARY_OUT")
+  --max-attempts 6 \
+  --label "${LAMBDA_FUNCTION}-canary") || CANARY_META=""
 
 CANARY_FUNC_ERR=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('FunctionError',''))" "$CANARY_META" 2>/dev/null || echo "")
 CANARY_STATUS=$(python3 -c "import json; d=json.load(open('$CANARY_OUT')); print(d.get('statusCode', 0))" 2>/dev/null || echo "0")
@@ -381,15 +387,18 @@ echo "  Found (or freshly created) — updating..."
     --region "${AWS_REGION}")
   echo "  Published regime version: ${REGIME_VERSION}"
 
+  # Canary via the shared krepis.aws invoke-canary CLI (config#1494); metadata
+  # JSON (incl. FunctionError) on stdout, payload to --out. Non-zero CLI exit
+  # leaves $REGIME_CANARY_META empty → the gate below refuses to promote.
   echo "==> Running regime canary against :${REGIME_VERSION} (action=dry_run)..."
   REGIME_CANARY_OUT=$(mktemp)
-  REGIME_CANARY_META=$(aws lambda invoke \
+  REGIME_CANARY_META=$(python3 -m krepis.aws invoke-canary \
     --function-name "${REGIME_LAMBDA_FUNCTION}:${REGIME_VERSION}" \
     --payload '{"action": "dry_run"}' \
-    --cli-binary-format raw-in-base64-out \
-    --cli-read-timeout 300 \
+    --out "$REGIME_CANARY_OUT" \
     --region "${AWS_REGION}" \
-    "$REGIME_CANARY_OUT")
+    --max-attempts 6 \
+    --label "${REGIME_LAMBDA_FUNCTION}-canary") || REGIME_CANARY_META=""
 
   REGIME_FUNC_ERR=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('FunctionError',''))" "$REGIME_CANARY_META" 2>/dev/null || echo "")
   REGIME_STATUS=$(python3 -c "import json; d=json.load(open('$REGIME_CANARY_OUT')); print(d.get('statusCode', 0))" 2>/dev/null || echo "0")
@@ -485,15 +494,18 @@ echo "  Found (or freshly created) — updating..."
     --region "${AWS_REGION}")
   echo "  Published regime-eval version: ${REGIME_EVAL_VERSION}"
 
+  # Canary via the shared krepis.aws invoke-canary CLI (config#1494); metadata
+  # JSON (incl. FunctionError) on stdout, payload to --out. Non-zero CLI exit
+  # leaves $REGIME_EVAL_CANARY_META empty → the gate below refuses to promote.
   echo "==> Running regime-eval canary against :${REGIME_EVAL_VERSION} (action=dry_run)..."
   REGIME_EVAL_CANARY_OUT=$(mktemp)
-  REGIME_EVAL_CANARY_META=$(aws lambda invoke \
+  REGIME_EVAL_CANARY_META=$(python3 -m krepis.aws invoke-canary \
     --function-name "${REGIME_EVAL_LAMBDA_FUNCTION}:${REGIME_EVAL_VERSION}" \
     --payload '{"action": "dry_run"}' \
-    --cli-binary-format raw-in-base64-out \
-    --cli-read-timeout 600 \
+    --out "$REGIME_EVAL_CANARY_OUT" \
     --region "${AWS_REGION}" \
-    "$REGIME_EVAL_CANARY_OUT")
+    --max-attempts 6 \
+    --label "${REGIME_EVAL_LAMBDA_FUNCTION}-canary") || REGIME_EVAL_CANARY_META=""
 
   REGIME_EVAL_FUNC_ERR=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('FunctionError',''))" "$REGIME_EVAL_CANARY_META" 2>/dev/null || echo "")
   REGIME_EVAL_STATUS=$(python3 -c "import json; d=json.load(open('$REGIME_EVAL_CANARY_OUT')); print(d.get('statusCode', 0))" 2>/dev/null || echo "0")

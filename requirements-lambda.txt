@@ -18,7 +18,10 @@
 # >=0.4.0 floor here let krepis 0.4/0.5 resolve flow-doctor 0.6.0rc6, whose
 # retired `claude-sonnet-4-6-20250514` pin 404'd on every flow-doctor diagnosis
 # call from the Lambda inference path. Kept in lockstep with requirements.txt.
-krepis[flow_doctor]>=0.6.0
+# Bumped to >=0.7.0 (config#1494): deploy.sh's canaries CALL the
+# `krepis.aws invoke-canary` CLI (0.7.0 ships it); the invoke is load-bearing.
+# Kept in lockstep with requirements.txt.
+krepis[flow_doctor]>=0.7.0
 nousergon-lib[arcticdb,flow_doctor,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.72.0
 numpy>=1.24.0,<2
 pandas>=2.0.0
